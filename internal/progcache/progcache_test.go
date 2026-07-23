@@ -39,6 +39,10 @@ func TestSharedProgramCache_DistinctSourcesDistinctPrograms(t *testing.T) {
 
 func TestSharedProgramCache_ConcurrentCompileIsSafe(t *testing.T) {
 	c := New()
+	// Under concurrent first-compile of the same source, multiple goroutines may
+	// each call goja.Compile; the double-checked lock ensures only ONE program is
+	// stored and all callers observe it (losers discard their own). This asserts
+	// the retained-program count is 1, not that compile ran exactly once.
 	var wg sync.WaitGroup
 	for i := 0; i < 50; i++ {
 		wg.Add(1)

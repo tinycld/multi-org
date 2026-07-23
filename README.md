@@ -71,27 +71,46 @@ Tenant hooks and migrations run under the fork's jsvm **Sandboxed** mode
 (`jsvm.Config{Sandboxed: true}`): a deny-by-default allowlist that withholds
 the host-reaching bindings — `$os` (exec / env / raw filesystem), `$http`
 (outbound HTTP), `$filesystem`, and `$filepath` — from both the hook and
-migration runtimes, and neuters `process.env` / `process.argv` so the host
-environment (e.g. `MT_SUPERUSER_PASSWORD`) is unreachable. Legitimate file
-access goes through org-scoped `$app` record-file APIs; `$apis.static` remains
-available and is confined to its configured root (no `..` traversal). Both the
-runtime load path (`orgmanager.load`) and the provision path
-(`controlplane.bootstrapTenantOnce`) enable it, and both use `jsvm.Register`
-(returning the error) rather than `MustRegister`, so a hook or migration that
-throws at load fails only that one org's load/provisioning instead of
-panicking the shared process.
+migration runtimes; neuters `process.env` / `process.argv` so the host
+environment (e.g. `MT_SUPERUSER_PASSWORD`) is unreachable; withholds
+`$apis.static` (a raw directory-serving primitive whose root is caller-chosen);
+denies file-based `require()` (only native modules like `process`/`console`/
+`buffer` load); and restricts `$template` to `loadString` (no `loadFiles`/
+`loadFS`). Both the runtime load path (`orgmanager.load`) and the provision
+path (`controlplane.bootstrapTenantOnce`) enable it, and both use
+`jsvm.Register` (returning the error) rather than `MustRegister`, so a hook or
+migration that throws at load fails only that one org's load/provisioning
+instead of panicking the shared process.
 
-**This is blast-radius reduction, not attacker containment** — the WordPress
-`disable_functions` / `open_basedir` tier. sobek is not a hard sandbox: engine
-escapes, CPU / memory / wall-clock DoS (no resource limits yet), and other
-shared-process risks remain because all orgs share one OS process. The
-allowlist guarantee is also contingent on the router never passing a
-capability-granting `OnInit` at the sandboxed call sites (an operator-only
-escape hatch — do not wire host capabilities through it for tenant apps).
+> **⚠️ This is blast-radius reduction, NOT attacker containment.** It is the
+> WordPress `disable_functions` / `open_basedir` tier: it raises the bar but
+> does not hold against a determined hostile author in a shared process.
+>
+> **Demonstrated in-process bypass (open):** `$app.db()` hands tenant JS a raw
+> SQL surface over the shared connection. A sandboxed hook can run
+> `ATTACH DATABASE '<other-org>/data.db'` inside a transaction and read another
+> org's secrets (and create arbitrary `.db` files) — arbitrary host-file
+> read/write, reaching the same headline threat the binding allowlist set out
+> to close. Our SQLite driver (modernc) exposes **no authorizer API**, so this
+> class cannot be cleanly contained in-process; `$app` similarly exposes
+> `newFilesystem`, `createBackup`/`restoreBackup`, etc. The recurring pattern —
+> each audit finding another capability re-entering through a *kept* surface —
+> is the signal that **allowlisting the full stock `$app`/DB API against a
+> hostile author in one shared process is the wrong altitude.**
+>
+> Also unaddressed in-process: sobek engine escapes, and CPU / memory /
+> wall-clock DoS (no resource limits).
 
-Hostile-grade isolation requires OS-level per-process / per-uid isolation
-(deferred). The `GetOrg → http.Handler` seam in `frontrouter` is where a
-reverse-proxy-to-subprocess would drop in without reworking dispatch.
+**The actual security boundary is OS-level per-process isolation, and it is now
+the required next deliverable** (not an optional hardening). Each org's app must
+run in its own process confined to its own directory (per-uid + a filesystem
+namespace/chroot so `ATTACH '<abs path>'` physically fails at the OS layer),
+with cgroup CPU/memory limits and a scrubbed environment. That layer confines
+filesystem, DB, resource, and *unknown-future* vectors uniformly — which
+in-process allowlisting provably cannot. The `GetOrg → http.Handler` seam in
+`frontrouter` is where a reverse-proxy-to-subprocess drops in without reworking
+dispatch. **Until it lands, do not treat tenant authors as untrusted in
+production.**
 
 ## Operator prerequisites & known gaps
 

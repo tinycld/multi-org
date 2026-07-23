@@ -244,30 +244,45 @@ Gaps found while making the router runnable:
    a tenant** — a tenant having an `orgs` table contradicts the isolation model.
    Fix likely means registering the control-plane schema only on the control-plane
    app (e.g. app-scoped migration registration) rather than globally.
-3. ~~**Tenant JS runs with full host capabilities.**~~ **CLOSED (2026-07-23).** Tenant
-   hooks + migrations now run under the fork's jsvm **Sandboxed** mode
-   (`jsvm.Config{Sandboxed: true}`): a deny-by-default allowlist that withholds
-   `$os`/`$http`/`$filesystem`/`$filepath` from **both** the hook and migration
-   runtimes and scrubs `process.env`/`process.argv` (so `MT_SUPERUSER_PASSWORD` et al.
-   are unreachable). `$apis.static` stays but is proven confined to its root (no `..`
-   traversal). Enabled at both untrusted-code call sites — runtime `orgmanager.load`
-   and provision-time `controlplane.bootstrapTenantOnce` — each using `jsvm.Register`
+3. **Tenant JS runs with full host capabilities → PARTIALLY mitigated in-process;
+   NOT contained.** Tenant hooks + migrations now run under the fork's jsvm
+   **Sandboxed** mode (`jsvm.Config{Sandboxed: true}`): a deny-by-default allowlist
+   that withholds `$os`/`$http`/`$filesystem`/`$filepath` from **both** the hook and
+   migration runtimes, scrubs `process.env`/`process.argv` (so `MT_SUPERUSER_PASSWORD`
+   et al. are unreachable), **withholds `$apis.static`**, **denies file-based
+   `require()`** (native modules only), and **restricts `$template` to `loadString`**.
+   Enabled at both untrusted-code call sites — runtime `orgmanager.load` and
+   provision-time `controlplane.bootstrapTenantOnce` — each using `jsvm.Register`
    (returning the error) not `MustRegister`, so a load-time throw fails **closed** for
    that one org instead of panicking the shared process. Spec + plan:
    `docs/superpowers/specs/2026-07-23-tenant-jsvm-sandbox-design.md` and
    `docs/superpowers/plans/2026-07-23-tenant-jsvm-sandbox.md`. See also the README's
    "Tenant JS security boundary" section.
 
-**Honest residual risk — still NOT done.** Finding #3 is the WordPress
-`disable_functions`/`open_basedir` tier: real **blast-radius reduction, not attacker
-containment.** sobek is not a hard sandbox, and **all orgs still share one OS
-process.** Two containment layers remain deliberately deferred:
-- **OS-level per-process / per-uid isolation** — the actual boundary against a
-  determined tenant author (engine escapes, cross-org reach in a shared process). The
-  `GetOrg → http.Handler` seam in `frontrouter` is the drop-in point for a
-  reverse-proxy-to-subprocess model.
-- **Resource-limit / DoS controls** — no CPU / memory / wall-clock caps on tenant JS
-  yet; a hostile or runaway hook can starve the shared process.
+   **⚠️ This is blast-radius reduction, NOT containment — and there is a DEMONSTRATED,
+   still-open in-process bypass.** `$app.db()` gives tenant JS a raw SQL surface over
+   the shared connection; a sandboxed hook running `ATTACH DATABASE '<other-org>/data.db'`
+   inside a transaction reads another org's secrets and can create arbitrary `.db`
+   files (arbitrary host-file read/write). Our SQLite driver (**modernc**) exposes **no
+   authorizer API**, so this class can't be cleanly contained in-process, and `$app`
+   exposes further host-reaching surface (`newFilesystem`, `createBackup`/`restoreBackup`).
+   Successive adversarial audits each found another capability re-entering through a
+   *kept* surface (`$apis.static` → `require` → `$template` → `$app.db()` raw SQL) —
+   the conclusion (2026-07-23) is that **allowlisting the full stock `$app`/DB API
+   against a hostile author in one shared process is the wrong altitude.** The
+   in-process hardening stands as defense-in-depth; it does **not** make tenant authors
+   safe to treat as untrusted.
+
+**The required next deliverable is OS-level per-process isolation** (no longer
+"optional hardening" — it is THE security boundary). Each org's app runs in its own
+process confined to its own directory: per-uid + a filesystem namespace/chroot so
+`ATTACH '<abs path>'` (and any host-path open) physically fails at the OS layer,
+cgroup CPU/memory/pids limits, and a scrubbed environment. That confines filesystem,
+DB, resource, **and unknown-future** vectors uniformly — which in-process allowlisting
+provably cannot. The `GetOrg → http.Handler` seam in `frontrouter` is the drop-in
+point for a reverse-proxy-to-subprocess model. **Until it lands, do NOT treat tenant
+authors as untrusted in production.** Still also unaddressed in-process: sobek engine
+escapes, and CPU/memory/wall-clock DoS (no resource limits).
 
 **Cleanup (non-blocking, still open):** store "content-addressed" naming is
 vestigial (`ContentHash`/`content_hash`/`manifest` unused — either wire or drop);

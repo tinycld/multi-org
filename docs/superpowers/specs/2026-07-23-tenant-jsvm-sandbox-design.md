@@ -284,23 +284,52 @@ here:
 - **No resource limits this phase.** A hostile hook can still DoS the shared
   process via CPU spin, memory exhaustion, or unbounded allocation, taking down
   **all** tenants. (Noted; out of scope — needs OS-level limits.)
-- **Shared-process secrets remain theoretically reachable** via any capability we
-  failed to strip. The allowlist must be audited as exhaustive (3.2.1–3.2.3 are the
-  known soft spots).
-- **Anything reachable through `$app`** (the tenant's own DB, mailer, settings)
-  is intentionally in-scope for the tenant and correctly org-scoped — not a leak.
+- **Shared-process secrets remain reachable** via any capability we failed to
+  strip. The allowlist must be audited as exhaustive — and it did NOT prove
+  exhaustive (see the outcome note below).
+- **`$app` is NOT safely org-scoped against a hostile author.** The original draft
+  of this bullet assumed anything reachable through `$app` (DB, mailer, settings)
+  was correctly org-scoped and not a leak. **That assumption is false.** `$app.db()`
+  exposes a raw SQL surface over the shared connection; a sandboxed hook running
+  `ATTACH DATABASE '<other-org>/data.db'` in a transaction reads another org's
+  secrets and can write arbitrary `.db` files — cross-org host-file read/write.
 
-**The real boundary — layer 2 (deferred):** OS-level isolation — each org in its
-own process under a separate uid, with cgroup CPU/memory/pids limits, a
-mount/PID/network namespace or seccomp profile, a scrubbed environment (no
-inherited `MT_*` secrets), and a read-only rootfs except its own `pb_data`. The
-router's `GetOrg(slug) → http.Handler` seam (already an abstraction in
-`frontrouter`) is where a reverse-proxy-to-subprocess drops in, so this phase does
-not foreclose it. Layer 2 gets its own spec when prioritized.
+**The real boundary — layer 2 (now REQUIRED, not merely deferred):** OS-level
+isolation — each org in its own process under a separate uid, with a filesystem
+namespace/chroot so an arbitrary-path open (`ATTACH '<abs>'`, `$app.newFilesystem`,
+backups) physically fails at the OS layer, cgroup CPU/memory/pids limits, a scrubbed
+environment (no inherited `MT_*` secrets), and a read-only rootfs except its own
+`pb_data`. The router's `GetOrg(slug) → http.Handler` seam (already an abstraction in
+`frontrouter`) is where a reverse-proxy-to-subprocess drops in. Layer 2 gets its own
+spec/plan.
 
 **The spec/docs and any operator-facing README MUST state plainly that Phase 1 is
-blast-radius reduction, not attacker containment, and that hostile-grade isolation
-requires layer 2.** Do not let this ship described as a hard sandbox.
+blast-radius reduction, not attacker containment.** Do not let this ship described as
+a hard sandbox.
+
+---
+
+## 6. Outcome note (2026-07-23) — why the allowlist was the wrong altitude
+
+Phase 1 shipped the binding allowlist (Tasks 1–11): `$os`/`$http`/`$filesystem`/
+`$filepath` withheld, `process.env`/`argv` scrubbed, `$apis.static` withheld,
+file-based `require()` denied, `$template` restricted to `loadString`, and
+load-time throws fail closed instead of panicking the shared process. All of that
+stands as defense-in-depth and is verified by tests.
+
+But a final adversarial review then demonstrated a **live cross-org exploit through
+`$app.db()` raw SQL** (`ATTACH DATABASE`), and our SQLite driver (modernc) exposes
+no authorizer to contain it cleanly in-process. This was the *fourth* capability an
+audit found re-entering through a binding we had kept (after `$apis.static`,
+`require`, `$template`). The pattern is the finding: **you cannot safely allowlist
+the full stock PocketBase `$app`/DB API against a hostile author in one shared
+process** — `$app.db()` alone is an open-ended raw-SQL surface, and each audit
+surfaces another kept capability.
+
+**Decision:** stop in-process patching; make **OS-level per-process isolation the
+next deliverable** (it confines filesystem, DB, resource, and unknown-future vectors
+uniformly). Phase 1 remains valuable hardening but must not be represented as
+containing a hostile tenant.
 
 ---
 

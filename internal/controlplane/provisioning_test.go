@@ -155,3 +155,94 @@ func TestProvision_InvalidSlugErrors(t *testing.T) {
 		t.Fatal("expected invalid slug to error")
 	}
 }
+
+func TestProvision_CreateOrgResumesStrandedRow(t *testing.T) {
+	root := t.TempDir()
+	cp, _ := New(filepath.Join(root, "pb_control", "pb_data"))
+	if err := cp.App.Bootstrap(); err != nil {
+		t.Fatal(err)
+	}
+	defer cp.App.ResetBootstrapState()
+	if err := cp.App.RunAllMigrations(); err != nil {
+		t.Fatal(err)
+	}
+	s := store.New(root)
+	if err := s.Publish("@tinycld/core", "1.0.0", map[string][]byte{"server/a.pb.js": []byte("1")}); err != nil {
+		t.Fatal(err)
+	}
+	p := NewProvisioner(cp.App, root, s, func(string) {})
+	rec, err := p.CreateOrg("acme", "Acme", map[string]string{"@tinycld/core": "1.0.0"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// simulate a strand: force status back to provisioning
+	rec.Set("status", "provisioning")
+	if err := cp.App.Save(rec); err != nil {
+		t.Fatal(err)
+	}
+	// re-run must RESUME (not error) and end active
+	rec2, err := p.CreateOrg("acme", "Acme", map[string]string{"@tinycld/core": "1.0.0"})
+	if err != nil {
+		t.Fatalf("expected resume, got error: %v", err)
+	}
+	if rec2.GetString("status") != "active" {
+		t.Fatalf("expected resumed org active, got %s", rec2.GetString("status"))
+	}
+	// and an ACTIVE org still rejects duplicate create
+	if _, err := p.CreateOrg("acme", "Acme", map[string]string{"@tinycld/core": "1.0.0"}); err == nil {
+		t.Fatal("expected duplicate active org to error")
+	}
+}
+
+func TestProvision_DeployWritesAuditRecord(t *testing.T) {
+	root := t.TempDir()
+	cp, _ := New(filepath.Join(root, "pb_control", "pb_data"))
+	if err := cp.App.Bootstrap(); err != nil {
+		t.Fatal(err)
+	}
+	defer cp.App.ResetBootstrapState()
+	if err := cp.App.RunAllMigrations(); err != nil {
+		t.Fatal(err)
+	}
+	s := store.New(root)
+	_ = s.Publish("@tinycld/core", "1.0.0", map[string][]byte{"server/a.pb.js": []byte("1")})
+	_ = s.Publish("@tinycld/core", "1.1.0", map[string][]byte{"server/a.pb.js": []byte("2")})
+	p := NewProvisioner(cp.App, root, s, func(string) {})
+	if _, err := p.CreateOrg("acme", "Acme", map[string]string{"@tinycld/core": "1.0.0"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := p.Deploy("acme", map[string]string{"@tinycld/core": "1.1.0"}); err != nil {
+		t.Fatal(err)
+	}
+	deps, err := cp.App.FindAllRecords("deployments")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(deps) != 1 {
+		t.Fatalf("expected 1 deployment audit record, got %d", len(deps))
+	}
+}
+
+func TestProvision_DeployRejectsArchivedOrg(t *testing.T) {
+	root := t.TempDir()
+	cp, _ := New(filepath.Join(root, "pb_control", "pb_data"))
+	if err := cp.App.Bootstrap(); err != nil {
+		t.Fatal(err)
+	}
+	defer cp.App.ResetBootstrapState()
+	if err := cp.App.RunAllMigrations(); err != nil {
+		t.Fatal(err)
+	}
+	s := store.New(root)
+	_ = s.Publish("@tinycld/core", "1.0.0", map[string][]byte{"server/a.pb.js": []byte("1")})
+	p := NewProvisioner(cp.App, root, s, func(string) {})
+	if _, err := p.CreateOrg("acme", "Acme", map[string]string{"@tinycld/core": "1.0.0"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := p.Archive("acme"); err != nil {
+		t.Fatal(err)
+	}
+	if err := p.Deploy("acme", map[string]string{"@tinycld/core": "1.0.0"}); err == nil {
+		t.Fatal("expected deploy to archived org to error")
+	}
+}

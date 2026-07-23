@@ -34,45 +34,51 @@ var slugRe = regexp.MustCompile(`^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$`)
 
 func validSlug(s string) bool { return slugRe.MatchString(s) }
 
-// CreateOrg provisions a new org: validates the slug, writes the dir tree,
-// materializes from the lockfile, creates the org row, bootstraps the tenant DB
-// once to run migrations, then flips the row to active. Fails if the slug exists.
+// CreateOrg provisions a new org, or resumes a previously half-provisioned one.
+// If an org row for the slug already exists and is still active, it errors; if
+// the existing row is in a non-active (e.g. stranded "provisioning") state, it
+// resumes: re-materializes, re-bootstraps the tenant DB, and flips to active.
 func (p *Provisioner) CreateOrg(slug, displayName string, lock map[string]string) (*core.Record, error) {
 	if !validSlug(slug) {
 		return nil, fmt.Errorf("invalid slug %q", slug)
 	}
 	col, err := p.app.FindCollectionByNameOrId("orgs")
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("find orgs collection: %w", err)
 	}
-	if existing, _ := p.app.FindFirstRecordByData("orgs", "slug", slug); existing != nil {
+
+	existing, _ := p.app.FindFirstRecordByData("orgs", "slug", slug)
+	if existing != nil && existing.GetString("status") == "active" {
 		return nil, fmt.Errorf("org %q already exists", slug)
 	}
 
 	orgDir := filepath.Join(p.root, "pb_orgs", slug)
 	for _, sub := range []string{"pb_data", "pb_hooks", "pb_public", "pb_migrations"} {
 		if err := os.MkdirAll(filepath.Join(orgDir, sub), 0o755); err != nil {
-			return nil, err
+			return nil, fmt.Errorf("create org dir: %w", err)
 		}
 	}
 
 	lfBytes, err := lockfile.OrgLockfile(lock).Marshal()
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("marshal lockfile: %w", err)
 	}
 	lf, err := lockfile.Parse(lfBytes)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("parse lockfile: %w", err)
 	}
 	resolved, err := lf.Resolve(p.store)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("resolve lockfile: %w", err)
 	}
 	if err := materialize.Materialize(orgDir, resolved); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("materialize: %w", err)
 	}
 
-	rec := core.NewRecord(col)
+	rec := existing
+	if rec == nil {
+		rec = core.NewRecord(col)
+	}
 	rec.Set("slug", slug)
 	rec.Set("display_name", displayName)
 	rec.Set("status", "provisioning")
@@ -80,7 +86,7 @@ func (p *Provisioner) CreateOrg(slug, displayName string, lock map[string]string
 	rec.Set("lockfile", string(lfBytes))
 	rec.Set("custom_domains", "[]")
 	if err := p.app.Save(rec); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("save org record: %w", err)
 	}
 
 	if err := bootstrapTenantOnce(orgDir); err != nil {
@@ -89,7 +95,7 @@ func (p *Provisioner) CreateOrg(slug, displayName string, lock map[string]string
 
 	rec.Set("status", "active")
 	if err := p.app.Save(rec); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("activate org record: %w", err)
 	}
 	return rec, nil
 }
@@ -101,6 +107,9 @@ func (p *Provisioner) Deploy(slug string, lock map[string]string) error {
 	if err != nil || rec == nil {
 		return fmt.Errorf("org %q not found", slug)
 	}
+	if s := rec.GetString("status"); s != "active" {
+		return fmt.Errorf("cannot deploy to org %q in status %q", slug, s)
+	}
 	lfBytes, err := lockfile.OrgLockfile(lock).Marshal()
 	if err != nil {
 		return err
@@ -121,11 +130,15 @@ func (p *Provisioner) Deploy(slug string, lock map[string]string) error {
 	if err := p.app.Save(rec); err != nil {
 		return err
 	}
-	if dcol, derr := p.app.FindCollectionByNameOrId("deployments"); derr == nil {
-		d := core.NewRecord(dcol)
-		d.Set("org", rec.Id) // relation set by org record id
-		d.Set("lockfile", string(lfBytes))
-		_ = p.app.Save(d)
+	dcol, err := p.app.FindCollectionByNameOrId("deployments")
+	if err != nil {
+		return fmt.Errorf("find deployments collection: %w", err)
+	}
+	d := core.NewRecord(dcol)
+	d.Set("org", rec.Id)
+	d.Set("lockfile", string(lfBytes))
+	if err := p.app.Save(d); err != nil {
+		return fmt.Errorf("record deployment: %w", err)
 	}
 	p.evict(slug)
 	return nil

@@ -171,6 +171,10 @@ func (p *Provisioner) Archive(slug string) error { return p.setStatus(slug, "arc
 // PublishPackage writes a package version into the store and registers it in the
 // packages collection.
 func (p *Provisioner) PublishPackage(name, version string, files map[string][]byte, kind string) error {
+	files, err := transpileForStore(files)
+	if err != nil {
+		return fmt.Errorf("transpile package %s@%s: %w", name, version, err)
+	}
 	if err := p.store.Publish(name, version, files); err != nil {
 		return err
 	}

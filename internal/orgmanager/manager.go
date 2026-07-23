@@ -31,10 +31,6 @@ type OrgRecord struct {
 // LookupFunc resolves an org's control-plane record by slug.
 type LookupFunc func(slug string) (OrgRecord, bool)
 
-func stubLookup(m map[string]OrgRecord) LookupFunc {
-	return func(slug string) (OrgRecord, bool) { r, ok := m[slug]; return r, ok }
-}
-
 type Config struct {
 	Root      string
 	Store     *store.PackageStore
@@ -45,12 +41,15 @@ type Config struct {
 }
 
 type OrgManager struct {
-	cfg   Config
-	group singleflight.Group
-	mu    sync.RWMutex
-	orgs  map[string]*OrgInstance
-	stop  chan struct{}
+	cfg    Config
+	group  singleflight.Group
+	mu     sync.RWMutex
+	orgs   map[string]*OrgInstance
+	closed bool
+	stop   chan struct{}
 }
+
+func nowNanos() int64 { return time.Now().UnixNano() }
 
 func New(cfg Config) *OrgManager {
 	if cfg.HooksPool <= 0 {
@@ -136,10 +135,15 @@ func (m *OrgManager) load(slug string) (*OrgInstance, error) {
 		return nil, fmt.Errorf("build mux %s: %w", slug, err)
 	}
 
-	inst := &OrgInstance{slug: slug, app: pb, mux: mux, ready: make(chan struct{})}
-	close(inst.ready)
+	inst := &OrgInstance{slug: slug, app: pb, mux: mux}
+	inst.lastUsed.Store(nowNanos())
 
 	m.mu.Lock()
+	if m.closed {
+		m.mu.Unlock()
+		_ = inst.close()
+		return nil, fmt.Errorf("manager shut down while loading org %q", slug)
+	}
 	m.orgs[slug] = inst
 	m.mu.Unlock()
 	return inst, nil
@@ -163,6 +167,7 @@ func (m *OrgManager) Evict(slug string) {
 func (m *OrgManager) Shutdown() {
 	close(m.stop)
 	m.mu.Lock()
+	m.closed = true
 	insts := make([]*OrgInstance, 0, len(m.orgs))
 	for _, inst := range m.orgs {
 		insts = append(insts, inst)
@@ -187,7 +192,8 @@ func (m *OrgManager) sweep() {
 			m.mu.RLock()
 			var stale []string
 			for slug, inst := range m.orgs {
-				if inst.lastUsed.Load() < cutoff {
+				lu := inst.lastUsed.Load()
+				if lu != 0 && lu < cutoff {
 					stale = append(stale, slug)
 				}
 			}

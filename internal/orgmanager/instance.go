@@ -13,14 +13,13 @@ type OrgInstance struct {
 	slug     string
 	app      *pocketbase.PocketBase
 	mux      http.Handler
-	lastUsed atomic.Int64 // unix nanos; touched on each dispatch
-	ready    chan struct{}
+	lastUsed atomic.Int64 // unix nanos; seeded at load, updated on each dispatch (dispatch wiring pending)
 }
 
 func (i *OrgInstance) Mux() http.Handler { return i.mux }
 func (i *OrgInstance) Slug() string      { return i.slug }
 
-func (i *OrgInstance) touch(nowNanos int64) { i.lastUsed.Store(nowNanos) }
+func (i *OrgInstance) touch(now int64) { i.lastUsed.Store(now) }
 
 // close drains realtime clients and releases the app's DB/cron resources.
 func (i *OrgInstance) close() error {

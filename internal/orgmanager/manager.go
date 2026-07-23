@@ -117,14 +117,17 @@ func (m *OrgManager) load(slug string) (*OrgInstance, error) {
 		DefaultDataDir:  filepath.Join(orgDir, "pb_data"),
 		HideStartBanner: true,
 	})
-	jsvm.MustRegister(pb, jsvm.Config{
+	if err := jsvm.Register(pb, jsvm.Config{
 		HooksDir:      filepath.Join(orgDir, "pb_hooks"),
 		MigrationsDir: filepath.Join(orgDir, "pb_migrations"),
 		HooksWatch:    false,
 		HooksPoolSize: m.cfg.HooksPool,
 		ProgramSource: m.cfg.Programs,
 		Sandboxed:     true, // untrusted tenant code
-	})
+	}); err != nil {
+		_ = pb.App.ResetBootstrapState()
+		return nil, fmt.Errorf("jsvm register %s: %w", slug, err)
+	}
 	if err := pb.Bootstrap(); err != nil {
 		return nil, fmt.Errorf("bootstrap %s: %w", slug, err)
 	}

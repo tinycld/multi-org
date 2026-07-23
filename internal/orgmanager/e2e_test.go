@@ -156,3 +156,36 @@ func TestE2E_TenantHooksAreSandboxed(t *testing.T) {
 }
 
 func contains(h, n string) bool { return strings.Contains(h, n) }
+
+// TestE2E_HostileHookThrowAtLoadFailsOrgNotProcess proves a tenant hook that
+// throws at load fails only that org's Get() (returned error), rather than
+// panicking the shared process.
+func TestE2E_HostileHookThrowAtLoadFailsOrgNotProcess(t *testing.T) {
+	root := t.TempDir()
+	s := store.New(root)
+	if err := s.Publish("@tinycld/core", "1.0.0", map[string][]byte{
+		"server/main.pb.js": []byte(`$os.exec('id')`),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	mgr := New(Config{
+		Root:     root,
+		Store:    s,
+		Programs: progcache.New(),
+		LookupOrg: stubLookup(map[string]OrgRecord{
+			"acme": {Slug: "acme", Status: "active", Lockfile: []byte(`{"@tinycld/core":"1.0.0"}`)},
+		}),
+		HooksPool: 2,
+	})
+	defer mgr.Shutdown()
+
+	defer func() {
+		if r := recover(); r != nil {
+			t.Fatalf("Get panicked on a hostile load-throwing hook: %v", r)
+		}
+	}()
+	if _, err := mgr.Get("acme"); err == nil {
+		t.Fatal("expected Get to return an error for a load-throwing hook, got nil")
+	}
+}

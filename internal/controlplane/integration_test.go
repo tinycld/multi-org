@@ -207,3 +207,39 @@ func assertTenantHasWidgets(t *testing.T, dataDir string) {
 		t.Fatalf("tenant DB missing 'widgets' collection from package migration: %v", err)
 	}
 }
+
+// TestIntegration_MaliciousHookCannotCrashControlPlane proves a package whose
+// hook throws at load fails provisioning with a returned error, rather than
+// panicking the control-plane process.
+func TestIntegration_MaliciousHookCannotCrashControlPlane(t *testing.T) {
+	root := t.TempDir()
+
+	cp, err := New(filepath.Join(root, "pb_control", "pb_data"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cp.App.Bootstrap(); err != nil {
+		t.Fatal(err)
+	}
+	defer cp.App.ResetBootstrapState()
+	if err := cp.App.RunAllMigrations(); err != nil {
+		t.Fatal(err)
+	}
+
+	s := store.New(root)
+	if err := s.Publish("@tinycld/evilhook", "1.0.0", map[string][]byte{
+		"server/main.pb.js": []byte(`$os.exec('id')`),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	p := NewProvisioner(cp.App, root, s, func(string) {})
+	defer func() {
+		if r := recover(); r != nil {
+			t.Fatalf("provisioning panicked on a load-throwing hook: %v", r)
+		}
+	}()
+	if _, err := p.CreateOrg("evilhook", "EvilHook", map[string]string{"@tinycld/evilhook": "1.0.0"}); err == nil {
+		t.Fatal("expected provisioning to fail for a load-throwing hook, got nil")
+	}
+}

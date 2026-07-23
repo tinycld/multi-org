@@ -40,6 +40,45 @@ func TestTranspileForStore_RewritesTSKeysAndContent(t *testing.T) {
 	}
 }
 
+func TestTranspileForStore_DTSPassesThrough(t *testing.T) {
+	in := map[string][]byte{
+		"server/types.d.ts": []byte("export interface X { a: number }"),
+	}
+	out, err := transpileForStore(in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := out["server/types.d.ts"]; !ok {
+		t.Fatalf(".d.ts must pass through unchanged (key kept); got keys %v", keys(out))
+	}
+	if _, bad := out["server/types.d.js"]; bad {
+		t.Fatal(".d.ts must NOT be rewritten to .d.js")
+	}
+}
+
+func TestTranspileForStore_OutputIsStableES2020(t *testing.T) {
+	// Golden-ish: pins that TS is stripped and ES2020 features are preserved
+	// (not down-leveled). Guards against esbuild-option drift vs the fork's
+	// transformSource, keeping publish-time and load-time transpile interchangeable.
+	in := map[string][]byte{
+		"m.pb.ts": []byte("const f = (x?: number): number => x ?? 0\nrouterAdd('GET','/x',()=>{})"),
+	}
+	out, err := transpileForStore(in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	js := string(out["m.pb.js"])
+	if strings.Contains(js, ": number") {
+		t.Fatalf("type annotations must be stripped: %s", js)
+	}
+	if !strings.Contains(js, "??") {
+		t.Fatalf("ES2020 nullish-coalescing must be preserved (target ES2020, not down-leveled): %s", js)
+	}
+	if !strings.Contains(js, "routerAdd") {
+		t.Fatalf("call must be preserved: %s", js)
+	}
+}
+
 func keys(m map[string][]byte) []string {
 	out := make([]string, 0, len(m))
 	for k := range m {

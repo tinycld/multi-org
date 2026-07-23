@@ -17,7 +17,10 @@ import (
 func transpileForStore(files map[string][]byte) (map[string][]byte, error) {
 	out := make(map[string][]byte, len(files))
 	for name, content := range files {
-		if !strings.HasSuffix(name, ".ts") {
+		// .d.ts files are type declarations with no runtime — pass them through
+		// unchanged (like .js), rather than letting esbuild erase them to empty JS
+		// and rewriting the key to .d.js.
+		if !strings.HasSuffix(name, ".ts") || strings.HasSuffix(name, ".d.ts") {
 			out[name] = content
 			continue
 		}

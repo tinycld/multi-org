@@ -1,7 +1,7 @@
 // Package progcache provides a process-wide, content-addressed cache of compiled
-// goja programs shared across all tenant apps. It implements the open
+// sobek programs shared across all tenant apps. It implements the open
 // jsvm.ProgramSource interface so identical hook/callback source across orgs
-// resolves to a single *goja.Program in memory.
+// resolves to a single *sobek.Program in memory.
 //
 // The cache has no eviction: entries are bounded by the number of DISTINCT
 // program sources across all installed packages, which is expected to be small
@@ -15,24 +15,24 @@ import (
 	"encoding/hex"
 	"sync"
 
-	"github.com/dop251/goja"
+	"github.com/grafana/sobek"
 	"github.com/pocketbase/pocketbase/plugins/jsvm"
 )
 
 type SharedProgramCache struct {
 	mu    sync.RWMutex
-	progs map[string]*goja.Program // (strict, sha256(src)) -> program
+	progs map[string]*sobek.Program // (strict, sha256(src)) -> program
 }
 
 func New() *SharedProgramCache {
-	return &SharedProgramCache{progs: make(map[string]*goja.Program)}
+	return &SharedProgramCache{progs: make(map[string]*sobek.Program)}
 }
 
 // Compile satisfies jsvm.ProgramSource. It keys the shared cache on
 // (strict, sha256(src)) so identical program source across orgs resolves to a
-// single *goja.Program. strict is part of the key because the same source
+// single *sobek.Program. strict is part of the key because the same source
 // compiled sloppy vs. strict yields different programs.
-func (c *SharedProgramCache) Compile(name, src string, strict bool) (*goja.Program, error) {
+func (c *SharedProgramCache) Compile(name, src string, strict bool) (*sobek.Program, error) {
 	// name is a constant (defaultScriptPath) supplied by the fork and carries no
 	// distinguishing information, so it is deliberately not part of the key.
 	key := strictPrefix(strict) + sha256Hex(src)
@@ -45,8 +45,8 @@ func (c *SharedProgramCache) Compile(name, src string, strict bool) (*goja.Progr
 	c.mu.RUnlock()
 
 	// Compile outside the write lock, then store under lock (idempotent — last
-	// writer wins with an identical program; goja programs are immutable).
-	p, err := goja.Compile(name, src, strict)
+	// writer wins with an identical program; sobek programs are immutable).
+	p, err := sobek.Compile(name, src, strict)
 	if err != nil {
 		return nil, err
 	}

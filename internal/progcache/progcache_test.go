@@ -4,7 +4,7 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/dop251/goja"
+	"github.com/grafana/sobek"
 )
 
 func TestSharedProgramCache_CompilesOncePerSource(t *testing.T) {
@@ -40,7 +40,7 @@ func TestSharedProgramCache_DistinctSourcesDistinctPrograms(t *testing.T) {
 func TestSharedProgramCache_ConcurrentCompileIsSafe(t *testing.T) {
 	c := New()
 	// Under concurrent first-compile of the same source, multiple goroutines may
-	// each call goja.Compile; the double-checked lock ensures only ONE program is
+	// each call sobek.Compile; the double-checked lock ensures only ONE program is
 	// stored and all callers observe it (losers discard their own). This asserts
 	// the retained-program count is 1, not that compile ran exactly once.
 	var wg sync.WaitGroup
@@ -62,7 +62,7 @@ func TestSharedProgramCache_ConcurrentCompileIsSafe(t *testing.T) {
 func TestSharedProgramCache_ProgramRunsOnFreshRuntime(t *testing.T) {
 	c := New()
 	prog, _ := c.Compile("pb.js", "40 + 2", true)
-	vm := goja.New()
+	vm := sobek.New()
 	v, err := vm.RunProgram(prog)
 	if err != nil {
 		t.Fatal(err)

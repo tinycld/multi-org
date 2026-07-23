@@ -7,6 +7,7 @@ import (
 	"regexp"
 
 	"github.com/pocketbase/pocketbase"
+	"github.com/pocketbase/pocketbase/apis"
 	"github.com/pocketbase/pocketbase/core"
 
 	"tinycld.org/multitenant/internal/lockfile"
@@ -177,6 +178,66 @@ func (p *Provisioner) PublishPackage(name, version string, files map[string][]by
 	rec.Set("store_path", filepath.Join("packages", name, version))
 	rec.Set("kind", kind)
 	return p.app.Save(rec)
+}
+
+// RegisterRoutes binds the provisioning API onto the control-plane app's OnServe.
+// All routes require a superuser (control-plane admin) auth.
+func (p *Provisioner) RegisterRoutes() {
+	p.app.OnServe().BindFunc(func(e *core.ServeEvent) error {
+		g := e.Router.Group("/api")
+
+		g.POST("/orgs", func(re *core.RequestEvent) error {
+			var body struct {
+				Slug        string            `json:"slug"`
+				DisplayName string            `json:"display_name"`
+				Lockfile    map[string]string `json:"lockfile"`
+			}
+			if err := re.BindBody(&body); err != nil {
+				return re.BadRequestError("invalid body", err)
+			}
+			rec, err := p.CreateOrg(body.Slug, body.DisplayName, body.Lockfile)
+			if err != nil {
+				return re.BadRequestError(err.Error(), err)
+			}
+			return re.JSON(200, map[string]any{"slug": rec.GetString("slug"), "status": rec.GetString("status")})
+		}).Bind(apis.RequireSuperuserAuth())
+
+		g.POST("/orgs/{slug}/deploy", func(re *core.RequestEvent) error {
+			var body struct {
+				Lockfile map[string]string `json:"lockfile"`
+			}
+			if err := re.BindBody(&body); err != nil {
+				return re.BadRequestError("invalid body", err)
+			}
+			if err := p.Deploy(re.Request.PathValue("slug"), body.Lockfile); err != nil {
+				return re.BadRequestError(err.Error(), err)
+			}
+			return re.NoContent(204)
+		}).Bind(apis.RequireSuperuserAuth())
+
+		g.POST("/orgs/{slug}/suspend", func(re *core.RequestEvent) error {
+			if err := p.Suspend(re.Request.PathValue("slug")); err != nil {
+				return re.BadRequestError(err.Error(), err)
+			}
+			return re.NoContent(204)
+		}).Bind(apis.RequireSuperuserAuth())
+
+		g.POST("/orgs/{slug}/resume", func(re *core.RequestEvent) error {
+			if err := p.Resume(re.Request.PathValue("slug")); err != nil {
+				return re.BadRequestError(err.Error(), err)
+			}
+			return re.NoContent(204)
+		}).Bind(apis.RequireSuperuserAuth())
+
+		g.DELETE("/orgs/{slug}", func(re *core.RequestEvent) error {
+			if err := p.Archive(re.Request.PathValue("slug")); err != nil {
+				return re.BadRequestError(err.Error(), err)
+			}
+			return re.NoContent(204)
+		}).Bind(apis.RequireSuperuserAuth())
+
+		return e.Next()
+	})
 }
 
 func bootstrapTenantOnce(orgDir string) error {

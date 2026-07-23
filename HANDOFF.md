@@ -47,6 +47,10 @@ Four bodies of work:
    + race-clean. Local-only, no remote.
 4. **TypeScript support** (§9) — spans both repos; the fork transpiles + runs TS on
    sobek, the router transpiles at publish.
+5. **Tenant JS sandbox** (§10) — in-process capability hardening for hostile tenant
+   authors (jsvm `Sandboxed` mode). Shipped as defense-in-depth, but a demonstrated
+   `$app.db()` `ATTACH` cross-org exploit proves in-process allowlisting is not
+   containment — **OS-level per-process isolation is now the required boundary** (§5).
 
 Design spec + implementation plans:
 - Fork seams + router design (2026-07-22) live in the fork's git history at
@@ -333,8 +337,8 @@ Pick up any of these independently:
 |---|---|---|---|
 | `~/code/tinycld/pocketbase` | `feat/jsvm-programsource` | `6644c6af` | **Yes** (`fork`) — clean PR #1 (goja-era) |
 | `~/code/tinycld/pocketbase` | `feat/jsvm-programsource-buildservemux` | (older) | Yes (`fork`) — **stale, don't PR** |
-| `~/code/tinycld/pocketbase` | `feat/multitenant-fork` | `0da4c670` | No — local integration (checked out); +8 TS/sobek commits since `2c4bcc31` (§9) |
-| `~/code/tinycld/multi-org` | `feat/operator-runnable` | `da08173` | **No remote**; +TS commits since `fb4c6b0` (§9) |
+| `~/code/tinycld/pocketbase` | `feat/multitenant-fork` | `fb868ca4` | No — local integration (checked out); +8 TS/sobek commits, **+8 jsvm Sandboxed-mode commits (§10)** since `0da4c670` |
+| `~/code/tinycld/multi-org` | `feat/operator-runnable` | `1694c1e` | **No remote**; **+ jsvm-sandbox wiring + docs commits (§10)** since `da08173` |
 | `~/code/tinycld` (core+shell) | `chore/bump-pocketbase-v0.39.8` | `8fff4e4` | No |
 | `mail/calendar/contacts/drive/text/calc` | `chore/bump-pocketbase-v0.39.8` | (each) | No |
 
@@ -443,3 +447,46 @@ the transpiler (no importable Go API yet — binary-only).
   `transformSource`, router `transpileForStore`) — same options by convention, not
   a shared helper (they're in different modules). A golden output-stability test on
   the router side guards against drift; keep them in sync if you change the target.
+
+---
+
+## 10. Tenant JS sandbox — in-process hardening (done 2026-07-23) + isolation escalation
+
+Hardened the untrusted tenant server-side JS boundary. Trust model: **fully hostile**
+tenant authors sharing one process. Spec + plan (this repo):
+`docs/superpowers/specs/2026-07-23-tenant-jsvm-sandbox-design.md`,
+`docs/superpowers/plans/2026-07-23-tenant-jsvm-sandbox.md`.
+
+### Shipped (defense-in-depth; stands, but is NOT containment)
+
+Fork `feat/multitenant-fork` (`614189f1..fb868ca4`) added a nil-default
+`jsvm.Config{Sandboxed}` mode; router `feat/operator-runnable`
+(`fc2efb4`, `3c782d9`, `b783697`) turns it on for tenant code:
+
+- **Deny-by-default binding allowlist** for both hook and migration runtimes:
+  withholds `$os` (exec/env/raw FS), `$http` (outbound), `$filesystem`, `$filepath`;
+  scrubs `process.env`/`process.argv`; **withholds `$apis.static`**; **denies
+  file-based `require()`** (native modules only); **restricts `$template` to
+  `loadString`**.
+- **Enabled at both untrusted-code call sites** — runtime `orgmanager.load` and
+  provision-time `controlplane.bootstrapTenantOnce` — each via `jsvm.Register`
+  (returns the error) not `MustRegister`, so a **load-time throw fails closed** for
+  that one org instead of panicking the shared process (a DoS otherwise; singleflight
+  would poison every caller of that org).
+- All TDD'd; fork + router suites green incl. `-race`; cross-org program sharing and
+  benign JS/TS provisioning still pass (§8 proof tests).
+
+### The escalation (why in-process tops out here)
+
+A final adversarial review demonstrated a **live cross-org exploit** the allowlist
+cannot close: `$app.db()` exposes raw SQL, and a sandboxed hook running
+`ATTACH DATABASE '<other-org>/data.db'` reads another org's secrets (and writes
+arbitrary `.db` files). modernc SQLite has **no authorizer API** to contain it
+in-process. This was the 4th capability an audit found re-entering through a *kept*
+surface (`$apis.static` → `require` → `$template` → `$app.db()`). **Conclusion:
+allowlisting the full stock `$app`/DB API against a hostile author in one shared
+process is the wrong altitude.**
+
+**OS-level per-process isolation is now the required next boundary** (§5 finding #3).
+Follow-up brief: `docs/superpowers/specs/FOLLOWUP-os-process-isolation.md`.
+**Until it lands, do not treat tenant authors as untrusted in production.**

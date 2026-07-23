@@ -68,6 +68,7 @@ func (m *OrgManager) Get(slug string) (*OrgInstance, error) {
 	m.mu.RLock()
 	if inst, ok := m.orgs[slug]; ok {
 		m.mu.RUnlock()
+		inst.touch(nowNanos())
 		return inst, nil
 	}
 	m.mu.RUnlock()
@@ -84,7 +85,9 @@ func (m *OrgManager) Get(slug string) (*OrgInstance, error) {
 	if err != nil {
 		return nil, err
 	}
-	return v.(*OrgInstance), nil
+	inst := v.(*OrgInstance)
+	inst.touch(nowNanos())
+	return inst, nil
 }
 
 func (m *OrgManager) load(slug string) (*OrgInstance, error) {

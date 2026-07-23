@@ -13,7 +13,7 @@ type OrgInstance struct {
 	slug     string
 	app      *pocketbase.PocketBase
 	mux      http.Handler
-	lastUsed atomic.Int64 // unix nanos; seeded at load, updated on each dispatch (dispatch wiring pending)
+	lastUsed atomic.Int64 // unix nanos; seeded at load, updated on each Get (request dispatch)
 }
 
 func (i *OrgInstance) Mux() http.Handler { return i.mux }

@@ -52,6 +52,60 @@ func TestMaterialize_LinksHooksAndPublic(t *testing.T) {
 	}
 }
 
+func TestMaterialize_LinksMigrations(t *testing.T) {
+	root := t.TempDir()
+	s := store.New(root)
+	if err := s.Publish("@tinycld/core", "2.4.0", map[string][]byte{
+		"pb-migrations/1700000000_init.js": []byte("migrate((app)=>{},(app)=>{})"),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	lf, _ := lockfile.Parse([]byte(`{"@tinycld/core":"2.4.0"}`))
+	resolved, err := lf.Resolve(s)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	orgDir := filepath.Join(t.TempDir(), "acme")
+	if err := Materialize(orgDir, resolved); err != nil {
+		t.Fatal(err)
+	}
+
+	// The hyphenated source pb-migrations lands in the underscore pb_migrations
+	// the tenant app reads, with content resolving through the symlink.
+	mig, err := os.ReadFile(filepath.Join(orgDir, "pb_migrations", "1700000000_init.js"))
+	if err != nil {
+		t.Fatalf("reading materialized migration: %v", err)
+	}
+	if string(mig) != "migrate((app)=>{},(app)=>{})" {
+		t.Fatalf("unexpected migration content: %s", mig)
+	}
+}
+
+func TestMaterialize_MigrationCollisionErrors(t *testing.T) {
+	root := t.TempDir()
+	s := store.New(root)
+	// Two packages contributing the same migration filename is a real bug.
+	if err := s.Publish("@tinycld/core", "2.4.0", map[string][]byte{
+		"pb-migrations/1700000000_init.js": []byte("core"),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Publish("@tinycld/mail", "1.2.0", map[string][]byte{
+		"pb-migrations/1700000000_init.js": []byte("mail"),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	lf, _ := lockfile.Parse([]byte(`{"@tinycld/core":"2.4.0","@tinycld/mail":"1.2.0"}`))
+	resolved, _ := lf.Resolve(s)
+
+	orgDir := filepath.Join(t.TempDir(), "acme")
+	err := Materialize(orgDir, resolved)
+	if err == nil {
+		t.Fatal("expected a migration filename collision error, got nil")
+	}
+}
+
 func TestMaterialize_IsIdempotent(t *testing.T) {
 	root := t.TempDir()
 	s := store.New(root)

@@ -9,6 +9,7 @@ import (
 	"github.com/pocketbase/pocketbase"
 	"github.com/pocketbase/pocketbase/apis"
 	"github.com/pocketbase/pocketbase/core"
+	"github.com/pocketbase/pocketbase/plugins/jsvm"
 
 	"tinycld.org/multitenant/internal/lockfile"
 	"tinycld.org/multitenant/internal/materialize"
@@ -33,7 +34,12 @@ func NewProvisioner(app core.App, root string, s *store.PackageStore, evict Evic
 
 var slugRe = regexp.MustCompile(`^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$`)
 
-func validSlug(s string) bool { return slugRe.MatchString(s) }
+// reservedSlugs are subdomain labels the front router routes to the control
+// plane / apex redirect (frontrouter.go) — an org created with one would be
+// unreachable, so reject them.
+var reservedSlugs = map[string]bool{"admin": true, "www": true}
+
+func validSlug(s string) bool { return slugRe.MatchString(s) && !reservedSlugs[s] }
 
 // CreateOrg provisions a new org, or resumes a previously half-provisioned one.
 // If an org row for the slug already exists and is still active, it errors; if
@@ -240,10 +246,21 @@ func (p *Provisioner) RegisterRoutes() {
 	})
 }
 
+// bootstrapTenantOnce opens a fresh tenant app just long enough to run its
+// migrations at provision time. jsvm is registered so the materialized JS
+// migrations in pb_migrations are picked up (without it only the Go core
+// migrations run and the tenant boots with no application collections). This is
+// a transient one-shot app, so ProgramSource is left nil — cross-org program
+// sharing is only relevant on the long-lived runtime load path (orgmanager).
 func bootstrapTenantOnce(orgDir string) error {
 	pb := pocketbase.NewWithConfig(pocketbase.Config{
 		DefaultDataDir:  filepath.Join(orgDir, "pb_data"),
 		HideStartBanner: true,
+	})
+	jsvm.MustRegister(pb, jsvm.Config{
+		HooksDir:      filepath.Join(orgDir, "pb_hooks"),
+		MigrationsDir: filepath.Join(orgDir, "pb_migrations"),
+		HooksWatch:    false,
 	})
 	if err := pb.Bootstrap(); err != nil {
 		return err

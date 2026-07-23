@@ -5,6 +5,7 @@ go 1.26.3
 replace github.com/pocketbase/pocketbase => ../pocketbase
 
 require (
+	github.com/evanw/esbuild v0.28.1
 	github.com/grafana/sobek v0.0.0-20260722203707-64fef69693b6
 	github.com/pocketbase/pocketbase v0.39.8
 	golang.org/x/crypto v0.54.0
@@ -18,7 +19,6 @@ require (
 	github.com/domodwyer/mailyak/v3 v3.6.2 // indirect
 	github.com/dop251/base64dec v0.0.0-20231022112746-c6c9f9a96217 // indirect
 	github.com/dustin/go-humanize v1.0.1 // indirect
-	github.com/evanw/esbuild v0.28.1 // indirect
 	github.com/fatih/color v1.19.0 // indirect
 	github.com/fsnotify/fsnotify v1.10.1 // indirect
 	github.com/gabriel-vasile/mimetype v1.4.13 // indirect

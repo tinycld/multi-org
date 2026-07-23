@@ -88,6 +88,78 @@ func TestIntegration_CreateOrgToLoadWithSchema(t *testing.T) {
 	}
 }
 
+// TestIntegration_CreateOrgToLoadWithTSSchema mirrors the JS test, but authors
+// the package in TypeScript and publishes via Provisioner.PublishPackage — which
+// runs transpileForStore at publish time (.pb.ts→.pb.js, .ts→.js). The source
+// uses TS-only syntax (interface, `as P`, `as any`); if the publish-time
+// transpile didn't run, that source would reach the JS engine verbatim and the
+// tenant would fail to load it. So this passing proves the full
+// TS-authored → transpile-at-publish → materialize → run-on-sobek chain.
+func TestIntegration_CreateOrgToLoadWithTSSchema(t *testing.T) {
+	root := t.TempDir()
+
+	cp, err := New(filepath.Join(root, "pb_control", "pb_data"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cp.App.Bootstrap(); err != nil {
+		t.Fatal(err)
+	}
+	defer cp.App.ResetBootstrapState()
+	if err := cp.App.RunAllMigrations(); err != nil {
+		t.Fatal(err)
+	}
+
+	s := store.New(root)
+	p := NewProvisioner(cp.App, root, s, func(string) {})
+
+	// TypeScript source with TS-only syntax — must be transpiled before it can
+	// run on the JS (sobek) engine.
+	files := map[string][]byte{
+		"server/main.pb.ts": []byte(
+			"interface P { ok: boolean }\n" +
+				"routerAdd('GET','/whoami',(e)=>e.json(200,{ ok: true } as P))"),
+		"pb-migrations/1700000000_widgets.ts": []byte(
+			"migrate((app)=>{\n" +
+				"  const c = new Collection({ id:'pbc_widgets_01', name:'widgets', type:'base', fields:[{ id:'w_name', name:'name', type:'text' }] } as any)\n" +
+				"  app.save(c)\n" +
+				"},(app)=>{ app.delete(app.findCollectionByNameOrId('widgets')) })"),
+	}
+	if err := p.PublishPackage("@tinycld/core", "1.0.0", files, "official"); err != nil {
+		t.Fatalf("PublishPackage: %v", err)
+	}
+
+	if _, err := p.CreateOrg("acme", "Acme", map[string]string{"@tinycld/core": "1.0.0"}); err != nil {
+		t.Fatalf("CreateOrg: %v", err)
+	}
+
+	// The TS migration (transpiled to JS, materialized, run) must have created the
+	// collection in acme's own tenant DB.
+	assertTenantHasWidgets(t, filepath.Join(root, "pb_orgs", "acme", "pb_data"))
+
+	// Drive the full runtime chain: OrgLookup (real, DB-backed) → manager.load.
+	mgr := orgmanager.New(orgmanager.Config{
+		Root:      root,
+		Store:     s,
+		Programs:  progcache.New(),
+		LookupOrg: OrgLookup(cp.App),
+		HooksPool: 2,
+	})
+	defer mgr.Shutdown()
+
+	inst, err := mgr.Get("acme")
+	if err != nil {
+		t.Fatalf("manager.Get(acme) via real lookup: %v", err)
+	}
+
+	// The TS hook (transpiled, materialized) serves on sobek.
+	rec := httptest.NewRecorder()
+	inst.Mux().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/whoami", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("/whoami via manager = %d body=%s", rec.Code, rec.Body.String())
+	}
+}
+
 func assertTenantHasWidgets(t *testing.T, dataDir string) {
 	t.Helper()
 	tenant := pocketbase.NewWithConfig(pocketbase.Config{

@@ -1,41 +1,67 @@
-# Handoff — Multi-Tenant PocketBase
+# Handoff — Multi-Org PocketBase Router
 
-**Date:** 2026-07-22
+**Updated:** 2026-07-23 (was 2026-07-22)
 **Goal:** Make one PocketBase process host many organizations — each org its own
 SQLite DB, client JS bundle, and server-side JS handlers — sharing versioned code
 where identical, isolated where not.
 
 This documents everything built, where it lives, what's pushed vs. local, and
-what remains. **Nothing here is on a public/shared remote except one clean PR
-branch** (see [Git state](#git-state)).
+what remains.
+
+> **⚠️ Paths changed 2026-07-23.** The router moved
+> `~/code/multitenant` → **`~/code/tinycld/multi-org`** and its Go module was
+> renamed `tinycld.org/multitenant` → **`tinycld.org/multi-org`**. The PocketBase
+> fork moved `~/code/vendor/pocketbase` → **`~/code/tinycld/pocketbase`**, and the
+> router's `go.mod replace` is now the relative **`../pocketbase`**. Both are
+> nested independent git repos inside the tinycld workspace (gitignored by the
+> parent; not pnpm members).
 
 ---
 
 ## TL;DR — current state
 
-The system is **built, wired, and proven end-to-end**: an automated test boots two
-isolated orgs that each serve their own JS hook route and share compiled programs
-in memory. It is **not yet operator-runnable** — three prerequisites are documented
-but unimplemented (superuser bootstrap, tenant schema source, wildcard TLS).
+The router is **operator-runnable and proven end-to-end live**, not just in a
+test. A booted `serve-multi` (proxy mode) creates a control-plane superuser from
+env, provisions an org via `POST /api/orgs`, brings that tenant up **with its
+application collections** (materialized from the package's `pb-migrations`), and
+serves the tenant's custom hook route at `<slug>.<domain>`. All three former
+prerequisites are closed.
 
-Three bodies of work:
+**As of 2026-07-23 the system also runs TypeScript.** Package authors write
+`.pb.ts` / `.ts` hooks and migrations; they are transpiled TS→JS (esbuild) and run
+on the **sobek** JS engine (the fork was swapped goja→sobek for ESM/ES2020+, with
+`sobek_nodejs` vendored in). Transpilation happens at **publish time** (the store
+holds `.js`) with a **load-time** fallback for raw `.ts`. Proven live: a TypeScript
+package published over HTTP → stored as `.js` → provisioned → its TS-authored hook
+served and its TS migration's collection present in the tenant DB. See §9.
 
-1. **PocketBase fork seams** (`~/code/vendor/pocketbase`) — two additive
-   extension points. One is a clean PR branch pushed to your fork; the other is
-   staged for a second PR.
+Four bodies of work:
+
+1. **PocketBase fork seams + TypeScript engine** (`~/code/tinycld/pocketbase`) — the
+   two additive embed seams (§1) *plus* the TypeScript transpile seam and the
+   goja→sobek swap (§9). All on `feat/multitenant-fork`.
 2. **Workspace version bump** — PocketBase `v0.38.1 → v0.39.8` across all 8 tinycld
    Go modules. Local commits, unpushed.
-3. **The multitenant router** (`~/code/multitenant`) — a new private Go module, 19
-   commits, 8 packages, all green + race-clean. Local-only, no remote.
+3. **The multi-org router** (`~/code/tinycld/multi-org`) — a private Go module,
+   branch `feat/operator-runnable`, 8 packages + TypeScript publish path, all green
+   + race-clean. Local-only, no remote.
+4. **TypeScript support** (§9) — spans both repos; the fork transpiles + runs TS on
+   sobek, the router transpiles at publish.
 
-Design spec + implementation plans live at
-`~/code/vendor/pocketbase/docs/superpowers/{specs,plans}/2026-07-22-*.md`.
+Design spec + implementation plans:
+- Fork seams + router design (2026-07-22) live in the fork's git history at
+  `docs/superpowers/{specs,plans}/2026-07-22-*.md` (on the branches that committed
+  them; not in the `feat/multitenant-fork` working tree).
+- Operator-runnable plan: `~/.claude/plans/streamed-orbiting-pretzel.md`.
+- **TypeScript** spec + plan (committed in this repo):
+  `docs/superpowers/specs/2026-07-23-typescript-hooks-design.md` and
+  `docs/superpowers/plans/2026-07-23-typescript-hooks.md`.
 
 ---
 
 ## 1. PocketBase fork seams
 
-**Repo:** `~/code/vendor/pocketbase` (a clone of `pocketbase/pocketbase`;
+**Repo:** `~/code/tinycld/pocketbase` (a clone of `pocketbase/pocketbase`;
 `origin` = upstream, `fork` = `git@github.com:nathanstitt/pocketbase.git`).
 
 Two narrow, backward-compatible, nil-default extension points were added so a
@@ -44,23 +70,30 @@ separate (closed) router can embed and multiplex PocketBase apps. Both are
 
 ### Seam A — `jsvm.ProgramSource` (PR #1, pushed)
 
-An optional hook on `jsvm.Config` letting an embedder share compiled goja programs
-across plugin instances:
+An optional hook on `jsvm.Config` letting an embedder share compiled programs
+across plugin instances. **As of the goja→sobek swap (§9) the interface returns
+`*sobek.Program`** (it was `*goja.Program` when the seam was first authored /
+pushed as PR #1):
 
 ```go
 type ProgramSource interface {
-    Compile(name, src string, strict bool) (*goja.Program, error)
+    Compile(name, src string, strict bool) (*sobek.Program, error)
 }
 ```
 
-Nil (default) → compile directly with goja. Set → route all hook-file + callback
-compilation through it. Hook files compile sloppy (matching `RunScript`);
+Nil (default) → compile directly with the engine. Set → route all hook-file +
+callback compilation through it. Hook files compile sloppy (matching `RunScript`);
 callbacks compile strict (matching the prior `MustCompile(..., true)` sites).
+
+> ⚠️ The **pushed PR #1 branch** (`feat/jsvm-programsource`) still uses
+> `*goja.Program` — the sobek swap lives only on the integration branch
+> `feat/multitenant-fork` (§9). If PR #1 is upstreamed as-is it stays goja; the
+> sobek swap is a downstream-only divergence unless separately upstreamed.
 
 - **Branch:** `feat/jsvm-programsource` (commit `6644c6af`, based on the released
   tag **`v0.39.8`** + one commit). **Pushed to `fork`** — clean, PR-ready.
 - **Files:** `plugins/jsvm/{program_source.go, jsvm.go, binds.go}` + tests.
-- The PR body is ready — see [Loose ends](#loose-ends) for where it is.
+- The PR body is ready — see [Loose ends](#6-loose-ends--next-actions) for where it is.
 
 ### Seam B — `apis.BuildServeMux` (PR #2, staged)
 
@@ -79,8 +112,8 @@ behavior is unchanged.
 
 - **Branch:** `feat/multitenant-fork` (commit `2c4bcc31`) = `feat/jsvm-programsource`
   + the two `BuildServeMux` commits cherry-picked. **This is the currently
-  checked-out branch**, and the multitenant module's `go.mod replace` points at
-  this working tree. Local-only; not for upstream.
+  checked-out branch**, and the router's `go.mod replace` (`../pocketbase`) points
+  at this working tree. Local-only; not for upstream.
 
 **Fork delivery plan (spec D12):** submit both seams as upstream PRs. If accepted,
 the downstream `replace` is dropped and everything becomes a plain library import.
@@ -114,27 +147,28 @@ module builds, tests pass, `go vet` clean; the assembled workspace builds.
 
 **To ship:** push each repo's bump branch (7 pushes / PRs), or fold into a
 coordinated release (see the `release` skill). These are independent of the
-multitenant work and can land anytime.
+router work and can land anytime.
 
 ---
 
-## 3. The multitenant router (`~/code/multitenant`)
+## 3. The multi-org router (`~/code/tinycld/multi-org`)
 
-New **private** Go module `tinycld.org/multitenant`, **19 commits, HEAD `a208907`,
-branch `main`, no remote, clean tree.** ~1150 LOC production Go across 8 packages,
-all tests green and race-clean.
+Private Go module `tinycld.org/multi-org`, **22 commits, HEAD `fb4c6b0`, branch
+`feat/operator-runnable`, no remote, clean tree.** ~1150 LOC production Go across
+8 packages, all tests green and race-clean.
 
 Imports the fork via `go.mod`:
-`replace github.com/pocketbase/pocketbase => /Users/nas/code/vendor/pocketbase`
+`replace github.com/pocketbase/pocketbase => ../pocketbase`
 (the fork must be on `feat/multitenant-fork` — it currently is).
 
 ### What it does
 
-One process hosts N orgs. A fronting HTTPS server dispatches by subdomain to a
+One process hosts N orgs. A fronting server dispatches by subdomain to a
 control-plane PocketBase app (registry + provisioning) or a lazily-loaded tenant
-app. Each tenant is stock PocketBase with `pb_hooks`/`pb_public` materialized as
-symlink farms from a version-addressed package store; compiled JS hook programs are
-shared across orgs via a process-wide cache implementing the fork's `ProgramSource`.
+app. Each tenant is stock PocketBase with `pb_hooks`/`pb_public`/`pb_migrations`
+materialized as symlink farms from a version-addressed package store; compiled JS
+hook programs are shared across orgs via a process-wide cache implementing the
+fork's `ProgramSource`.
 
 ### Package map
 
@@ -142,87 +176,85 @@ shared across orgs via a process-wide cache implementing the fork's `ProgramSour
 |---|---|
 | `internal/store` | Immutable version-addressed package store. |
 | `internal/lockfile` | Per-org `{name:version}` lockfile; parse + resolve vs. store. |
-| `internal/materialize` | Symlink-farm `pb_hooks` (from `server/`) + `pb_public` (from `client/dist/`). |
+| `internal/materialize` | Symlink-farm `pb_hooks` (from `server/`), `pb_public` (from `client/dist/`), **and `pb_migrations` (from `pb-migrations/`)**. |
 | `internal/progcache` | `SharedProgramCache` → the fork's `jsvm.ProgramSource`. |
 | `internal/controlplane` | Control-plane app: `orgs/packages/deployments` schema, `Provisioner`, HTTP routes, `OrgLookup`. |
 | `internal/orgmanager` | Lazy per-org app loader: materialize → bootstrap PB+jsvm(shared cache) → `BuildServeMux`; singleflight, `Evict`, idle sweeper. |
 | `internal/frontrouter` | `Host` → subdomain dispatch. |
-| `internal/server` | Single `http.Server` + wildcard autocert + graceful shutdown. |
-| `cmd/serve-multi` | Wires it all together. |
+| `internal/server` | Single `http.Server`; TLS mode = proxy / file / autocert; graceful shutdown. |
+| `cmd/serve-multi` | Wires it all together; env-driven superuser bootstrap. |
 
-### Proven working (the payoff)
+### Proven working
 
-`internal/orgmanager/e2e_test.go` — two orgs boot independently, each serves
-`/api/health` **and** its own custom `/whoami` JS-hook route (materialized from the
-package + run through the shared cache), and loading the second org with identical
-hooks **adds zero new compiled programs** (`TestE2E_SecondOrgAddsNoNewPrograms`).
-The cross-org memory-sharing win — the whole reason for Seam A — is verified across
-the fork boundary.
-
-### How the work was done
-
-All 13 plan tasks implemented via subagent-driven TDD, each with two-stage review
-(spec compliance, then code quality). Reviews caught **five real bugs** beyond
-typos, all fixed:
-
-1. jsvm hook files compiled strict instead of sloppy → would break existing
-   sloppy-mode `.pb.js` (Plan 1).
-2. Unrecoverable stranded `provisioning` org row → made `CreateOrg` resumable.
-3. `Shutdown` vs in-flight `load` leaked a bootstrapped app → `closed` guard.
-4. Idle sweeper evicted every instance because `lastUsed` was never seeded → seed
-   at load + skip zero.
-5. `Deploy` swallowed the audit-record write error → propagate.
-
-Plus a final holistic review that found the cross-cutting gaps below.
+- **Cross-org program sharing** (`internal/orgmanager/e2e_test.go`): two orgs boot
+  independently, each serves `/api/health` **and** its own custom `/whoami` JS-hook
+  route, and loading a second org with identical hooks **adds zero new compiled
+  programs** (`TestE2E_SecondOrgAddsNoNewPrograms`) — the whole reason for Seam A,
+  verified across the fork boundary.
+- **Full provisioning chain** (`internal/controlplane/integration_test.go`,
+  `TestIntegration_CreateOrgToLoadWithSchema`): the real
+  `CreateOrg → OrgLookup → orgmanager.load` path (no stub lookup). A package
+  carrying a `pb-migrations` schema is published, `CreateOrg` runs, the tenant DB
+  gains the collection, and the manager serves the tenant's hook route.
+- **Live smoke test (2026-07-23):** booted `serve-multi` in proxy mode; superuser
+  bootstrapped from env; `POST /api/orgs` → `active`; `acme.<domain>/whoami` served;
+  the package's `widgets` collection confirmed present in acme's own `data.db`
+  (materialized via the `pb_migrations` symlink); reserved slug `admin` rejected 400.
 
 ---
 
-## 4. Known gaps & prerequisites (from the final review)
+## 4. Operator-runnable work — DONE (Track A, 2026-07-23)
 
-The architecture composes correctly (the hard seams — `OnServe`-before-
-`BuildServeMux`, the JSONField lockfile round-trip, cross-org cache sharing — are
-all verified right). These stand between "composes" and "operator can run it." They
-are also documented in `README.md`.
+Commit `207ef4b` (`feat: make the router operator-runnable`) closed the three
+former prerequisites. Approved plan: `~/.claude/plans/streamed-orbiting-pretzel.md`.
 
-**Fixed already:** idle eviction now tracks real request activity (`touch()` wired
-into `Get`).
+1. **Control-plane superuser bootstrap** — `cmd/serve-multi/main.go`
+   `ensureSuperuser` upserts a superuser from `MT_SUPERUSER_EMAIL` /
+   `MT_SUPERUSER_PASSWORD` after migrations (idempotent; logs and no-ops when
+   unset). The provisioning API is now usable on a fresh `MT_ROOT`.
+2. **Tenant application schema** — `materialize` gained a third step
+   (`linkMigrations`) that symlinks each package's `pb-migrations/*.js` into the
+   org's `pb_migrations`, **erroring on cross-package filename collisions**
+   (mirroring tinycld's single-tenant generator guarantee). `bootstrapTenantOnce`
+   now registers jsvm so those JS migrations actually run at first provision.
+   Provisioned tenants boot with their application collections.
+3. **TLS modes** — `internal/server/serve.go` honors `MT_TLS_MODE`: **`proxy`**
+   (plain HTTP behind a TLS-terminating LB/proxy — the default and simplest real
+   deploy), **`file`** (pre-issued `*.<domain>` wildcard cert+key via
+   `MT_TLS_CERT`/`MT_TLS_KEY`), and **`autocert`** (retained; still needs a DNS-01
+   solver for real wildcards).
 
-**Prerequisites (must close before hosting a real tenant):**
+Also folded in: **reserved-subdomain rejection** (`validSlug` now rejects
+`admin`/`www`, which the front router can't reach) and the **dedicated integration
+test** above.
 
-1. **No control-plane superuser** → the provisioning API (`POST /api/orgs`, all
-   superuser-guarded) is unusable on a fresh `mt_data`. Add an env-driven
-   `create-superuser` step to `cmd/serve-multi`, or create one manually against
-   `<MT_ROOT>/pb_control/pb_data`.
-2. **No tenant schema source** → `materialize` wires `pb_hooks`/`pb_public` but not
-   `pb_migrations`; `CreateOrg` creates that dir empty. Provisioned tenants boot
-   with hooks + assets but **no application collections**. This is an open design
-   decision: link a package's `pb_migrations/` as a third materialize step, or ship
-   JS migrations another way.
-3. **Wildcard TLS** → autocert can't issue `*.MT_BASE_DOMAIN` via HTTP-01; supply a
-   DNS-01 solver or a pre-issued wildcard cert.
+---
 
-**Cleanup (non-blocking):** store "content-addressed" naming is vestigial
-(`ContentHash`/`content_hash`/`manifest` unused — either wire or drop);
-`validSlug` accepts reserved `admin`/`www` slugs the router can't serve; no single
-test drives the real `CreateOrg → OrgLookup → load` chain (covered transitively);
+## 5. Remaining gaps / findings (surfaced 2026-07-23, NOT yet done)
+
+Gaps found while making the router runnable:
+
+1. ~~**No HTTP route to publish packages.**~~ **CLOSED (2026-07-23, §9).** The
+   `POST /api/store/packages` route (superuser-guarded, base64 file payloads) was
+   added as part of the TypeScript work and is proven live.
+2. **Control-plane collections leak into every tenant.** `orgs`/`packages`/
+   `deployments` are registered into the process-global `core.AppMigrations`, so
+   every tenant DB also runs them (observed `orgs`, `packages`, `deployments` in
+   acme's `data.db`). The spec is explicit that **no org/membership data belongs in
+   a tenant** — a tenant having an `orgs` table contradicts the isolation model.
+   Fix likely means registering the control-plane schema only on the control-plane
+   app (e.g. app-scoped migration registration) rather than globally.
+
+**Cleanup (non-blocking, still open):** store "content-addressed" naming is
+vestigial (`ContentHash`/`content_hash`/`manifest` unused — either wire or drop);
 `lockfile.Resolve` doesn't run the `peerVersions` solver yet (spec §7 follow-on).
 
----
-
-## 5. Git state (what's where)
-
-| Repo | Branch | HEAD | Pushed? |
-|---|---|---|---|
-| `~/code/vendor/pocketbase` | `feat/jsvm-programsource` | `6644c6af` | **Yes** (`fork`) — clean PR #1 |
-| `~/code/vendor/pocketbase` | `feat/jsvm-programsource-buildservemux` | (older) | Yes (`fork`) — **stale, don't PR** |
-| `~/code/vendor/pocketbase` | `feat/multitenant-fork` | `2c4bcc31` | No — local integration (checked out) |
-| `~/code/multitenant` | `main` | `a208907` | **No remote** |
-| `~/code/tinycld` (core+shell) | `chore/bump-pocketbase-v0.39.8` | `8fff4e4` | No |
-| `mail/calendar/contacts/drive/text/calc` | `chore/bump-pocketbase-v0.39.8` | (each) | No |
-
-⚠️ The multitenant module builds against the fork's **working tree**, which must
-stay on `feat/multitenant-fork` for the `replace` to see both seams. If you check
-out another fork branch, the router won't compile (missing `BuildServeMux`).
+**The Track-B follow-on — tinycld de-org-ing (spec §11):** remove `orgs`/`user_org`
+collections + FKs from the tinycld app, collapse `useOrgLiveQuery`/`OrgScope` to
+auth-based rules, org switcher via the parent-domain hint cookie. This is the
+larger app-facing effort that makes orgs independent inside the tinycld codebase.
+It's now unblocked (the router can produce a live tenant to verify against) but
+needs its own plan.
 
 ---
 
@@ -231,30 +263,139 @@ out another fork branch, the router won't compile (missing `BuildServeMux`).
 Pick up any of these independently:
 
 - **PR #1 (ProgramSource):** open it from `nathanstitt/pocketbase:feat/jsvm-programsource`
-  against `pocketbase/pocketbase`. The PR body was drafted in the working
-  conversation (re-generate if lost — it's a short summary of Seam A + the sloppy-
-  mode note + backward-compat statement).
+  against `pocketbase/pocketbase` (short summary of Seam A + the sloppy-mode note +
+  backward-compat statement).
 - **PR #2 (BuildServeMux):** rebuild a clean branch off `v0.39.8` (the pushed
   `-buildservemux` branch is stale), then PR.
 - **Ship the version bump:** push the 7 `chore/bump-pocketbase-v0.39.8` branches
   (or fold into a coordinated release).
-- **Close prerequisites #1–#3** (superuser bootstrap, tenant schema, wildcard TLS)
-  to make the router operator-runnable.
+- **Close finding #2 (tenant schema leak)** from §5. (Finding #1, the publish
+  route, is now closed — §9.)
 - **Delete the stale fork branch** `feat/jsvm-programsource-buildservemux` from the
   remote once PR #2's clean branch exists.
-- **Give the multitenant module a remote** if it should be shared/CI'd.
+- **Give the multi-org module a remote** if it should be shared/CI'd.
+- **Plan Track B** (tinycld de-org-ing, spec §11).
+- **TypeScript follow-ons (§9):** the goja→sobek swap is a downstream-only
+  divergence — decide whether to upstream it or keep it fork-local; and the two
+  esbuild transpile call sites (fork `transformSource`, router `transpileForStore`)
+  are duplicated across repos, kept in sync by a golden test rather than a shared
+  helper.
 
 ---
 
-## 7. Verify the current state
+## 7. Git state (what's where)
+
+| Repo | Branch | HEAD | Pushed? |
+|---|---|---|---|
+| `~/code/tinycld/pocketbase` | `feat/jsvm-programsource` | `6644c6af` | **Yes** (`fork`) — clean PR #1 (goja-era) |
+| `~/code/tinycld/pocketbase` | `feat/jsvm-programsource-buildservemux` | (older) | Yes (`fork`) — **stale, don't PR** |
+| `~/code/tinycld/pocketbase` | `feat/multitenant-fork` | `0da4c670` | No — local integration (checked out); +8 TS/sobek commits since `2c4bcc31` (§9) |
+| `~/code/tinycld/multi-org` | `feat/operator-runnable` | `da08173` | **No remote**; +TS commits since `fb4c6b0` (§9) |
+| `~/code/tinycld` (core+shell) | `chore/bump-pocketbase-v0.39.8` | `8fff4e4` | No |
+| `mail/calendar/contacts/drive/text/calc` | `chore/bump-pocketbase-v0.39.8` | (each) | No |
+
+⚠️ The router builds against the fork's **working tree**, which must stay on
+`feat/multitenant-fork` for the `../pocketbase` replace to see both seams **and the
+sobek engine**. If you check out another fork branch, the router won't compile
+(missing `BuildServeMux`, and/or `*goja.Program` vs `*sobek.Program` mismatch).
+
+Both `multi-org/` and `pocketbase/` are gitignored by the parent `~/code/tinycld`
+repo (entries just below the `link-members.ts` auto-managed block) and are not
+pnpm workspace members, so workspace tooling ignores them.
+
+---
+
+## 8. Verify the current state
 
 ```sh
 # Router builds + all tests green + race-clean (fork must be on feat/multitenant-fork):
-cd ~/code/multitenant && go build ./... && go vet ./... && go test ./... -count=1 && go test -race ./...
+cd ~/code/tinycld/multi-org && go build ./... && go vet ./... && go test ./... -count=1 && go test -race ./...
 
-# The core promise:
+# The cross-org sharing promise + the full provisioning chain (JS and TS variants):
 go test ./internal/orgmanager/ -run TestE2E -v
+go test ./internal/controlplane/ -run TestIntegration_CreateOrgToLoadWithSchema -v
+go test ./internal/controlplane/ -run TestIntegration_CreateOrgToLoadWithTSSchema -v
+
+# TypeScript on the fork (transpile seam + sobek engine, incl. vendored node modules):
+cd ~/code/tinycld/pocketbase && go test ./plugins/jsvm/... -count=1 && go test -race ./plugins/jsvm/ -count=1
+
+# Live operator flow (proxy mode, no TLS needed for the smoke test):
+#   MT_ROOT=/tmp/mt_smoke MT_BASE_DOMAIN=tinycld.test MT_TLS_MODE=proxy MT_ADDR=127.0.0.1:8543 \
+#     MT_SUPERUSER_EMAIL=admin@tinycld.test MT_SUPERUSER_PASSWORD='<pw>' ./serve-multi
+#   Then, as superuser on admin.<domain>: POST /api/store/packages a package whose files
+#   are base64-encoded .pb.ts/.ts source (transpiled to .js in the store), POST /api/orgs,
+#   then GET <slug>.<domain>/<hook route>. (A package can also be seeded on disk under
+#   <MT_ROOT>/packages/<name>/<version>/ using already-.js files.)
 
 # Workspace bump holds:
 cd ~/code/tinycld/tinycld/core/server && go test ./...
 ```
+
+---
+
+## 9. TypeScript hooks & migrations + goja→sobek (done 2026-07-23)
+
+Package authors write `.pb.ts` / `.ts` hooks and migrations in real TypeScript
+(types, `interface`, `enum`, `as`, optional chaining). Spec + plan:
+`docs/superpowers/{specs,plans}/2026-07-23-typescript-hooks*.md`.
+
+**Decisions (from the brainstorm):** esbuild-Go for transpile (pure Go, no CGO,
+`Loader: LoaderTS`, `Target: ES2020`, inline sourcemaps); engine goja→**sobek**
+(`github.com/grafana/sobek`) for ESM/ES2020+; **on-disk bytecode caching dropped**
+(neither goja nor sobek can serialize `*Program`; the in-memory `ProgramSource`
+cache covers load speed). TS 7's native Go compiler was evaluated and rejected as
+the transpiler (no importable Go API yet — binary-only).
+
+### In the fork (`~/code/tinycld/pocketbase`, `feat/multitenant-fork`)
+
+- **Transpile seam** — `plugins/jsvm/transform.go`: `transformSource(name, content)`
+  transpiles `.ts` via esbuild, passes `.js` through byte-for-byte, and guards
+  empty input (so an empty `.pb.ts` stays 0 bytes and `registerHooks` still fires
+  its `types.d.ts` bootstrap). Wired into `filesContent` (`jsvm.go`) — the single
+  chokepoint **both** `registerHooks` and `registerMigrations` use. This placement
+  is load-bearing: migrations run via `vm.RunScript` and bypass `p.compile`, so a
+  seam at `p.compile` alone would miss `.ts` migrations.
+- **Engine swap goja→sobek** — every `goja.` → `sobek.` across `plugins/jsvm/` +
+  `tools/types/`; `ProgramSource.Compile` now returns `*sobek.Program`.
+- **Vendored `sobek_nodejs`** — the require/console/process/buffer modules (+
+  transitive util/goutil/errors) are copied into
+  `plugins/jsvm/internal/nodejs/**` (MIT, provenance in that dir's README) rather
+  than depended on as the 1-star `ohayocorp/sobek_nodejs` module. The fork is
+  self-contained; no external node-compat dep.
+
+### In the router (`~/code/tinycld/multi-org`, `feat/operator-runnable`)
+
+- **`progcache`** — `SharedProgramCache` now holds `*sobek.Program` (follows the
+  seam). Only forced router change from the engine swap.
+- **Publish-time transpile** — `internal/controlplane/transpile.go`
+  `transpileForStore(files)` converts `.pb.ts`→`.pb.js` / `.ts`→`.js` (keys +
+  content) before `store.Publish`, so the store holds `.js` and production tenants
+  materialize pure JS (the fork's load-time seam then no-ops). `.d.ts` files pass
+  through untranspiled. Called from `PublishPackage`.
+- **`POST /api/store/packages`** — the publish route (superuser-guarded, files as
+  base64) — closes §5 finding #1.
+
+### Proven
+
+- Fork: `plugins/jsvm/transform_test.go` — unit (transpile / `.js` passthrough /
+  empty guard / error surfacing), e2e `.pb.ts` hook + `.ts` migration through the
+  seam, node-compat (Buffer/process/console/require) and ES2020 (`?.`/`??`) on
+  sobek. Vendored packages' own suites pass.
+- Router: `transpile_test.go` (key-rewrite, `.d.ts` passthrough, ES2020-stability
+  golden test), and `integration_test.go`
+  `TestIntegration_CreateOrgToLoadWithTSSchema` — the full stack: TS published via
+  `PublishPackage` → transpiled → materialized → tenant collection present + hook
+  route serves on sobek. A separate reviewer empirically confirmed this test FAILS
+  if transpile is neutered.
+- **Live:** a TypeScript package `POST`ed to `/api/store/packages` was stored as
+  `.js`, provisioned, its hook served `{"ok":true}`, and its migration's collection
+  was present in the tenant DB.
+
+### Consequences / watch-outs
+
+- The **sobek swap is downstream-only.** The pushed PR #1 branch is still goja
+  (§1). Upstreaming sobek is a separate decision.
+- The **two esbuild call sites are duplicated** across repos (fork
+  `transformSource`, router `transpileForStore`) — same options by convention, not
+  a shared helper (they're in different modules). A golden output-stability test on
+  the router side guards against drift; keep them in sync if you change the target.

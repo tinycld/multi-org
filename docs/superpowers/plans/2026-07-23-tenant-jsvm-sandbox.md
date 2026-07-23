@@ -736,6 +736,265 @@ git commit -m "feat: sandbox provision-time tenant migrations"
 
 ---
 
+## Task 8.5: Fail closed (not panic) on a load-time hook error (fork + router)
+
+**Why (found during Task 8 review):** When `HooksWatch: false` (the config BOTH router call sites use), `compileHookFiles` (`plugins/jsvm/jsvm.go`) **re-`panic`s** on any hook file that throws at *load* time — e.g. a hostile tenant hook with top-level `$os.exec(...)` or any top-level `throw`. That panic propagates uncaught through `Register`/`MustRegister`, crashing the **entire shared multi-tenant process** when an org is lazily loaded (`orgmanager.Get`) or provisioned. The capability sandbox denies `$os`, but the *throw* still panics → a process-wide DoS any org operator can trigger by publishing a hook bundle that throws on load. Task 8 fixed this for the migration path (via `Register`+return); this task closes the same class of bug on the **hook-load** path at both sites.
+
+**Design:** Make `compileHookFiles` **return** the load error instead of re-panicking **when `p.config.Sandboxed`** (stock non-sandboxed behavior stays byte-for-byte: it still panics, matching upstream's trusted-author assumption). Then switch `orgmanager.load`'s `MustRegister` → `Register`+return so a hostile hook fails only that one org's load (surfacing as a 5xx for that tenant) rather than panicking the process. The provision path already uses `Register`+return after Task 8, so it inherits the fix automatically once the fork stops panicking under `Sandboxed`.
+
+**Files:**
+- Modify: `~/code/tinycld/pocketbase/plugins/jsvm/jsvm.go` (`compileHookFiles`)
+- Modify: `~/code/tinycld/pocketbase/plugins/jsvm/sandbox_test.go` (fork deny test)
+- Modify: `~/code/tinycld/multi-org/internal/orgmanager/manager.go` (`MustRegister` → `Register`+return)
+- Modify: `~/code/tinycld/multi-org/internal/orgmanager/e2e_test.go` (router deny test)
+- Modify: `~/code/tinycld/multi-org/internal/controlplane/integration_test.go` (provision hook-throw deny test)
+
+### Part A — fork: return instead of panic under Sandboxed
+
+- [ ] **Step 1: Write the failing fork test (a sandboxed hook that throws at load must make `Register` return an error, not panic)**
+
+Append to `~/code/tinycld/pocketbase/plugins/jsvm/sandbox_test.go`:
+
+```go
+func TestSandboxHookThrowAtLoadReturnsError(t *testing.T) {
+	app, err := tests.NewTestApp()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(app.Cleanup)
+
+	hooksDir := filepath.Join(t.TempDir(), "pb_hooks")
+	if err := os.MkdirAll(hooksDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// Top-level code runs at hook LOAD. Under sandbox $os is undefined, so this
+	// throws at load. It must be RETURNED as an error, not panic the process.
+	if err := os.WriteFile(filepath.Join(hooksDir, "main.pb.js"), []byte(`$os.exec('id')`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Register must not panic; it must return a non-nil error.
+	defer func() {
+		if r := recover(); r != nil {
+			t.Fatalf("Register panicked on a load-time hook error under sandbox: %v", r)
+		}
+	}()
+	if err := Register(app, Config{HooksDir: hooksDir, Sandboxed: true}); err == nil {
+		t.Fatal("expected Register to return an error for a load-throwing sandboxed hook, got nil")
+	}
+}
+```
+
+- [ ] **Step 2: Run it — expect FAIL (panic)**
+
+Run: `cd ~/code/tinycld/pocketbase && go test ./plugins/jsvm/ -run TestSandboxHookThrowAtLoadReturnsError -v`
+Expected: FAIL — the test's `recover` catches a panic and calls `t.Fatalf` ("Register panicked ..."), because `compileHookFiles` currently panics when `HooksWatch` is false.
+
+- [ ] **Step 3: Make `compileHookFiles` return under Sandboxed**
+
+In `~/code/tinycld/pocketbase/plugins/jsvm/jsvm.go`, `compileHookFiles` currently does (in the deferred recover): `if p.config.HooksWatch { color.Red(...) } else { panic(fmtErr) }`, and the per-file work is wrapped in an inner `func(){ ... }()` closure so a panic doesn't abort the loop. Change it so that under `Sandboxed`, a load error is captured and returned instead of panicked. Replace the body of `compileHookFiles` with:
+
+```go
+func (p *plugin) compileHookFiles(loader *sobek.Runtime, files map[string][]byte) error {
+	var loadErr error
+	for file, content := range files {
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					fmtErr := fmt.Errorf("failed to execute %s:\n - %v", file, r)
+					switch {
+					case p.config.Sandboxed:
+						// Untrusted code: a load-time throw must fail this app's
+						// registration (returned to the caller), never panic the
+						// shared multi-tenant process.
+						if loadErr == nil {
+							loadErr = fmtErr
+						}
+					case p.config.HooksWatch:
+						color.Red("%v", fmtErr)
+					default:
+						panic(fmtErr)
+					}
+				}
+			}()
+
+			prog, cerr := p.compile(string(content), false)
+			if cerr != nil {
+				panic(cerr)
+			}
+			if _, rerr := loader.RunProgram(prog); rerr != nil {
+				panic(rerr)
+			}
+		}()
+		if loadErr != nil {
+			return loadErr
+		}
+	}
+	return loadErr
+}
+```
+
+> This preserves stock behavior exactly: non-sandboxed + `HooksWatch` → log; non-sandboxed + no watch → panic (unchanged). Only the sandboxed path is new: capture the first load error and return it (the outer `registerHooks` already does `if err := p.compileHookFiles(...); err != nil { return err }`).
+
+- [ ] **Step 4: Run the fork test — expect PASS**
+
+Run: `cd ~/code/tinycld/pocketbase && go test ./plugins/jsvm/ -run TestSandboxHookThrowAtLoadReturnsError -v`
+Expected: PASS (no panic; `Register` returns an error).
+
+- [ ] **Step 5: Full fork jsvm suite + race (no regression to the panic/log behavior)**
+
+Run: `cd ~/code/tinycld/pocketbase && go test ./plugins/jsvm/ -count=1 && go test -race ./plugins/jsvm/ -count=1`
+Expected: PASS.
+
+- [ ] **Step 6: Commit (fork)**
+
+```bash
+cd ~/code/tinycld/pocketbase
+git add plugins/jsvm/jsvm.go plugins/jsvm/sandbox_test.go
+git commit -m "feat(jsvm): return (not panic) on load-time hook error when Sandboxed"
+```
+
+### Part B — router: orgmanager fails that one org, not the process
+
+- [ ] **Step 7: Write the failing router test (a hostile hook that throws at load makes `Get` return an error, not panic)**
+
+Append to `~/code/tinycld/multi-org/internal/orgmanager/e2e_test.go`:
+
+```go
+// TestE2E_HostileHookThrowAtLoadFailsOrgNotProcess proves a tenant hook that
+// throws at load fails only that org's Get() (returned error), rather than
+// panicking the shared process.
+func TestE2E_HostileHookThrowAtLoadFailsOrgNotProcess(t *testing.T) {
+	root := t.TempDir()
+	s := store.New(root)
+	// Top-level $os throws at load; under sandbox $os is undefined.
+	if err := s.Publish("@tinycld/core", "1.0.0", map[string][]byte{
+		"server/main.pb.js": []byte(`$os.exec('id')`),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	mgr := New(Config{
+		Root:     root,
+		Store:    s,
+		Programs: progcache.New(),
+		LookupOrg: stubLookup(map[string]OrgRecord{
+			"acme": {Slug: "acme", Status: "active", Lockfile: []byte(`{"@tinycld/core":"1.0.0"}`)},
+		}),
+		HooksPool: 2,
+	})
+	defer mgr.Shutdown()
+
+	defer func() {
+		if r := recover(); r != nil {
+			t.Fatalf("Get panicked on a hostile load-throwing hook: %v", r)
+		}
+	}()
+	if _, err := mgr.Get("acme"); err == nil {
+		t.Fatal("expected Get to return an error for a load-throwing hook, got nil")
+	}
+}
+```
+
+- [ ] **Step 8: Run it — expect FAIL (panic)**
+
+Run: `cd ~/code/tinycld/multi-org && go test ./internal/orgmanager/ -run TestE2E_HostileHookThrowAtLoadFailsOrgNotProcess -v`
+Expected: FAIL — `Get` panics (via `MustRegister`), the test's `recover` fires `t.Fatalf`. (Even with the Part A fork fix, `manager.load` still calls `MustRegister`, which panics on the returned error — that's what Step 9 fixes.)
+
+- [ ] **Step 9: Switch `manager.load` to `Register` + return**
+
+In `~/code/tinycld/multi-org/internal/orgmanager/manager.go`, in `load`, replace the `jsvm.MustRegister(pb, jsvm.Config{...})` call with the error-returning form:
+
+```go
+	if err := jsvm.Register(pb, jsvm.Config{
+		HooksDir:      filepath.Join(orgDir, "pb_hooks"),
+		MigrationsDir: filepath.Join(orgDir, "pb_migrations"),
+		HooksWatch:    false,
+		HooksPoolSize: m.cfg.HooksPool,
+		ProgramSource: m.cfg.Programs,
+		Sandboxed:     true, // untrusted tenant code
+	}); err != nil {
+		_ = pb.App.ResetBootstrapState()
+		return nil, fmt.Errorf("jsvm register %s: %w", slug, err)
+	}
+```
+
+> Match the existing error-handling pattern already used a few lines below for `pb.Bootstrap()` / `RunAllMigrations()` (they `ResetBootstrapState()` then return a wrapped error). Confirm `fmt` is imported (it is — used elsewhere in the file). Note `jsvm.Register` runs during plugin registration, BEFORE `pb.Bootstrap()`; if the reset-on-error at this point is unnecessary because bootstrap hasn't run, keep it anyway for symmetry — it is a safe no-op. If `ResetBootstrapState` before Bootstrap errors in practice, drop that line and just return the wrapped error.
+
+- [ ] **Step 10: Run the router test — expect PASS**
+
+Run: `cd ~/code/tinycld/multi-org && go test ./internal/orgmanager/ -run TestE2E_HostileHookThrowAtLoadFailsOrgNotProcess -v`
+Expected: PASS (Get returns an error, no panic).
+
+- [ ] **Step 11: Full orgmanager suite (existing e2e + Task 7 test still pass)**
+
+Run: `cd ~/code/tinycld/multi-org && go test ./internal/orgmanager/ -count=1 && go test -race ./internal/orgmanager/ -count=1`
+Expected: PASS.
+
+### Part C — router: provision path rejects a load-throwing hook too
+
+- [ ] **Step 12: Add a provision-path hook-throw deny test**
+
+Append to `~/code/tinycld/multi-org/internal/controlplane/integration_test.go` (mirror `TestIntegration_MaliciousMigrationCannotExec`'s setup, but ship the throw in a HOOK file, not a migration):
+
+```go
+// TestIntegration_MaliciousHookCannotCrashControlPlane proves a package whose
+// hook throws at load fails provisioning with a returned error, rather than
+// panicking the control-plane process.
+func TestIntegration_MaliciousHookCannotCrashControlPlane(t *testing.T) {
+	root := t.TempDir()
+
+	cp, err := New(filepath.Join(root, "pb_control", "pb_data"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cp.App.Bootstrap(); err != nil {
+		t.Fatal(err)
+	}
+	defer cp.App.ResetBootstrapState()
+	if err := cp.App.RunAllMigrations(); err != nil {
+		t.Fatal(err)
+	}
+
+	s := store.New(root)
+	if err := s.Publish("@tinycld/evilhook", "1.0.0", map[string][]byte{
+		"server/main.pb.js": []byte(`$os.exec('id')`),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	p := NewProvisioner(cp.App, root, s, func(string) {})
+	defer func() {
+		if r := recover(); r != nil {
+			t.Fatalf("provisioning panicked on a load-throwing hook: %v", r)
+		}
+	}()
+	if _, err := p.CreateOrg("evilhook", "EvilHook", map[string]string{"@tinycld/evilhook": "1.0.0"}); err == nil {
+		t.Fatal("expected provisioning to fail for a load-throwing hook, got nil")
+	}
+}
+```
+
+- [ ] **Step 13: Run it — expect PASS (Part A already made the fork return the error; Task 8 already made bootstrapTenantOnce use Register+return)**
+
+Run: `cd ~/code/tinycld/multi-org && go test ./internal/controlplane/ -run TestIntegration_MaliciousHookCannotCrashControlPlane -v`
+Expected: PASS. If it FAILS with a panic, `bootstrapTenantOnce` must be double-checked to use `jsvm.Register` (Task 8) AND the fork Part A fix must be in place — verify both, do not weaken the test.
+
+- [ ] **Step 14: Full controlplane suite**
+
+Run: `cd ~/code/tinycld/multi-org && go test ./internal/controlplane/ -count=1`
+Expected: PASS.
+
+- [ ] **Step 15: Commit (router)**
+
+```bash
+cd ~/code/tinycld/multi-org
+git add internal/orgmanager/manager.go internal/orgmanager/e2e_test.go internal/controlplane/integration_test.go
+git commit -m "feat: fail closed (not panic) on a hostile load-throwing tenant hook"
+```
+
+---
+
 ## Task 9: Full-suite verification (both repos)
 
 - [ ] **Step 1: Fork — build, vet, test, race**

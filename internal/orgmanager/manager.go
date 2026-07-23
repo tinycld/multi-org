@@ -123,6 +123,7 @@ func (m *OrgManager) load(slug string) (*OrgInstance, error) {
 		HooksWatch:    false,
 		HooksPoolSize: m.cfg.HooksPool,
 		ProgramSource: m.cfg.Programs,
+		Sandboxed:     true, // untrusted tenant code
 	})
 	if err := pb.Bootstrap(); err != nil {
 		return nil, fmt.Errorf("bootstrap %s: %w", slug, err)

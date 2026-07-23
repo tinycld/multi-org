@@ -3,6 +3,7 @@ package orgmanager
 import (
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"tinycld.org/multi-org/internal/progcache"
@@ -115,3 +116,43 @@ func TestE2E_SecondOrgAddsNoNewPrograms(t *testing.T) {
 	}
 	t.Logf("cache stable at %d programs across both orgs (full sharing)", afterSecond)
 }
+
+// TestE2E_TenantHooksAreSandboxed proves the manager loads tenant hooks with the
+// jsvm sandbox: a hook route reporting typeof $os must return "undefined".
+func TestE2E_TenantHooksAreSandboxed(t *testing.T) {
+	root := t.TempDir()
+	s := store.New(root)
+	hook := []byte(`routerAdd('GET','/caps',(e)=>e.json(200,{os:typeof $os,http:typeof $http}))`)
+	if err := s.Publish("@tinycld/core", "1.0.0", map[string][]byte{
+		"server/main.pb.js": hook,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	mgr := New(Config{
+		Root:     root,
+		Store:    s,
+		Programs: progcache.New(),
+		LookupOrg: stubLookup(map[string]OrgRecord{
+			"acme": {Slug: "acme", Status: "active", Lockfile: []byte(`{"@tinycld/core":"1.0.0"}`)},
+		}),
+		HooksPool: 2,
+	})
+	defer mgr.Shutdown()
+
+	acme, err := mgr.Get("acme")
+	if err != nil {
+		t.Fatalf("acme: %v", err)
+	}
+	rec := httptest.NewRecorder()
+	acme.Mux().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/caps", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("/caps = %d body=%s", rec.Code, rec.Body.String())
+	}
+	body := rec.Body.String()
+	if !contains(body, `"os":"undefined"`) || !contains(body, `"http":"undefined"`) {
+		t.Fatalf("expected tenant hooks sandboxed ($os/$http undefined), got %s", body)
+	}
+}
+
+func contains(h, n string) bool { return strings.Contains(h, n) }

@@ -9,7 +9,7 @@ import (
 
 	"github.com/pocketbase/pocketbase/apis"
 
-	"tinycld.org/multitenant/internal/store"
+	"tinycld.org/multi-org/internal/store"
 )
 
 func TestOrgLookup_ReturnsActiveOrgRecord(t *testing.T) {

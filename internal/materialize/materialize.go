@@ -9,7 +9,7 @@ import (
 	"os"
 	"path/filepath"
 
-	"tinycld.org/multitenant/internal/lockfile"
+	"tinycld.org/multi-org/internal/lockfile"
 )
 
 // Materialize (re)builds <orgDir>/pb_hooks, pb_public, and pb_migrations from

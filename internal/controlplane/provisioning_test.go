@@ -5,7 +5,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"tinycld.org/multitenant/internal/store"
+	"tinycld.org/multi-org/internal/store"
 )
 
 func TestProvision_CreatesOrgRowAndDirs(t *testing.T) {

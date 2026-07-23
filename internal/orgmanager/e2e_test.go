@@ -5,8 +5,8 @@ import (
 	"net/http/httptest"
 	"testing"
 
-	"tinycld.org/multitenant/internal/progcache"
-	"tinycld.org/multitenant/internal/store"
+	"tinycld.org/multi-org/internal/progcache"
+	"tinycld.org/multi-org/internal/store"
 )
 
 func TestE2E_TwoOrgsIsolatedShareProgramCache(t *testing.T) {

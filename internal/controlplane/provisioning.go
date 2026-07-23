@@ -11,9 +11,9 @@ import (
 	"github.com/pocketbase/pocketbase/core"
 	"github.com/pocketbase/pocketbase/plugins/jsvm"
 
-	"tinycld.org/multitenant/internal/lockfile"
-	"tinycld.org/multitenant/internal/materialize"
-	"tinycld.org/multitenant/internal/store"
+	"tinycld.org/multi-org/internal/lockfile"
+	"tinycld.org/multi-org/internal/materialize"
+	"tinycld.org/multi-org/internal/store"
 )
 
 // EvictFunc lets provisioning invalidate a cached org instance in the manager.

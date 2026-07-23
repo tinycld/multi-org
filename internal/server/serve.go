@@ -11,7 +11,7 @@ import (
 
 	"golang.org/x/crypto/acme/autocert"
 
-	"tinycld.org/multitenant/internal/frontrouter"
+	"tinycld.org/multi-org/internal/frontrouter"
 )
 
 // TLSMode selects how the fronting server terminates (or defers) TLS.

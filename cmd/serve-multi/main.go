@@ -15,11 +15,11 @@ import (
 	"github.com/pocketbase/pocketbase/apis"
 	"github.com/pocketbase/pocketbase/core"
 
-	"tinycld.org/multitenant/internal/controlplane"
-	"tinycld.org/multitenant/internal/orgmanager"
-	"tinycld.org/multitenant/internal/progcache"
-	"tinycld.org/multitenant/internal/server"
-	"tinycld.org/multitenant/internal/store"
+	"tinycld.org/multi-org/internal/controlplane"
+	"tinycld.org/multi-org/internal/orgmanager"
+	"tinycld.org/multi-org/internal/progcache"
+	"tinycld.org/multi-org/internal/server"
+	"tinycld.org/multi-org/internal/store"
 )
 
 func main() {

@@ -8,9 +8,9 @@ import (
 
 	"github.com/pocketbase/pocketbase"
 
-	"tinycld.org/multitenant/internal/orgmanager"
-	"tinycld.org/multitenant/internal/progcache"
-	"tinycld.org/multitenant/internal/store"
+	"tinycld.org/multi-org/internal/orgmanager"
+	"tinycld.org/multi-org/internal/progcache"
+	"tinycld.org/multi-org/internal/store"
 )
 
 // widgetsMigration is a minimal PocketBase JS migration that creates one

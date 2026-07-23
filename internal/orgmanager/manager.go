@@ -11,10 +11,10 @@ import (
 	"github.com/pocketbase/pocketbase/plugins/jsvm"
 	"golang.org/x/sync/singleflight"
 
-	"tinycld.org/multitenant/internal/lockfile"
-	"tinycld.org/multitenant/internal/materialize"
-	"tinycld.org/multitenant/internal/progcache"
-	"tinycld.org/multitenant/internal/store"
+	"tinycld.org/multi-org/internal/lockfile"
+	"tinycld.org/multi-org/internal/materialize"
+	"tinycld.org/multi-org/internal/progcache"
+	"tinycld.org/multi-org/internal/store"
 )
 
 // Ensure the shared cache satisfies the fork's jsvm seam.

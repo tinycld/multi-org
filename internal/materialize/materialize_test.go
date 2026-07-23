@@ -5,8 +5,8 @@ import (
 	"path/filepath"
 	"testing"
 
-	"tinycld.org/multitenant/internal/lockfile"
-	"tinycld.org/multitenant/internal/store"
+	"tinycld.org/multi-org/internal/lockfile"
+	"tinycld.org/multi-org/internal/store"
 )
 
 func TestMaterialize_LinksHooksAndPublic(t *testing.T) {

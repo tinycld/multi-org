@@ -1,8 +1,8 @@
-module tinycld.org/multitenant
+module tinycld.org/multi-org
 
 go 1.26.3
 
-replace github.com/pocketbase/pocketbase => /Users/nas/code/vendor/pocketbase
+replace github.com/pocketbase/pocketbase => ../pocketbase
 
 require (
 	github.com/dop251/goja v0.0.0-20260701091749-b07b74453ea9

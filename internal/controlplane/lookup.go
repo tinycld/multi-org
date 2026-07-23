@@ -3,7 +3,7 @@ package controlplane
 import (
 	"github.com/pocketbase/pocketbase/core"
 
-	"tinycld.org/multitenant/internal/orgmanager"
+	"tinycld.org/multi-org/internal/orgmanager"
 )
 
 // OrgLookup returns an orgmanager.LookupFunc backed by the control-plane orgs

@@ -8,7 +8,7 @@ import (
 	"encoding/json"
 	"sort"
 
-	"tinycld.org/multitenant/internal/store"
+	"tinycld.org/multi-org/internal/store"
 )
 
 // OrgLockfile maps package name -> version.

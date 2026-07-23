@@ -6,6 +6,10 @@ import (
 	"github.com/pocketbase/pocketbase"
 )
 
+// registerOnce guards registration into core.AppMigrations, which is a
+// PROCESS-GLOBAL registry deliberately shared across all PocketBase apps in the
+// process. sync.Once makes registration idempotent so multiple ControlPlane
+// instances (or repeated New calls) don't double-register the schema migration.
 var registerOnce sync.Once
 
 // ControlPlane wraps the control-plane PocketBase app: the authoritative registry

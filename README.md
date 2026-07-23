@@ -65,6 +65,34 @@ MT_ROOT=./mt_data MT_BASE_DOMAIN=tinycld.org MT_ADDR=:443 ./serve-multi
 Env: `MT_ROOT` (data root, default `./mt_data`), `MT_BASE_DOMAIN` (default
 `tinycld.org`), `MT_ADDR` (default `:443`).
 
+## Tenant JS security boundary
+
+Tenant hooks and migrations run under the fork's jsvm **Sandboxed** mode
+(`jsvm.Config{Sandboxed: true}`): a deny-by-default allowlist that withholds
+the host-reaching bindings — `$os` (exec / env / raw filesystem), `$http`
+(outbound HTTP), `$filesystem`, and `$filepath` — from both the hook and
+migration runtimes, and neuters `process.env` / `process.argv` so the host
+environment (e.g. `MT_SUPERUSER_PASSWORD`) is unreachable. Legitimate file
+access goes through org-scoped `$app` record-file APIs; `$apis.static` remains
+available and is confined to its configured root (no `..` traversal). Both the
+runtime load path (`orgmanager.load`) and the provision path
+(`controlplane.bootstrapTenantOnce`) enable it, and both use `jsvm.Register`
+(returning the error) rather than `MustRegister`, so a hook or migration that
+throws at load fails only that one org's load/provisioning instead of
+panicking the shared process.
+
+**This is blast-radius reduction, not attacker containment** — the WordPress
+`disable_functions` / `open_basedir` tier. sobek is not a hard sandbox: engine
+escapes, CPU / memory / wall-clock DoS (no resource limits yet), and other
+shared-process risks remain because all orgs share one OS process. The
+allowlist guarantee is also contingent on the router never passing a
+capability-granting `OnInit` at the sandboxed call sites (an operator-only
+escape hatch — do not wire host capabilities through it for tenant apps).
+
+Hostile-grade isolation requires OS-level per-process / per-uid isolation
+(deferred). The `GetOrg → http.Handler` seam in `frontrouter` is where a
+reverse-proxy-to-subprocess would drop in without reworking dispatch.
+
 ## Operator prerequisites & known gaps
 
 This module composes correctly at the transport, caching, and provisioning layers

@@ -244,6 +244,30 @@ Gaps found while making the router runnable:
    a tenant** — a tenant having an `orgs` table contradicts the isolation model.
    Fix likely means registering the control-plane schema only on the control-plane
    app (e.g. app-scoped migration registration) rather than globally.
+3. ~~**Tenant JS runs with full host capabilities.**~~ **CLOSED (2026-07-23).** Tenant
+   hooks + migrations now run under the fork's jsvm **Sandboxed** mode
+   (`jsvm.Config{Sandboxed: true}`): a deny-by-default allowlist that withholds
+   `$os`/`$http`/`$filesystem`/`$filepath` from **both** the hook and migration
+   runtimes and scrubs `process.env`/`process.argv` (so `MT_SUPERUSER_PASSWORD` et al.
+   are unreachable). `$apis.static` stays but is proven confined to its root (no `..`
+   traversal). Enabled at both untrusted-code call sites — runtime `orgmanager.load`
+   and provision-time `controlplane.bootstrapTenantOnce` — each using `jsvm.Register`
+   (returning the error) not `MustRegister`, so a load-time throw fails **closed** for
+   that one org instead of panicking the shared process. Spec + plan:
+   `docs/superpowers/specs/2026-07-23-tenant-jsvm-sandbox-design.md` and
+   `docs/superpowers/plans/2026-07-23-tenant-jsvm-sandbox.md`. See also the README's
+   "Tenant JS security boundary" section.
+
+**Honest residual risk — still NOT done.** Finding #3 is the WordPress
+`disable_functions`/`open_basedir` tier: real **blast-radius reduction, not attacker
+containment.** sobek is not a hard sandbox, and **all orgs still share one OS
+process.** Two containment layers remain deliberately deferred:
+- **OS-level per-process / per-uid isolation** — the actual boundary against a
+  determined tenant author (engine escapes, cross-org reach in a shared process). The
+  `GetOrg → http.Handler` seam in `frontrouter` is the drop-in point for a
+  reverse-proxy-to-subprocess model.
+- **Resource-limit / DoS controls** — no CPU / memory / wall-clock caps on tenant JS
+  yet; a hostile or runaway hook can starve the shared process.
 
 **Cleanup (non-blocking, still open):** store "content-addressed" naming is
 vestigial (`ContentHash`/`content_hash`/`manifest` unused — either wire or drop);

@@ -2,6 +2,12 @@
 // goja programs shared across all tenant apps. It implements the open
 // jsvm.ProgramSource interface so identical hook/callback source across orgs
 // resolves to a single *goja.Program in memory.
+//
+// The cache has no eviction: entries are bounded by the number of DISTINCT
+// program sources across all installed packages, which is expected to be small
+// and static (identical source across many orgs collapses to one entry). Callers
+// must not feed per-tenant-unique source (e.g. with an interpolated org id) into
+// it, which would defeat sharing and make growth unbounded.
 package progcache
 
 import (
@@ -27,6 +33,8 @@ func New() *SharedProgramCache {
 // single *goja.Program. strict is part of the key because the same source
 // compiled sloppy vs. strict yields different programs.
 func (c *SharedProgramCache) Compile(name, src string, strict bool) (*goja.Program, error) {
+	// name is a constant (defaultScriptPath) supplied by the fork and carries no
+	// distinguishing information, so it is deliberately not part of the key.
 	key := strictPrefix(strict) + sha256Hex(src)
 
 	c.mu.RLock()

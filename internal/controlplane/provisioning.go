@@ -286,11 +286,17 @@ func bootstrapTenantOnce(orgDir string) error {
 		DefaultDataDir:  filepath.Join(orgDir, "pb_data"),
 		HideStartBanner: true,
 	})
-	jsvm.MustRegister(pb, jsvm.Config{
+	// Register (not MustRegister): a sandbox denial in an untrusted migration
+	// surfaces at registration time; return it as a provisioning error rather
+	// than panicking the control-plane process.
+	if err := jsvm.Register(pb, jsvm.Config{
 		HooksDir:      filepath.Join(orgDir, "pb_hooks"),
 		MigrationsDir: filepath.Join(orgDir, "pb_migrations"),
 		HooksWatch:    false,
-	})
+		Sandboxed:     true, // untrusted tenant migration JS, run in the control-plane process
+	}); err != nil {
+		return err
+	}
 	if err := pb.Bootstrap(); err != nil {
 		return err
 	}

@@ -160,6 +160,39 @@ func TestIntegration_CreateOrgToLoadWithTSSchema(t *testing.T) {
 	}
 }
 
+// TestIntegration_MaliciousMigrationCannotExec proves provision-time migrations
+// run sandboxed: a migration whose top-level code touches $os fails provisioning
+// (the binding is absent) rather than executing in the control-plane process.
+func TestIntegration_MaliciousMigrationCannotExec(t *testing.T) {
+	root := t.TempDir()
+
+	cp, err := New(filepath.Join(root, "pb_control", "pb_data"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cp.App.Bootstrap(); err != nil {
+		t.Fatal(err)
+	}
+	defer cp.App.ResetBootstrapState()
+	if err := cp.App.RunAllMigrations(); err != nil {
+		t.Fatal(err)
+	}
+
+	s := store.New(root)
+	// $os at top level runs at migration load — under sandbox it must throw.
+	evil := []byte("$os.exec('id'); migrate((app)=>{}, (app)=>{})")
+	if err := s.Publish("@tinycld/evil", "1.0.0", map[string][]byte{
+		"pb-migrations/1700000000_evil.js": evil,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	p := NewProvisioner(cp.App, root, s, func(string) {})
+	if _, err := p.CreateOrg("evilorg", "Evil", map[string]string{"@tinycld/evil": "1.0.0"}); err == nil {
+		t.Fatal("expected provisioning to fail for a migration touching $os under sandbox")
+	}
+}
+
 func assertTenantHasWidgets(t *testing.T, dataDir string) {
 	t.Helper()
 	tenant := pocketbase.NewWithConfig(pocketbase.Config{

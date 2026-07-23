@@ -301,6 +301,11 @@ needs its own plan.
 
 Pick up any of these independently:
 
+- **OS-level per-process tenant isolation (the required security boundary — see §5
+  finding #3).** Scoped follow-up brief with the constraints, existing anchors, and
+  the open decisions is at
+  `docs/superpowers/specs/FOLLOWUP-os-process-isolation.md`. Run it through
+  brainstorming (deployment-target/isolation-primitive decision first) → spec → plan.
 - **PR #1 (ProgramSource):** open it from `nathanstitt/pocketbase:feat/jsvm-programsource`
   against `pocketbase/pocketbase` (short summary of Seam A + the sloppy-mode note +
   backward-compat statement).

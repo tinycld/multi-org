@@ -1,6 +1,7 @@
 package controlplane
 
 import (
+	"encoding/base64"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -244,6 +245,30 @@ func (p *Provisioner) RegisterRoutes() {
 				return re.BadRequestError(err.Error(), err)
 			}
 			return re.NoContent(204)
+		}).Bind(apis.RequireSuperuserAuth())
+
+		g.POST("/store/packages", func(re *core.RequestEvent) error {
+			var body struct {
+				Name    string            `json:"name"`
+				Version string            `json:"version"`
+				Kind    string            `json:"kind"`
+				Files   map[string]string `json:"files"` // path -> base64 content
+			}
+			if err := re.BindBody(&body); err != nil {
+				return re.BadRequestError("invalid body", err)
+			}
+			files := make(map[string][]byte, len(body.Files))
+			for path, b64 := range body.Files {
+				raw, err := base64.StdEncoding.DecodeString(b64)
+				if err != nil {
+					return re.BadRequestError("invalid base64 for "+path, err)
+				}
+				files[path] = raw
+			}
+			if err := p.PublishPackage(body.Name, body.Version, files, body.Kind); err != nil {
+				return re.BadRequestError(err.Error(), err)
+			}
+			return re.JSON(200, map[string]any{"name": body.Name, "version": body.Version})
 		}).Bind(apis.RequireSuperuserAuth())
 
 		return e.Next()

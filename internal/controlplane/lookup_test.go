@@ -75,3 +75,33 @@ func TestRegisterRoutes_OrgsRequiresSuperuser(t *testing.T) {
 		t.Fatalf("expected 401 for unauthenticated provisioning, got %d: %s", rec.Code, rec.Body.String())
 	}
 }
+
+func TestRegisterRoutes_PublishPackageRequiresSuperuser(t *testing.T) {
+	root := t.TempDir()
+	cp, _ := New(filepath.Join(root, "pb_control", "pb_data"))
+	if err := cp.App.Bootstrap(); err != nil {
+		t.Fatal(err)
+	}
+	defer cp.App.ResetBootstrapState()
+	if err := cp.App.RunAllMigrations(); err != nil {
+		t.Fatal(err)
+	}
+	s := store.New(root)
+	p := NewProvisioner(cp.App, root, s, func(string) {})
+	p.RegisterRoutes()
+
+	mux, err := apis.BuildServeMux(cp.App, apis.ServeConfig{})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Unauthenticated POST /api/store/packages must be rejected (401), proving the
+	// route is wired AND superuser-guarded.
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/api/store/packages", strings.NewReader(`{"name":"@x/y","version":"1.0.0","files":{}}`))
+	req.Header.Set("Content-Type", "application/json")
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 for unauthenticated publish, got %d: %s", rec.Code, rec.Body.String())
+	}
+}

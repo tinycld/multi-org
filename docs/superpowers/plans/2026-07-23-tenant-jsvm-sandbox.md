@@ -1063,6 +1063,321 @@ git commit -m "docs: document the tenant JS sandbox boundary and its honest ceil
 
 ---
 
+## Task 11: Close the residual arbitrary-file-read holes in the safe subset (fork + router)
+
+**Why (found by the final holistic review):** The deny-list removed the four host `Bind*` functions, but three capabilities that reach the host filesystem survive *inside binds that were kept*, each verified as a live arbitrary-file-read through the real router:
+
+1. **`$apis.static(<any dir>, false)`** — `BindApis`'s `static` does `os.DirFS(authorSuppliedPath)` with no confinement. A tenant hook mounts `/`, `/etc`, or another org's data dir and serves every host-readable file (incl. binary `data.db`) over its subdomain. Task 6 only proved `..` can't escape a *given* root — it never tested that the author *chooses* the root.
+2. **`require('<abs path>')`** — the require registries are `new(require.Registry)` with no loader, so `DefaultSourceLoader` reads the real host FS. A hook or migration reads any host `.json` (creds/config) or executes any `.js`. Reachable on the migration path too — inside the control-plane process.
+3. **`$template.loadFiles('<abs path>')`** — `template.ParseFiles` → `os.ReadFile` any host text file.
+
+Root cause: the audit checked the four host `Bind*` *functions*, not host-reaching *behavior inside the kept binds*. This task closes all three and corrects the docs. **All three fixes are fork-side; then a router e2e proves them through the real stack.**
+
+**Files:**
+- Modify: `~/code/tinycld/pocketbase/plugins/jsvm/binds.go` (`$apis.static`)
+- Modify: `~/code/tinycld/pocketbase/plugins/jsvm/jsvm.go` (require loader + `$template` under sandbox; the `BindApis` call site)
+- Modify: `~/code/tinycld/pocketbase/plugins/jsvm/sandbox_test.go` (three fork negative tests)
+- Modify: `~/code/tinycld/multi-org/internal/orgmanager/e2e_test.go` (router e2e proof)
+- Modify: `~/code/tinycld/multi-org/README.md`, `HANDOFF.md` (correct overclaims)
+
+### Part A — `$apis.static`: omit under sandbox
+
+The design: keep the exported `BindApis(vm)` unchanged (upstream-compatible, still includes `static`), extract the `static` registration into an unexported `bindApisStatic(vm)`, and have the sandboxed hook path install everything in `BindApis` EXCEPT `static`. Concretely, add an unexported `bindApisSandboxed(vm)` that is `BindApis` minus `static`, and call it instead of `BindApis` in the sandboxed branch.
+
+- [ ] **Step 1: Fork test — `$apis.static` must be absent under sandbox.** Append to `sandbox_test.go`:
+
+```go
+func TestSandboxApisStaticAbsent(t *testing.T) {
+	hook := `routerAdd('GET','/s',(e)=>e.json(200,{static: typeof ($apis && $apis.static)}))`
+	app := newSandboxApp(t, hook)
+	rec := serveRoute(t, app, "GET", "/s")
+	if rec.Code != 200 {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	if !contains(rec.Body.String(), `"static":"undefined"`) {
+		t.Fatalf("expected $apis.static undefined under sandbox, got %s", rec.Body.String())
+	}
+}
+```
+
+- [ ] **Step 2: Run it — expect FAIL** (`static` is currently `"function"`).
+Run: `cd ~/code/tinycld/pocketbase && go test ./plugins/jsvm/ -run TestSandboxApisStaticAbsent -v`
+
+- [ ] **Step 3: Split `static` out of `BindApis` in `binds.go`.** Replace the `static` registration inside `BindApis` (the `obj.Set("static", ...)` block, ~lines 871-880) by moving it into a new unexported function, and add a sandboxed variant. In `binds.go`:
+
+Change `BindApis` so its body no longer sets `static` directly — instead call `bindApisStatic(vm, obj)` at the point where `static` used to be set. Add below `BindApis`:
+
+```go
+// bindApisStatic registers $apis.static, which serves an author-chosen host
+// directory. It is a raw filesystem-read capability (os.DirFS on an arbitrary
+// path) and is therefore installed only for trusted (non-sandboxed) apps.
+func bindApisStatic(vm *sobek.Runtime, apisObj *sobek.Object) {
+	apisObj.Set("static", func(dirOrFS any, indexFallback bool) func(*core.RequestEvent) error {
+		switch v := dirOrFS.(type) {
+		case fs.FS:
+			return apis.Static(v, indexFallback)
+		case string:
+			return apis.Static(os.DirFS(v), indexFallback)
+		default:
+			panic("$apis.static expects the first argument to be either a plain string path or fs.FS value")
+		}
+	})
+}
+```
+
+Then define the sandboxed entry point. Add:
+
+```go
+// BindApisSandboxed registers the $apis helpers that are safe for untrusted
+// code — everything BindApis provides EXCEPT $apis.static (a raw filesystem
+// read). Use this instead of BindApis when running sandboxed tenant hooks.
+func BindApisSandboxed(vm *sobek.Runtime) {
+	bindApisCommon(vm, false)
+}
+```
+
+Refactor `BindApis` to share a common core so the two entry points can't drift:
+
+```go
+func BindApis(vm *sobek.Runtime) { bindApisCommon(vm, true) }
+
+// bindApisCommon installs the $apis object. When withStatic is false the raw
+// $apis.static filesystem-read helper is omitted (sandboxed tenants).
+func bindApisCommon(vm *sobek.Runtime, withStatic bool) {
+	obj := vm.NewObject()
+	vm.Set("$apis", obj)
+
+	if withStatic {
+		bindApisStatic(vm, obj)
+	}
+
+	// ... the rest of the original BindApis body (middlewares, record helpers,
+	// api-error constructors) unchanged, operating on obj ...
+}
+```
+
+> IMPORTANT: move the ENTIRE remaining body of the original `BindApis` (the `obj.Set("requireGuestOnly", ...)` … through the `registerFactoryAsConstructor(..., "InternalServerError", ...)` block) verbatim into `bindApisCommon` after the `if withStatic` block. Do not duplicate it. `BindApis(vm)` stays exported with identical stock behavior (it calls `bindApisCommon(vm, true)`). Verify by reading `binds.go` that nothing else references the old inline `static`.
+
+- [ ] **Step 4: Call the sandboxed variant in `jsvm.go`.** In `sharedBinds` (inside `registerHooks`), change the unconditional `BindApis(vm)` (~line 329) to:
+
+```go
+		if p.config.Sandboxed {
+			BindApisSandboxed(vm)
+		} else {
+			BindApis(vm)
+		}
+```
+
+- [ ] **Step 5: Run the test — expect PASS.**
+Run: `cd ~/code/tinycld/pocketbase && go test ./plugins/jsvm/ -run TestSandboxApisStaticAbsent -v`
+
+### Part B — `require`: deny file-based requires under sandbox
+
+The design: for sandboxed VMs, create the require registry with a `SourceLoader` that refuses every file-based require (returns `require.ModuleFileDoesNotExistError`). Native modules (`process`/`console`/`buffer`) are registered separately and bypass the loader, so they still work. Tenant hooks/migrations are single flat files — no legitimate multi-file `require()` of bundled source exists in this system.
+
+- [ ] **Step 6: Fork test — `require` of an absolute host path must fail under sandbox.** Append to `sandbox_test.go`:
+
+```go
+func TestSandboxRequireCannotReadHostFile(t *testing.T) {
+	secret := filepath.Join(t.TempDir(), "creds.json")
+	if err := os.WriteFile(secret, []byte(`{"key":"HOST-SECRET"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// The hook tries to require the absolute host path; under sandbox it must
+	// throw (caught here) rather than return the file contents.
+	hook := "routerAdd('GET','/r',(e)=>{ try { const c = require(" + "`" + secret + "`" + "); return e.json(200,{leaked:c.key}) } catch (err) { return e.json(200,{blocked:true}) } })"
+	app := newSandboxApp(t, hook)
+	rec := serveRoute(t, app, "GET", "/r")
+	if rec.Code != 200 {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	if contains(rec.Body.String(), "HOST-SECRET") {
+		t.Fatalf("SECURITY: require read a host file under sandbox: %s", rec.Body.String())
+	}
+	if !contains(rec.Body.String(), `"blocked":true`) {
+		t.Fatalf("expected require to be blocked, got %s", rec.Body.String())
+	}
+}
+```
+
+- [ ] **Step 7: Run it — expect FAIL** (currently returns `HOST-SECRET`).
+Run: `cd ~/code/tinycld/pocketbase && go test ./plugins/jsvm/ -run TestSandboxRequireCannotReadHostFile -v`
+
+- [ ] **Step 8: Install a denying loader under sandbox in `jsvm.go`.** Both registry creation sites use `new(require.Registry)` — in `registerMigrations` (~line 208) and `registerHooks` (~line 291). Replace each with a sandbox-aware constructor. Add a package-level helper in `jsvm.go`:
+
+```go
+// newRequireRegistry builds the require registry for a plugin's VMs. When
+// sandboxed, it installs a source loader that refuses every file-based require
+// (native modules like process/console/buffer bypass the loader and still
+// work), so untrusted code cannot require an arbitrary host path to read or
+// execute a file. Non-sandboxed keeps the default host-filesystem loader.
+func newRequireRegistry(sandboxed bool) *require.Registry {
+	if sandboxed {
+		return require.NewRegistryWithLoader(func(string) ([]byte, error) {
+			return nil, require.ModuleFileDoesNotExistError
+		})
+	}
+	return new(require.Registry)
+}
+```
+
+Then replace `registry := new(require.Registry)` (migrations) and `requireRegistry := new(require.Registry)` (hooks) with `... := newRequireRegistry(p.config.Sandboxed)`.
+
+> Confirm `require.ModuleFileDoesNotExistError` and `require.NewRegistryWithLoader` are exported from `plugins/jsvm/internal/nodejs/require/module.go` (they are — `NewRegistryWithLoader` at ~line 70, `ModuleFileDoesNotExistError` is the sentinel returned by `DefaultSourceLoader`). If the error sentinel is unexported under a different name, return a plain `errors.New("module loading is disabled")` instead — the require call still throws, which is all the test needs.
+
+- [ ] **Step 9: Run the test — expect PASS.**
+Run: `cd ~/code/tinycld/pocketbase && go test ./plugins/jsvm/ -run TestSandboxRequireCannotReadHostFile -v`
+
+### Part C — `$template`: only `loadString` under sandbox
+
+The design: under sandbox, don't expose the raw `*template.Registry` (whose `loadFiles`/`loadFS` read host files). Instead expose a JS object with only `loadString`, delegating to the registry.
+
+- [ ] **Step 10: Fork test — `$template.loadFiles` must be unavailable; `loadString` still works.** Append to `sandbox_test.go`:
+
+```go
+func TestSandboxTemplateNoFileLoad(t *testing.T) {
+	secret := filepath.Join(t.TempDir(), "secret.txt")
+	if err := os.WriteFile(secret, []byte("TEMPLATE-SECRET"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	hook := "routerAdd('GET','/t',(e)=>{" +
+		" const lf = typeof ($template && $template.loadFiles);" +
+		" let render='';" +
+		" try { render = $template.loadString('hi {{.}}').render('x') } catch (err) { render = 'ERR' }" +
+		" let leaked=false;" +
+		" try { const r = $template.loadFiles(" + "`" + secret + "`" + "); if (r.render({}).indexOf('TEMPLATE-SECRET')>=0) leaked=true } catch (err) {}" +
+		" return e.json(200,{loadFiles: lf, render: render, leaked: leaked}) })"
+	app := newSandboxApp(t, hook)
+	rec := serveRoute(t, app, "GET", "/t")
+	if rec.Code != 200 {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	body := rec.Body.String()
+	if contains(body, `"leaked":true`) || contains(body, "TEMPLATE-SECRET") {
+		t.Fatalf("SECURITY: $template read a host file under sandbox: %s", body)
+	}
+	if !contains(body, `"loadFiles":"undefined"`) {
+		t.Fatalf("expected $template.loadFiles undefined under sandbox, got %s", body)
+	}
+	if !contains(body, `"render":"hi x"`) {
+		t.Fatalf("expected loadString to still render, got %s", body)
+	}
+}
+```
+
+- [ ] **Step 11: Run it — expect FAIL** (`loadFiles` currently works / leaks).
+Run: `cd ~/code/tinycld/pocketbase && go test ./plugins/jsvm/ -run TestSandboxTemplateNoFileLoad -v`
+
+- [ ] **Step 12: Expose only `loadString` under sandbox in `jsvm.go`.** At BOTH `vm.Set("$template", templateRegistry)` sites (~line 236 migrations, ~line 332 hooks), make the sandboxed VM get a restricted object. Add a package-level helper:
+
+```go
+// setTemplateBinding installs $template. When sandboxed, only loadString (pure,
+// in-memory) is exposed — loadFiles/loadFS read host files and are withheld.
+func setTemplateBinding(vm *sobek.Runtime, reg *template.Registry, sandboxed bool) {
+	if !sandboxed {
+		vm.Set("$template", reg)
+		return
+	}
+	obj := vm.NewObject()
+	obj.Set("loadString", reg.LoadString)
+	vm.Set("$template", obj)
+}
+```
+
+Replace both `vm.Set("$template", templateRegistry)` lines with `setTemplateBinding(vm, templateRegistry, p.config.Sandboxed)`.
+
+> Confirm `template.Registry` has an exported `LoadString(text string) *Renderer` method (it does — `tools/template/registry.go:102`). The sobek FieldMapper exposes it to JS as `loadString`.
+
+- [ ] **Step 13: Run the test — expect PASS.**
+Run: `cd ~/code/tinycld/pocketbase && go test ./plugins/jsvm/ -run TestSandboxTemplateNoFileLoad -v`
+
+### Part D — fork full suite + commit
+
+- [ ] **Step 14: Full fork suite + race.**
+Run: `cd ~/code/tinycld/pocketbase && go build ./... && go vet ./plugins/jsvm/... && go test ./plugins/jsvm/... -count=1 && go test -race ./plugins/jsvm/ -count=1`
+Expected: PASS. In particular the existing `TestSandboxSafeBindingsPresent` (routing/$security/$app) and the non-sandboxed regression tests must still pass — the safe subset for legit hooks (routing, DB, crypto, `loadString` templating) is intact; only file-reading capabilities were removed.
+
+- [ ] **Step 15: Commit (fork).**
+```bash
+cd ~/code/tinycld/pocketbase
+git add plugins/jsvm/binds.go plugins/jsvm/jsvm.go plugins/jsvm/sandbox_test.go
+git commit -m "fix(jsvm): close arbitrary-file-read via \$apis.static, require, and \$template under sandbox"
+```
+
+### Part E — router e2e proof (through the real stack)
+
+- [ ] **Step 16: Router e2e — all three primitives blocked through the manager.** Append to `~/code/tinycld/multi-org/internal/orgmanager/e2e_test.go`:
+
+```go
+// TestE2E_TenantCannotReadHostFilesViaSafeBinds proves the residual file-read
+// holes are closed end-to-end: a tenant hook reports $apis.static and
+// $template.loadFiles are undefined, and a require() of an absolute host path
+// is blocked (does not return the file contents).
+func TestE2E_TenantCannotReadHostFilesViaSafeBinds(t *testing.T) {
+	root := t.TempDir()
+	s := store.New(root)
+	hook := []byte("routerAdd('GET','/probe',(e)=>{" +
+		" let req='ok'; try { require('/etc/hostname') } catch (x) { req='blocked' }" +
+		" return e.json(200,{" +
+		"  static: typeof ($apis && $apis.static)," +
+		"  loadFiles: typeof ($template && $template.loadFiles)," +
+		"  require: req }) })")
+	if err := s.Publish("@tinycld/core", "1.0.0", map[string][]byte{"server/main.pb.js": hook}); err != nil {
+		t.Fatal(err)
+	}
+
+	mgr := New(Config{
+		Root: root, Store: s, Programs: progcache.New(),
+		LookupOrg: stubLookup(map[string]OrgRecord{
+			"acme": {Slug: "acme", Status: "active", Lockfile: []byte(`{"@tinycld/core":"1.0.0"}`)},
+		}),
+		HooksPool: 2,
+	})
+	defer mgr.Shutdown()
+
+	acme, err := mgr.Get("acme")
+	if err != nil {
+		t.Fatalf("acme: %v", err)
+	}
+	rec := httptest.NewRecorder()
+	acme.Mux().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/probe", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("/probe = %d body=%s", rec.Code, rec.Body.String())
+	}
+	body := rec.Body.String()
+	for _, want := range []string{`"static":"undefined"`, `"loadFiles":"undefined"`, `"require":"blocked"`} {
+		if !contains(body, want) {
+			t.Fatalf("expected %s (file-read hole open), got %s", want, body)
+		}
+	}
+}
+```
+
+- [ ] **Step 17: Run it — expect PASS (fork Part A-C already close the holes).**
+Run: `cd ~/code/tinycld/multi-org && go test ./internal/orgmanager/ -run TestE2E_TenantCannotReadHostFilesViaSafeBinds -v`
+Expected: PASS. If any assertion fails, a fork fix is missing — do NOT weaken the test; verify Parts A-C are committed in the fork working tree.
+
+- [ ] **Step 18: Full router suite + race.**
+Run: `cd ~/code/tinycld/multi-org && go test ./... -count=1 && go test -race ./...`
+Expected: PASS (cross-org sharing + benign provisioning still green).
+
+### Part F — correct the docs
+
+- [ ] **Step 19: Fix the overclaims** in `~/code/tinycld/multi-org/README.md` "Tenant JS security boundary" section. The current text says raw filesystem is withheld and `$apis.static` is "confined to its configured root" and that file access is *only* via `$app`. With Part A-C, raw FS read IS now closed for tenants — but the SPECIFIC wording must be accurate. Update the section so it reads (adjust to match surrounding prose):
+
+Replace the sentence about `$apis.static` with: "`$apis.static` (a raw directory-serving primitive whose root is caller-chosen) is withheld from sandboxed tenants entirely; file-based `require()` and `$template.loadFiles`/`loadFS` are likewise disabled, so tenant code has no path to read arbitrary host files." Keep the rest (the honest-ceiling paragraph, OnInit caveat, OS-isolation-deferred) as-is.
+
+- [ ] **Step 20: Update `HANDOFF.md`** §5 to note the file-read holes found by the holistic review are now closed (reference this task), leaving OS-level isolation + resource/DoS limits as the honest residual gaps (unchanged).
+
+- [ ] **Step 21: Commit (router).**
+```bash
+cd ~/code/tinycld/multi-org
+git add internal/orgmanager/e2e_test.go README.md HANDOFF.md
+git commit -m "test+docs: prove and document tenant file-read holes closed"
+```
+
+---
+
 ## Self-review checklist (for the implementer, before declaring done)
 
 - [ ] Both `jsvm.MustRegister` tenant call sites pass `Sandboxed: true` (`orgmanager/manager.go`, `controlplane/provisioning.go`). The control-plane's *own* app (if it registers jsvm for operator hooks) is NOT sandboxed.

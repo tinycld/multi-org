@@ -1,9 +1,22 @@
 # Handoff — Multi-Org PocketBase Router
 
-**Updated:** 2026-07-23 (was 2026-07-22)
+**Updated:** 2026-07-25 (was 2026-07-24)
 **Goal:** Make one PocketBase process host many organizations — each org its own
 SQLite DB, client JS bundle, and server-side JS handlers — sharing versioned code
 where identical, isolated where not.
+
+> **2026-07-25:** **The §11 "no feature Go" decision was REVERSED — packages ship
+> Go again.** The contacts pilot was re-Go'd: its CardDAV/FTS/audit now run in the
+> package's own Go server, driven by config it builds and passes to core's reusable
+> `carddav`/`fts` libraries (single copy — no duplication). The multi-org router
+> keeps serving CardDAV **host-side** for stock-PB tenants (they still have no
+> feature Go), importing the same `tinycld.org/core/carddav`. The tail of Track-B
+> de-org was finished so the contacts app + e2e run green. See **§13**.
+
+> **2026-07-24:** **Track B (tinycld de-org-ing) is done** for core + app shell +
+> all TS client + core Go server + the contacts feature — the tinycld codebase now
+> assumes a single org (the router owns multiplexing). See **§12**. Feature Go
+> servers (mail/drive/calendar/text/calc) remain, blocked on §11 fork adoption.
 
 This documents everything built, where it lives, what's pushed vs. local, and
 what remains.
@@ -35,7 +48,7 @@ holds `.js`) with a **load-time** fallback for raw `.ts`. Proven live: a TypeScr
 package published over HTTP → stored as `.js` → provisioned → its TS-authored hook
 served and its TS migration's collection present in the tenant DB. See §9.
 
-Four bodies of work:
+Six bodies of work:
 
 1. **PocketBase fork seams + TypeScript engine** (`~/code/tinycld/pocketbase`) — the
    two additive embed seams (§1) *plus* the TypeScript transpile seam and the
@@ -51,6 +64,24 @@ Four bodies of work:
    authors (jsvm `Sandboxed` mode). Shipped as defense-in-depth, but a demonstrated
    `$app.db()` `ATTACH` cross-org exploit proves in-process allowlisting is not
    containment — **OS-level per-process isolation is now the required boundary** (§5).
+6. **Host-side capabilities + multi-org CardDAV** (§11) — the Go-into-core /
+   config-driven-capability model: packages contribute protocol servers (CardDAV),
+   FTS, and audit as **manifest config**, and core runs them host-side (no feature
+   Go in tenants). Pilot: contacts de-Go'd; CardDAV served per-org in BOTH the
+   single-tenant app (`sharedDBScope`) and multi-org tenants (`singleOrgScope`),
+   the latter wired through `orgmanager` over each tenant's app. Closed the
+   control-plane-leak (§5 #2) along the way. Spans the tinycld repo (core
+   capabilities) and this router. All green.
+7. **Track B — tinycld de-org-ing (§12, done 2026-07-24).** `orgs`/`user_org`
+   collections DELETED from the tinycld app; `role` moved onto `users`; every
+   feature/core FK repointed `user_org → users`; `useOrgLiveQuery` scope collapsed
+   to `{ userId }`; RLS rewritten to `@request.auth.role`; `app/a/[orgSlug]/` route
+   segment collapsed to `app/(app)/`; the two admin surfaces merged (`/admin` =
+   in-shell console, `/setup` = bootstrap door). Verified end-to-end against a fresh
+   boot of the forked server (member/guest RLS, contacts owner-isolation). Committed
+   on `feat/de-org` across 8 repos. **Now single-org: the router owns org
+   multiplexing; core assumes one org = one DB.** The `sharedDBScope` mentioned in
+   item 6 above is gone — carddav is `singleOrgScope`-only now.
 
 Design spec + implementation plans:
 - Fork seams + router design (2026-07-22) live in the fork's git history at
@@ -60,6 +91,9 @@ Design spec + implementation plans:
 - **TypeScript** spec + plan (committed in this repo):
   `docs/superpowers/specs/2026-07-23-typescript-hooks-design.md` and
   `docs/superpowers/plans/2026-07-23-typescript-hooks.md`.
+- **Multi-org CardDAV** spec (committed in this repo):
+  `docs/superpowers/specs/2026-07-23-carddav-multi-org.md`. Core capability-hook
+  reference lives in the tinycld repo at `tinycld/docs/hooks.md`.
 
 ---
 
@@ -241,13 +275,18 @@ Gaps found while making the router runnable:
 1. ~~**No HTTP route to publish packages.**~~ **CLOSED (2026-07-23, §9).** The
    `POST /api/store/packages` route (superuser-guarded, base64 file payloads) was
    added as part of the TypeScript work and is proven live.
-2. **Control-plane collections leak into every tenant.** `orgs`/`packages`/
-   `deployments` are registered into the process-global `core.AppMigrations`, so
-   every tenant DB also runs them (observed `orgs`, `packages`, `deployments` in
-   acme's `data.db`). The spec is explicit that **no org/membership data belongs in
-   a tenant** — a tenant having an `orgs` table contradicts the isolation model.
-   Fix likely means registering the control-plane schema only on the control-plane
-   app (e.g. app-scoped migration registration) rather than globally.
+2. ~~**Control-plane collections leak into every tenant.**~~ **CLOSED
+   (2026-07-23, §11).** `orgs`/`packages`/`deployments` were registered into the
+   process-global `core.AppMigrations`, so every tenant `RunAllMigrations()` also
+   created them — a tenant having an `orgs` table (the registry of every other org)
+   contradicts the isolation model, and it collided with any package wanting those
+   collection names. Fixed by making the control-plane schema **app-scoped**:
+   `controlplane.RunSchema(app)` runs a local `MigrationsList` against the
+   control-plane app only (via `NewMigrationsRunner`), and `ControlPlane.Init()`
+   sequences Bootstrap → RunSystemMigrations → RunSchema. `core.AppMigrations` is no
+   longer touched, so tenants never inherit the registry. Guarded by
+   `TestIntegration_TenantHasNoControlPlaneCollections` (asserts a provisioned
+   tenant DB has none of the three, while the control-plane still has all three).
 3. **Tenant JS runs with full host capabilities → PARTIALLY mitigated in-process;
    NOT contained.** Tenant hooks + migrations now run under the fork's jsvm
    **Sandboxed** mode (`jsvm.Config{Sandboxed: true}`): a deny-by-default allowlist
@@ -292,12 +331,15 @@ escapes, and CPU/memory/wall-clock DoS (no resource limits).
 vestigial (`ContentHash`/`content_hash`/`manifest` unused — either wire or drop);
 `lockfile.Resolve` doesn't run the `peerVersions` solver yet (spec §7 follow-on).
 
-**The Track-B follow-on — tinycld de-org-ing (spec §11):** remove `orgs`/`user_org`
+~~**The Track-B follow-on — tinycld de-org-ing (spec §11):** remove `orgs`/`user_org`
 collections + FKs from the tinycld app, collapse `useOrgLiveQuery`/`OrgScope` to
-auth-based rules, org switcher via the parent-domain hint cookie. This is the
-larger app-facing effort that makes orgs independent inside the tinycld codebase.
-It's now unblocked (the router can produce a live tenant to verify against) but
-needs its own plan.
+auth-based rules, org switcher via the parent-domain hint cookie.~~ **DONE
+2026-07-24 (§12)** for core + app shell + all TS client + core Go server + the
+contacts feature. The org switcher (parent-domain cookie) is stubbed pending the
+router setting the cookie. **Remaining:** the 5 feature Go servers
+(mail/drive/calendar/text/calc) still contain org/user_org logic AND are blocked on
+§11 fork adoption (they lack the `replace => ../../pocketbase` sobek fork replace,
+so they can't build against the forked core). See §12 "Remaining".
 
 ---
 
@@ -317,8 +359,11 @@ Pick up any of these independently:
   `-buildservemux` branch is stale), then PR.
 - **Ship the version bump:** push the 7 `chore/bump-pocketbase-v0.39.8` branches
   (or fold into a coordinated release).
-- **Close finding #2 (tenant schema leak)** from §5. (Finding #1, the publish
-  route, is now closed — §9.)
+- ~~**Close finding #2 (tenant schema leak)** from §5.~~ **DONE (§11)** — the
+  control-plane schema is app-scoped now. (Finding #1, the publish route, closed in
+  §9.)
+- **Commit the §11 CardDAV/capabilities work** across the three repos (`multi-org`,
+  tinycld core+shell, `contacts`) — currently uncommitted working-tree changes.
 - **Delete the stale fork branch** `feat/jsvm-programsource-buildservemux` from the
   remote once PR #2's clean branch exists.
 - **Give the multi-org module a remote** if it should be shared/CI'd.
@@ -338,9 +383,25 @@ Pick up any of these independently:
 | `~/code/tinycld/pocketbase` | `feat/jsvm-programsource` | `6644c6af` | **Yes** (`fork`) — clean PR #1 (goja-era) |
 | `~/code/tinycld/pocketbase` | `feat/jsvm-programsource-buildservemux` | (older) | Yes (`fork`) — **stale, don't PR** |
 | `~/code/tinycld/pocketbase` | `feat/multitenant-fork` | `fb868ca4` | No — local integration (checked out); +8 TS/sobek commits, **+8 jsvm Sandboxed-mode commits (§10)** since `0da4c670` |
-| `~/code/tinycld/multi-org` | `feat/operator-runnable` | `1694c1e` | **No remote**; **+ jsvm-sandbox wiring + docs commits (§10)** since `da08173` |
-| `~/code/tinycld` (core+shell) | `chore/bump-pocketbase-v0.39.8` | `8fff4e4` | No |
-| `mail/calendar/contacts/drive/text/calc` | `chore/bump-pocketbase-v0.39.8` | (each) | No |
+| `~/code/tinycld/multi-org` | `feat/operator-runnable` | `1694c1e` | **No remote**; **+ jsvm-sandbox wiring + docs commits (§10)** since `da08173`; **+ UNCOMMITTED CardDAV/capabilities + control-plane-leak fix (§11)** in the working tree |
+| `~/code/tinycld` (core+shell) | **`feat/de-org`** | `1f6691f` | No; §11 committed as `6f8ead3`, then **Track-B de-org** stacked in 3 commits (`a4d577a` schema → `aed30e8` client → `1f6691f` server+app). Branched off `chore/bump-pocketbase-v0.39.8` (`8fff4e4`). |
+| `~/code/tinycld/contacts` | **`feat/de-org`** | `9ccd0ac` | No; §11 de-Go committed (`ea752ad`), then de-org schema/client + the `contacts.pb.ts` inline-uuid fix (§12) |
+| `mail/calendar/drive/text/calc` | **`feat/de-org`** | (each) | No; **client** de-org committed; **feature Go servers NOT de-orged** (see §12 Remaining) |
+| `~/code/tinycld/google-takeout-import` | **`feat/de-org`** | `1781eb0` | No; client de-org committed |
+
+⚠️ **The §11 CardDAV work is now COMMITTED** (`6f8ead3` in the tinycld repo;
+contacts `ea752ad`) — the Track-B de-org branch (`feat/de-org`) is stacked on top of
+it. The router imports `tinycld.org/core` via a `replace => ../tinycld/core/server`
+in `multi-org/go.mod`, so a router build needs the tinycld core working tree present
+with its capability packages.
+
+⚠️ **Workspace is currently running LEAN (core + contacts only).** The other 6
+feature dirs (`mail calendar drive text calc google-takeout-import`) plus the two
+test stubs (`share-stub`, `shortcut-stub`) are PARKED at `~/code/tinycld/.parked/`
+and removed from `pnpm-workspace.yaml`, so `getPackages()` doesn't scan them and the
+app boots as a lean core+contacts shell. To restore the full workspace: move the
+parked dirs back to the workspace root, re-add them to `pnpm-workspace.yaml`, then
+`pnpm install`. Their git repos (all on `feat/de-org`) travel with the dirs.
 
 ⚠️ The router builds against the fork's **working tree**, which must stay on
 `feat/multitenant-fork` for the `../pocketbase` replace to see both seams **and the
@@ -364,6 +425,12 @@ go test ./internal/orgmanager/ -run TestE2E -v
 go test ./internal/controlplane/ -run TestIntegration_CreateOrgToLoadWithSchema -v
 go test ./internal/controlplane/ -run TestIntegration_CreateOrgToLoadWithTSSchema -v
 
+# Multi-org CardDAV multiplex + control-plane-leak fix (§11):
+go test ./internal/controlplane/ -run TestIntegration_MultiOrgCardDAV -v
+go test ./internal/controlplane/ -run TestIntegration_TenantHasNoControlPlaneCollections -v
+# Core capability packages (tinycld repo, standalone against the fork):
+cd ~/code/tinycld/tinycld/core/server && GOWORK=off go test ./carddav/ ./fts/ ./audit/ ./coreserver/
+
 # TypeScript on the fork (transpile seam + sobek engine, incl. vendored node modules):
 cd ~/code/tinycld/pocketbase && go test ./plugins/jsvm/... -count=1 && go test -race ./plugins/jsvm/ -count=1
 
@@ -377,6 +444,24 @@ cd ~/code/tinycld/pocketbase && go test ./plugins/jsvm/... -count=1 && go test -
 
 # Workspace bump holds:
 cd ~/code/tinycld/tinycld/core/server && go test ./...
+
+# --- Track B — de-org (§12), on feat/de-org across the tinycld repos ---
+# Core TS (typecheck + biome + vitest) and app-shell checks:
+cd ~/code/tinycld/tinycld/core && pnpm exec tinycld-pkg check
+cd ~/code/tinycld/tinycld && pnpm run checks
+# Contacts (re-linked feature):
+cd ~/code/tinycld/contacts && pnpm exec tinycld-pkg check
+# Core Go server on the fork (all suites; rewritten to single-org fixtures):
+cd ~/code/tinycld/tinycld/core/server && GOWORK=off go build ./... && GOWORK=off go vet ./... && GOWORK=off go test ./...
+# Live single-org schema + RLS (fresh boot of the app-shell server binary):
+#   Build: cd ~/code/tinycld/tinycld/server && go build -o /tmp/tinycld-server .
+#   /tmp/tinycld-server superuser create admin@x.test 'Passw0rd123!' --dir /tmp/pbv
+#   /tmp/tinycld-server serve --dir /tmp/pbv \
+#     --migrationsDir ~/code/tinycld/tinycld/server/pb_migrations \
+#     --hooksDir ~/code/tinycld/tinycld/server/pb_hooks --http 127.0.0.1:8899
+#   Assert: sqlite3 /tmp/pbv/data.db has NO orgs/user_org, users has a `role` field;
+#   a member lists all users, a guest sees only itself and 0 labels; a member's
+#   contact (owner = their user id) is invisible to another user.
 ```
 
 ---
@@ -490,3 +575,253 @@ process is the wrong altitude.**
 **OS-level per-process isolation is now the required next boundary** (§5 finding #3).
 Follow-up brief: `docs/superpowers/specs/FOLLOWUP-os-process-isolation.md`.
 **Until it lands, do not treat tenant authors as untrusted in production.**
+
+---
+
+## 11. Host-side capabilities + multi-org CardDAV (done 2026-07-23)
+
+The model: functionality that must be Go (protocol servers, FTS5, OOXML, …) lives
+in **core** and runs **host-side**; packages contribute it as **manifest config**,
+not feature Go. A tenant stays stock PocketBase + JS/TS hooks. Spec:
+`docs/superpowers/specs/2026-07-23-carddav-multi-org.md`; capability-hook reference:
+`tinycld/docs/hooks.md` (tinycld repo). **Uncommitted** across `multi-org`, tinycld
+core+shell, and `contacts` (see §7).
+
+### In the tinycld repo (`~/code/tinycld/tinycld`)
+
+- **Fork adoption**: `server/go.mod` + `core/server/go.mod` gain
+  `replace github.com/pocketbase/pocketbase => …/pocketbase`, so the single-tenant
+  app links the fork jsvm (sobek + `OnInit`). Verified: full core + all 6 feature
+  Go suites green on the fork.
+- **`OnInit` `$`-binding seam** — `core/server/coreserver/jsvm_binds.go`:
+  `RegisterJSVMBinder`/`buildJsvmOnInit`/`NewBindNamespace`. Minimal by design; the
+  pilot needs **zero** custom bindings (data-plane work is core Go record hooks
+  driven by config, not bindings — keeps the untrusted-TS surface tiny).
+- **Core capability packages**: `core/server/{carddav,fts,audit}/`, all
+  config-driven and wired from `coreserver/pkg_capabilities.go` (reads each
+  package's manifest block from `bundled-packages.json`; **fails loud** on a
+  malformed block). CardDAV uses an `OrgScope` interface: `sharedDBScope`
+  (single-tenant, org-by-slug across one DB) vs `singleOrgScope` (multi-org, the DB
+  IS the org). FTS5 sync/search generalized from contacts; audit moved off the
+  `audit.RegisterCollection` Go call to config.
+- **Manifest**: `carddav`/`fts`/`audit` block types added to
+  `scripts/load-manifest.ts`. **contacts de-Go'd**: `contacts/server/` deleted; a
+  single `contacts/pb-hooks/contacts.pb.ts` (vcard_uid autogen) remains; the
+  manifest declares `hooks`/`carddav`/`fts`/`audit`. The generator drops contacts
+  from the Go wiring and symlinks its `pb-hooks` into the app's `pb_hooks`.
+
+### In this router (`~/code/tinycld/multi-org`)
+
+- **Imports `tinycld.org/core`** (`replace => ../tinycld/core/server`).
+- **`orgmanager.load` composes CardDAV** over each tenant's app: `composeMux`
+  prefix-routes `/carddav*` to `carddav.HandlerFor(inst.app, sources)`
+  (`singleOrgScope`), else the stock mux. `inst.App()` accessor added.
+- **Manifest reaches the host**: `PublishPackage` now emits a parsed `manifest.json`
+  into the store (`controlplane/manifest.go`: transpile `manifest.ts` via esbuild →
+  eval in a throwaway sobek VM → JSON), and `controlplane.CardDAVSources` reads the
+  `carddav` block from it, fed to `orgmanager.Config.CardDAVSources`.
+- **`materialize`** now links `pb-hooks/*` into the tenant `pb_hooks` (the tinycld
+  convention), alongside the legacy `server/` link.
+- **Control-plane-leak fix (§5 #2, CLOSED)**: control-plane schema is now
+  **app-scoped** (`controlplane.RunSchema` / `ControlPlane.Init`), off the
+  process-global `core.AppMigrations`, so tenants no longer inherit
+  `orgs`/`packages`/`deployments`.
+
+### Proven
+
+- Core: `carddav` (codec, path helpers, both scopes DB-backed), `fts`
+  (sanitize/coerce), `audit` (descriptor translation), binding seam — all green;
+  single-tenant `/carddav` served a live 401 challenge from config.
+- Router: `TestIntegration_MultiOrgCardDAV` — publish contacts → provision **acme +
+  globex** → each serves **only its own** contact via `inst.Mux()` (the multiplex
+  proof: acme has Alice not Bob, globex the reverse); `…_Challenges401` (route
+  mounted from config, not 404); `TestIntegration_TenantHasNoControlPlaneCollections`
+  (leak fix). `emitManifestJSON` + `CardDAVSources` unit-tested. Full router suite
+  green + vet clean.
+
+### Multi-org CardDAV model (decided)
+
+**Per-org, org-from-hostname.** `acme.<domain>/carddav` authenticates against
+acme's tenant `users` and serves acme's contacts; a user in K orgs configures K
+CardDAV accounts. **Nested/aggregated** ("one login → a book per org") was rejected:
+it needs a cross-org identity that doesn't exist — the control-plane authenticates
+only the operator superuser and holds no end-user/membership data; end-users
+authenticate per-tenant. A global-identity + membership + tenant-SSO feature
+(overlaps Track-B de-org-ing) is a prerequisite and out of scope.
+
+### Follow-ons
+
+- **Other protocols** (CalDAV/CardDAV-analog, WebDAV, IMAP/SMTP) follow the same
+  host-Go-over-tenant-app shape; IMAP/SMTP add stateful long-lived sessions and one
+  host listener (SNI selects the org at connect, TLS terminated by the host).
+- **Post-isolation**: once orgs are isolated processes, the host can't read
+  `inst.app` directly — CardDAV/IMAP then **proxy** to per-org backends. The
+  `OrgScope`/data-access seam is where that swap lands without touching protocol
+  code.
+
+---
+
+## 12. Track B — tinycld de-org-ing (done 2026-07-24)
+
+The app-facing counterpart to the router: with the router owning org multiplexing,
+**core now assumes a single org (one org = one PocketBase DB)**. All multi-org
+concepts were removed from the tinycld codebase. Plan:
+`~/.claude/plans/rustling-popping-babbage.md`. Committed on `feat/de-org` across all
+8 repos (see §7 for hashes).
+
+### Decisions (locked with the user)
+
+- `orgs` + `user_org` collections **deleted**. The `role` enum
+  (`owner`/`admin`/`member`/`guest`) moved onto the `users` auth record. Every
+  feature/core FK that pointed at `user_org` was **repointed to `users`** (value is
+  now a users id): `contacts.owner`, `calendar_members.user`,
+  `calendar_events.created_by`, `drive_items.created_by`, `drive_shares.user_org`
+  (name kept), `mail_*.user_org` (name kept), core `labels.user` /
+  `label_assignments.user` / `org_pkg_access.user`, `comment_mentions.mentioned_user_org`.
+- Direct `org` FK fields **dropped** everywhere + their composite indexes rebuilt.
+- **No backwards compat / no data preservation**: migrations edited IN PLACE (fresh
+  DBs re-migrate; no add→backfill→drop). Org-only patch migrations deleted.
+- Roles + member management **survive** (invites, members list, package access,
+  role-gated UI) — only cross-org concerns (switcher, org-create console, cross-org
+  impersonation, org-slug routing) go away.
+- Route segment `app/a/[orgSlug]/` **collapsed to `app/(app)/`** (host identifies the
+  org). `useOrgHref`/`useOrgSlug` kept as slug-free shims to avoid churning ~200 nav
+  sites.
+- **The two admin surfaces merged**: `/admin` = the single in-shell console
+  (packages/builds/orgs/super-admins); `/setup` (was top-level `/admin`) = the
+  pre-auth bootstrap door only (first-run `?token=` wizard + `_superusers` recovery).
+  The Go first-run URL now prints `/setup?token=`.
+
+### What shipped
+
+- **Schema** (all repos): migrations edited in place; RLS rewritten from
+  `org.user_org_via_org…` predicates to `@request.auth.id`/`@request.auth.role`
+  (verified: once `role` is a real `users` field, `@request.auth.role` resolves in
+  the PB rule engine).
+- **Client** (core + all 7 features): `useOrgLiveQuery` scope → `{ userId }`;
+  `useCurrentRole` reads `users.role`; org-branding hooks stubbed; auth store dropped
+  `primaryOrgSlug`/org-expand; `OrganizationsTab` stubbed to an empty state (org list
+  is a router-cookie concern, not built); members roster + settings screens
+  re-sourced from `users`.
+- **Go server (core)**: `carddav` collapsed to `singleOrgScope` (owner = the authed
+  user id; `sharedDBScope`/`findUserOrgBySlug` deleted); `userorg` reduced to account
+  offboarding (leave-org endpoints removed); invites/demo set `users.role` instead of
+  creating junction rows; `notify`/`fts`/`audit` de-org-scoped; cross-org
+  impersonation (`org_admin.go`) deleted. All core Go tests rewritten to single-org
+  fixtures and passing.
+
+### Verified end-to-end (fresh boot of the forked app-shell server)
+
+- Migrations replay clean into a fresh DB: **no** `orgs`/`user_org`/`org_provisioning`;
+  `users.role` = `select[owner,admin,member,guest]`; FKs → `_pb_users_auth_`; no `org`
+  fields.
+- RLS live: a **member** lists all users; a **guest** sees only itself and gets 0
+  labels (`@request.auth.role != "guest"` + self carve-out both hold).
+- **Contacts** (re-linked, no Go server): member creates a contact owned by their
+  user id → 200; owner-scoped RLS isolates it from other users; the `contacts.pb.ts`
+  hook auto-generates `vcard_uid`.
+- TS: core typecheck + biome + 477 unit tests green; app-shell checks green; contacts
+  check green.
+
+### Remaining
+
+1. **The 5 feature Go servers** (mail/drive/calendar/text/calc) still contain
+   org/user_org logic AND are **blocked on §11 fork adoption** — they lack the
+   `replace github.com/pocketbase/pocketbase => ../../pocketbase` the app shell has,
+   so they can't build against the sobek-forked core (goja↔sobek mismatch). Their
+   *client* code is already de-orged. Next: add the fork replace to each, then de-org
+   the server (same pattern core used). Contacts (already de-Go'd) is the proven
+   template.
+2. **§11 TypeScript-hooks transpile bug (found during Track-B verification).** A
+   `.pb.ts` hook cannot reference a top-level module binding — a `function` OR a
+   `const` arrow, declared before or after the hook — from inside the hook callback:
+   it throws `ReferenceError: X is not defined` at request time. The fork's TS→JS
+   hook-wrapping seam loses module scope. Worked around in `contacts.pb.ts` by
+   inlining the UUID logic into the callback; the fork seam should be fixed so hooks
+   can factor out helpers. (Plain `.pb.js` hooks are unaffected — they load without
+   the esbuild wrap.)
+3. **Org switcher parent-domain cookie**: `OrganizationsTab` is stubbed; wire it to
+   the cookie once the router sets it (`.<domain>` cookie listing accessible orgs,
+   rows linking to `<slug>.<domain>`).
+4. **Restore the full workspace** when the feature servers are ready (see §7 warning).
+
+---
+
+## 13. Packages ship Go again — §11 reversal + carddav de-dup (done 2026-07-25)
+
+The §11 model — "functionality that must be Go lives in core, packages contribute
+only config, **no feature Go runs**" — was **reversed**. Packages must keep the
+ability to ship their own Go. The contacts pilot was re-Go'd, with core's protocol
+code kept as **one shared copy** (not duplicated per consumer). Committed on branch
+`multi-org` across three repos (tinycld, contacts, this router).
+
+### Decisions (locked with the user)
+
+- **Packages own their Go** via the manifest `server: { package, module }` +
+  `Register(app)` seam (the "Era-1" model, still used by parked mail/drive/…).
+- **Core keeps `carddav` + `fts` as generic, config-driven LIBRARIES**, not
+  boot-time wiring. A package's Go builds a `carddav.Source` / `fts.Config` and
+  calls `carddav.Register` / `fts.Register` / `audit.RegisterCollection`. **Single
+  copy** — the router imports the same `tinycld.org/core/carddav`, so there is no
+  duplication (an earlier attempt vendored a copy into the router; that was undone
+  once the decision was to keep core's copy).
+- **Single-tenant only** for package Go for now; running package Go inside multi-org
+  *tenants* stays deferred to the OS-process-isolation follow-on (§5 #3). Tenants
+  remain stock PocketBase; the router serves CardDAV host-side (`orgmanager.load` →
+  `composeMux` → `carddav.HandlerFor(inst.app, sources)`), unchanged.
+
+### In the tinycld repo (`~/code/tinycld/tinycld`, branch `multi-org`)
+
+- `core/server/coreserver`: removed the manifest-config capability wiring
+  (`pkg_capabilities.go` deleted; the `fts.Register`/`carddav.Register`/
+  `audit.RegisterFromDescriptors` calls dropped from `server.go`). Kept the
+  `$`-binding seam and the `/carddav` CORS bypass. `audit`'s config-driven
+  `Descriptor` path deleted (imperative `RegisterCollection` stays).
+- `core/server/{carddav,fts}` **kept** as the single shared libraries.
+- `scripts/gen-server.ts`: `buildMemberGoWork` now emits the fork replace so a
+  package server builds standalone against the sobek fork.
+- **Track-B de-org tail finished** so the contacts app runs: the seed harness
+  (`scripts/seed-db.ts`, `SeedContext`, `reset-demo.ts`) de-org'd (user `role`, no
+  `orgs`/`user_org`, dead `seedSecondOrg` removed); the shared e2e helpers
+  de-org'd (`login()` gates on the nav rail, bare `/<pkg>` routes); and the
+  **post-login React #185 loop** fixed — `app/index.tsx`'s `navigateToOrg()`
+  (`router.push('/')`) pushed the current route onto itself under the collapsed
+  single-org path, so it's now a declarative `<Redirect>` to the first accessible
+  package; `useOrgHref` returns a stable string href.
+
+### In the contacts repo (`~/code/tinycld/contacts`, branch `multi-org`)
+
+- `server/` restored (recovered from `b8d2d2b`, reconciled to single-org): a
+  `Register(app)` that builds a contacts `carddav.Source` + `fts.Config`, calls
+  core's capabilities, adds the `vcard_uid` create hook, and exposes a
+  `$contacts.search` JS binding. `manifest.ts` re-adds `server`, drops the
+  `carddav`/`fts`/`audit` config blocks; `contacts.pb.ts` is a TS-extension example.
+- `seed.ts` de-org'd (owner/labels by user id).
+
+### In this router (`~/code/tinycld/multi-org`, branch `multi-org`)
+
+- **No source change from the de-dup** beyond confirming it still imports
+  `tinycld.org/core/carddav` and that `TestIntegration_MultiOrgCardDAV` is green.
+  The router's CardDAV multiplex is unchanged. (The pre-existing §11 working-tree
+  changes — `controlplane.go`, `provisioning.go`, `materialize.go`, `manifest.go`,
+  `capabilities.go`, `carddav.go`, the integration tests — are committed onto this
+  branch alongside.)
+
+### Verified
+
+- Go: contacts server + core (`carddav`/`fts`) + the app-shell binary (with
+  `contacts.Register` wired) all build/test; router builds + vets +
+  `TestIntegration_MultiOrgCardDAV` green.
+- TS: app checks + core (477 tests) + contacts (20 tests) green.
+- **Live single-tenant smoke**: vcard_uid autogen, `/api/contacts/search` (incl.
+  partial-email), CardDAV 401 → REPORT vCard → soft-delete, and an `audit_logs` row.
+- **Contacts Playwright e2e: 5/5 pass** (boots, renders seeded data, search
+  clear/restore, partial-email FTS, create-shows-in-list).
+
+### Remaining / follow-ons
+
+- **Package Go inside multi-org tenants** — still deferred to OS-process isolation
+  (§5 #3). Until then the router serves protocol Go host-side.
+- **The other feature servers** (mail/drive/calendar/calc/text) are still Era-1 and
+  blocked on §11 fork adoption (§12 Remaining) — unchanged by this work.
+- The `manifest.ts` version mismatch was fixed for contacts (`0.1.2`).

@@ -176,6 +176,12 @@ func (p *Provisioner) PublishPackage(name, version string, files map[string][]by
 	if err != nil {
 		return fmt.Errorf("transpile package %s@%s: %w", name, version, err)
 	}
+	// Emit a parsed manifest.json so the host can read the package's host-side
+	// capability config (carddav/fts/audit) without a TS loader at load time.
+	files, err = emitManifestJSON(files)
+	if err != nil {
+		return fmt.Errorf("manifest json for %s@%s: %w", name, version, err)
+	}
 	if err := p.store.Publish(name, version, files); err != nil {
 		return err
 	}

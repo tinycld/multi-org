@@ -4,12 +4,16 @@ go 1.26.3
 
 replace github.com/pocketbase/pocketbase => ../pocketbase
 
+replace tinycld.org/core => ../tinycld/core/server
+
 require (
 	github.com/evanw/esbuild v0.28.1
+	github.com/google/uuid v1.6.0 // indirect
 	github.com/grafana/sobek v0.0.0-20260722203707-64fef69693b6
 	github.com/pocketbase/pocketbase v0.39.8
 	golang.org/x/crypto v0.54.0
 	golang.org/x/sync v0.22.0
+	tinycld.org/core v0.0.0
 )
 
 require (
@@ -19,6 +23,8 @@ require (
 	github.com/domodwyer/mailyak/v3 v3.6.2 // indirect
 	github.com/dop251/base64dec v0.0.0-20231022112746-c6c9f9a96217 // indirect
 	github.com/dustin/go-humanize v1.0.1 // indirect
+	github.com/emersion/go-vcard v0.0.0-20260618161152-d854b7e0e2d3 // indirect
+	github.com/emersion/go-webdav v0.7.0 // indirect
 	github.com/fatih/color v1.19.0 // indirect
 	github.com/fsnotify/fsnotify v1.10.1 // indirect
 	github.com/gabriel-vasile/mimetype v1.4.13 // indirect
@@ -26,7 +32,6 @@ require (
 	github.com/go-sourcemap/sourcemap v2.1.4+incompatible // indirect
 	github.com/golang-jwt/jwt/v5 v5.3.1 // indirect
 	github.com/google/pprof v0.0.0-20260604005048-7023385849c0 // indirect
-	github.com/google/uuid v1.6.0 // indirect
 	github.com/inconshreveable/mousetrap v1.1.0 // indirect
 	github.com/mattn/go-colorable v0.1.15 // indirect
 	github.com/mattn/go-isatty v0.0.23 // indirect

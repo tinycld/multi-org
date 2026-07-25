@@ -11,6 +11,7 @@ import (
 	"github.com/pocketbase/pocketbase/plugins/jsvm"
 	"golang.org/x/sync/singleflight"
 
+	"tinycld.org/core/carddav"
 	"tinycld.org/multi-org/internal/lockfile"
 	"tinycld.org/multi-org/internal/materialize"
 	"tinycld.org/multi-org/internal/progcache"
@@ -38,6 +39,15 @@ type Config struct {
 	LookupOrg LookupFunc
 	HooksPool int
 	MaxIdle   time.Duration // 0 => no idle eviction sweeper
+
+	// CardDAVSources returns the CardDAV sources an org's resolved package set
+	// contributes (read from each package's `carddav` manifest block). When it
+	// returns a non-empty slice, load() composes a host-side CardDAV handler over
+	// the tenant's app in front of the stock mux, so <slug>.<domain>/carddav is
+	// served by trusted host Go against that org's DB. Nil or empty => no CardDAV
+	// for that org (the tenant serves only its stock mux). Kept as a hook so the
+	// manager stays decoupled from manifest parsing (see capabilities.go).
+	CardDAVSources func(resolved []lockfile.ResolvedPackage) ([]carddav.Source, error)
 }
 
 type OrgManager struct {
@@ -136,10 +146,16 @@ func (m *OrgManager) load(slug string) (*OrgInstance, error) {
 		return nil, fmt.Errorf("migrations %s: %w", slug, err)
 	}
 
-	mux, err := apis.BuildServeMux(pb, apis.ServeConfig{})
+	stockMux, err := apis.BuildServeMux(pb, apis.ServeConfig{})
 	if err != nil {
 		_ = pb.App.ResetBootstrapState()
 		return nil, fmt.Errorf("build mux %s: %w", slug, err)
+	}
+
+	mux, err := m.composeMux(pb, stockMux, resolved)
+	if err != nil {
+		_ = pb.App.ResetBootstrapState()
+		return nil, fmt.Errorf("compose mux %s: %w", slug, err)
 	}
 
 	inst := &OrgInstance{slug: slug, app: pb, mux: mux}

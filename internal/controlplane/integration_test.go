@@ -40,7 +40,7 @@ func TestIntegration_CreateOrgToLoadWithSchema(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer cp.App.ResetBootstrapState()
-	if err := cp.App.RunAllMigrations(); err != nil {
+	if err := cpInitForTest(cp); err != nil {
 		t.Fatal(err)
 	}
 
@@ -106,7 +106,7 @@ func TestIntegration_CreateOrgToLoadWithTSSchema(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer cp.App.ResetBootstrapState()
-	if err := cp.App.RunAllMigrations(); err != nil {
+	if err := cpInitForTest(cp); err != nil {
 		t.Fatal(err)
 	}
 
@@ -174,7 +174,7 @@ func TestIntegration_MaliciousMigrationCannotExec(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer cp.App.ResetBootstrapState()
-	if err := cp.App.RunAllMigrations(); err != nil {
+	if err := cpInitForTest(cp); err != nil {
 		t.Fatal(err)
 	}
 
@@ -193,6 +193,17 @@ func TestIntegration_MaliciousMigrationCannotExec(t *testing.T) {
 	}
 }
 
+// cpInitForTest runs the control-plane's system migrations + app-scoped schema on
+// an already-bootstrapped test app. Mirrors ControlPlane.Init but assumes the
+// caller already did Bootstrap (the tests do, so they control the defer of
+// ResetBootstrapState).
+func cpInitForTest(cp *ControlPlane) error {
+	if err := cp.App.RunSystemMigrations(); err != nil {
+		return err
+	}
+	return RunSchema(cp.App)
+}
+
 func assertTenantHasWidgets(t *testing.T, dataDir string) {
 	t.Helper()
 	tenant := pocketbase.NewWithConfig(pocketbase.Config{
@@ -205,6 +216,63 @@ func assertTenantHasWidgets(t *testing.T, dataDir string) {
 	defer tenant.App.ResetBootstrapState()
 	if _, err := tenant.App.FindCollectionByNameOrId("widgets"); err != nil {
 		t.Fatalf("tenant DB missing 'widgets' collection from package migration: %v", err)
+	}
+}
+
+// TestIntegration_TenantHasNoControlPlaneCollections proves the control-plane
+// schema (orgs/packages/deployments) does NOT leak into a tenant DB — a tenant
+// must know nothing about the registry of other orgs. Guards against the
+// process-global AppMigrations leak.
+func TestIntegration_TenantHasNoControlPlaneCollections(t *testing.T) {
+	root := t.TempDir()
+
+	cp, err := New(filepath.Join(root, "pb_control", "pb_data"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cp.App.Bootstrap(); err != nil {
+		t.Fatal(err)
+	}
+	defer cp.App.ResetBootstrapState()
+	if err := cpInitForTest(cp); err != nil {
+		t.Fatal(err)
+	}
+
+	// The control-plane itself MUST have the schema (it's the registry).
+	for _, name := range []string{"orgs", "packages", "deployments"} {
+		if _, err := cp.App.FindCollectionByNameOrId(name); err != nil {
+			t.Fatalf("control-plane missing its own %q collection: %v", name, err)
+		}
+	}
+
+	s := store.New(root)
+	if err := s.Publish("@tinycld/core", "1.0.0", map[string][]byte{
+		"pb-migrations/1700000000_widgets.js": []byte(widgetsMigration),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	p := NewProvisioner(cp.App, root, s, func(string) {})
+	if _, err := p.CreateOrg("acme", "Acme", map[string]string{"@tinycld/core": "1.0.0"}); err != nil {
+		t.Fatalf("CreateOrg: %v", err)
+	}
+
+	tenant := pocketbase.NewWithConfig(pocketbase.Config{
+		DefaultDataDir:  filepath.Join(root, "pb_orgs", "acme", "pb_data"),
+		HideStartBanner: true,
+	})
+	if err := tenant.Bootstrap(); err != nil {
+		t.Fatalf("bootstrap tenant DB: %v", err)
+	}
+	defer tenant.App.ResetBootstrapState()
+
+	for _, name := range []string{"orgs", "packages", "deployments"} {
+		if _, err := tenant.App.FindCollectionByNameOrId(name); err == nil {
+			t.Errorf("tenant DB leaked control-plane collection %q", name)
+		}
+	}
+	// The tenant's own package schema must still be present.
+	if _, err := tenant.App.FindCollectionByNameOrId("widgets"); err != nil {
+		t.Errorf("tenant DB missing its own 'widgets' collection: %v", err)
 	}
 }
 
@@ -222,7 +290,7 @@ func TestIntegration_MaliciousHookCannotCrashControlPlane(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer cp.App.ResetBootstrapState()
-	if err := cp.App.RunAllMigrations(); err != nil {
+	if err := cpInitForTest(cp); err != nil {
 		t.Fatal(err)
 	}
 

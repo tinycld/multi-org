@@ -18,7 +18,7 @@ func TestProvision_CreatesOrgRowAndDirs(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer cp.App.ResetBootstrapState()
-	if err := cp.App.RunAllMigrations(); err != nil {
+	if err := cpInitForTest(cp); err != nil {
 		t.Fatal(err)
 	}
 
@@ -48,7 +48,7 @@ func TestProvision_DeployEvicts(t *testing.T) {
 	cp, _ := New(filepath.Join(root, "pb_control", "pb_data"))
 	_ = cp.App.Bootstrap()
 	defer cp.App.ResetBootstrapState()
-	_ = cp.App.RunAllMigrations()
+	_ = cpInitForTest(cp)
 
 	s := store.New(root)
 	_ = s.Publish("@tinycld/core", "1.0.0", map[string][]byte{"server/a.pb.js": []byte("1")})
@@ -72,7 +72,7 @@ func TestProvision_SuspendResumeArchive(t *testing.T) {
 	cp, _ := New(filepath.Join(root, "pb_control", "pb_data"))
 	_ = cp.App.Bootstrap()
 	defer cp.App.ResetBootstrapState()
-	_ = cp.App.RunAllMigrations()
+	_ = cpInitForTest(cp)
 	s := store.New(root)
 	_ = s.Publish("@tinycld/core", "1.0.0", map[string][]byte{"server/a.pb.js": []byte("1")})
 
@@ -106,7 +106,7 @@ func TestProvision_PublishPackageRegisters(t *testing.T) {
 	cp, _ := New(filepath.Join(root, "pb_control", "pb_data"))
 	_ = cp.App.Bootstrap()
 	defer cp.App.ResetBootstrapState()
-	_ = cp.App.RunAllMigrations()
+	_ = cpInitForTest(cp)
 	s := store.New(root)
 
 	p := NewProvisioner(cp.App, root, s, func(string) {})
@@ -131,7 +131,7 @@ func TestProvision_DuplicateSlugErrors(t *testing.T) {
 	cp, _ := New(filepath.Join(root, "pb_control", "pb_data"))
 	_ = cp.App.Bootstrap()
 	defer cp.App.ResetBootstrapState()
-	_ = cp.App.RunAllMigrations()
+	_ = cpInitForTest(cp)
 	s := store.New(root)
 	_ = s.Publish("@tinycld/core", "1.0.0", map[string][]byte{"server/a.pb.js": []byte("1")})
 	p := NewProvisioner(cp.App, root, s, func(string) {})
@@ -148,7 +148,7 @@ func TestProvision_InvalidSlugErrors(t *testing.T) {
 	cp, _ := New(filepath.Join(root, "pb_control", "pb_data"))
 	_ = cp.App.Bootstrap()
 	defer cp.App.ResetBootstrapState()
-	_ = cp.App.RunAllMigrations()
+	_ = cpInitForTest(cp)
 	s := store.New(root)
 	p := NewProvisioner(cp.App, root, s, func(string) {})
 	if _, err := p.CreateOrg("Acme_Bad!", "x", map[string]string{}); err == nil {
@@ -163,7 +163,7 @@ func TestProvision_CreateOrgResumesStrandedRow(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer cp.App.ResetBootstrapState()
-	if err := cp.App.RunAllMigrations(); err != nil {
+	if err := cpInitForTest(cp); err != nil {
 		t.Fatal(err)
 	}
 	s := store.New(root)
@@ -201,7 +201,7 @@ func TestProvision_DeployWritesAuditRecord(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer cp.App.ResetBootstrapState()
-	if err := cp.App.RunAllMigrations(); err != nil {
+	if err := cpInitForTest(cp); err != nil {
 		t.Fatal(err)
 	}
 	s := store.New(root)
@@ -230,7 +230,7 @@ func TestProvision_DeployRejectsArchivedOrg(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer cp.App.ResetBootstrapState()
-	if err := cp.App.RunAllMigrations(); err != nil {
+	if err := cpInitForTest(cp); err != nil {
 		t.Fatal(err)
 	}
 	s := store.New(root)

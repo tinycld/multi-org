@@ -34,13 +34,12 @@ func main() {
 	if err != nil {
 		log.Fatalf("control plane: %v", err)
 	}
-	if err := cp.App.Bootstrap(); err != nil {
-		log.Fatalf("bootstrap control plane: %v", err)
+	// Init bootstraps + runs system migrations + applies the control-plane schema
+	// (app-scoped, so it never leaks into tenant DBs).
+	if err := cp.Init(); err != nil {
+		log.Fatalf("init control plane: %v", err)
 	}
 	defer cp.App.ResetBootstrapState()
-	if err := cp.App.RunAllMigrations(); err != nil {
-		log.Fatalf("control-plane migrations: %v", err)
-	}
 
 	if err := ensureSuperuser(cp.App); err != nil {
 		log.Fatalf("bootstrap superuser: %v", err)
@@ -50,12 +49,13 @@ func main() {
 	programs := progcache.New()
 
 	mgr := orgmanager.New(orgmanager.Config{
-		Root:      root,
-		Store:     pkgStore,
-		Programs:  programs,
-		LookupOrg: controlplane.OrgLookup(cp.App),
-		HooksPool: 15,
-		MaxIdle:   30 * time.Minute,
+		Root:           root,
+		Store:          pkgStore,
+		Programs:       programs,
+		LookupOrg:      controlplane.OrgLookup(cp.App),
+		HooksPool:      15,
+		MaxIdle:        30 * time.Minute,
+		CardDAVSources: controlplane.CardDAVSources,
 	})
 	defer mgr.Shutdown()
 

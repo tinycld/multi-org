@@ -4,33 +4,54 @@ import (
 	"github.com/pocketbase/pocketbase/core"
 )
 
-// registerSchema appends the control-plane collections to the process-global app
-// migrations. Called once from New before Bootstrap. The filename prefix is
-// deliberately well above PocketBase's own base migration timestamps (16xx) so
-// filename ordering reflects the real ordering: PB's base tables must exist first.
-func registerSchema() {
-	core.AppMigrations.Register(func(txApp core.App) error {
-		orgs, err := createOrgs(txApp)
-		if err != nil {
-			return err
-		}
-		if err := createPackages(txApp); err != nil {
-			return err
-		}
-		return createDeployments(txApp, orgs)
-	}, func(txApp core.App) error {
-		// reverse order (deployments references orgs via relation)
-		for _, name := range []string{"deployments", "packages", "orgs"} {
-			c, err := txApp.FindCollectionByNameOrId(name)
+// controlPlaneSchemaFile is the migration filename recorded in the control-plane's
+// _migrations table. The prefix is well above PocketBase's base migration
+// timestamps (16xx) so ordering reflects reality: PB's base tables exist first.
+const controlPlaneSchemaFile = "1900000000_controlplane_init.go"
+
+// controlPlaneMigrations returns the control-plane schema as an APP-SCOPED
+// migration list — NOT the process-global core.AppMigrations. This is
+// deliberate: core.AppMigrations is shared by every PocketBase app in the process
+// (including every tenant), so registering the control-plane schema there leaked
+// orgs/packages/deployments into every tenant DB. Running this list only against
+// the control-plane app (RunSchema) keeps the registry out of tenants.
+func controlPlaneMigrations() core.MigrationsList {
+	var list core.MigrationsList
+	list.Add(&core.Migration{
+		File: controlPlaneSchemaFile,
+		Up: func(txApp core.App) error {
+			orgs, err := createOrgs(txApp)
 			if err != nil {
-				continue // already gone
-			}
-			if err := txApp.Delete(c); err != nil {
 				return err
 			}
-		}
-		return nil
-	}, "1900000000_controlplane_init.go")
+			if err := createPackages(txApp); err != nil {
+				return err
+			}
+			return createDeployments(txApp, orgs)
+		},
+		Down: func(txApp core.App) error {
+			// reverse order (deployments references orgs via relation)
+			for _, name := range []string{"deployments", "packages", "orgs"} {
+				c, err := txApp.FindCollectionByNameOrId(name)
+				if err != nil {
+					continue // already gone
+				}
+				if err := txApp.Delete(c); err != nil {
+					return err
+				}
+			}
+			return nil
+		},
+	})
+	return list
+}
+
+// RunSchema applies the control-plane schema against a single app, recording it
+// in that app's _migrations table (idempotent — a re-run is a no-op). Call it
+// only on the control-plane app, after Bootstrap and RunSystemMigrations.
+func RunSchema(app core.App) error {
+	_, err := core.NewMigrationsRunner(app, controlPlaneMigrations()).Up()
+	return err
 }
 
 func createOrgs(app core.App) (*core.Collection, error) {

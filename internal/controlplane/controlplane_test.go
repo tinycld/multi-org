@@ -18,7 +18,7 @@ func TestControlPlane_BootstrapsWithOrgsCollection(t *testing.T) {
 	}
 	defer cp.App.ResetBootstrapState()
 
-	if err := cp.App.RunAllMigrations(); err != nil {
+	if err := cpInitForTest(cp); err != nil {
 		t.Fatalf("migrations: %v", err)
 	}
 

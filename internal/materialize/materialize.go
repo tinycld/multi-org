@@ -37,6 +37,11 @@ func Materialize(orgDir string, resolved []lockfile.ResolvedPackage) error {
 	migrationOwners := map[string]string{}
 
 	for _, pkg := range resolved {
+		// Hooks come from pb-hooks/ (the tinycld convention: *.pb.ts/*.pb.js).
+		// A legacy server/ dir is also linked for packages that predate pb-hooks.
+		if err := linkServerHooks(filepath.Join(pkg.Dir, "pb-hooks"), hooksDir); err != nil {
+			return err
+		}
 		if err := linkServerHooks(filepath.Join(pkg.Dir, "server"), hooksDir); err != nil {
 			return err
 		}

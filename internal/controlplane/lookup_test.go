@@ -19,7 +19,7 @@ func TestOrgLookup_ReturnsActiveOrgRecord(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer cp.App.ResetBootstrapState()
-	if err := cp.App.RunAllMigrations(); err != nil {
+	if err := cpInitForTest(cp); err != nil {
 		t.Fatal(err)
 	}
 
@@ -53,7 +53,7 @@ func TestRegisterRoutes_OrgsRequiresSuperuser(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer cp.App.ResetBootstrapState()
-	if err := cp.App.RunAllMigrations(); err != nil {
+	if err := cpInitForTest(cp); err != nil {
 		t.Fatal(err)
 	}
 	s := store.New(root)
@@ -83,7 +83,7 @@ func TestRegisterRoutes_PublishPackageRequiresSuperuser(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer cp.App.ResetBootstrapState()
-	if err := cp.App.RunAllMigrations(); err != nil {
+	if err := cpInitForTest(cp); err != nil {
 		t.Fatal(err)
 	}
 	s := store.New(root)

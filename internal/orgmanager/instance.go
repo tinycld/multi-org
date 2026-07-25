@@ -16,8 +16,9 @@ type OrgInstance struct {
 	lastUsed atomic.Int64 // unix nanos; seeded at load, updated on each Get (request dispatch)
 }
 
-func (i *OrgInstance) Mux() http.Handler { return i.mux }
-func (i *OrgInstance) Slug() string      { return i.slug }
+func (i *OrgInstance) Mux() http.Handler        { return i.mux }
+func (i *OrgInstance) Slug() string             { return i.slug }
+func (i *OrgInstance) App() *pocketbase.PocketBase { return i.app }
 
 func (i *OrgInstance) touch(now int64) { i.lastUsed.Store(now) }
 

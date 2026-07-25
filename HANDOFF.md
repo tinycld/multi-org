@@ -5,6 +5,12 @@
 SQLite DB, client JS bundle, and server-side JS handlers — sharing versioned code
 where identical, isolated where not.
 
+> **2026-07-25 (later):** **`mail` migrated** — de-orged (schema + the 12.5k-line
+> Go server), widened to `core.App`, and its IMAP/SMTP transport lifted into the
+> new shared `tinycld.org/core/mailproto`. Mail is unparked and green: 36/36
+> Playwright, plus a live smoke test that reproduced the silent zero-row search
+> bug the rename fixes. Router unaffected. See **§14**.
+
 > **2026-07-25:** **The §11 "no feature Go" decision was REVERSED — packages ship
 > Go again.** The contacts pilot was re-Go'd: its CardDAV/FTS/audit now run in the
 > package's own Go server, driven by config it builds and passes to core's reusable
@@ -395,8 +401,9 @@ it. The router imports `tinycld.org/core` via a `replace => ../tinycld/core/serv
 in `multi-org/go.mod`, so a router build needs the tinycld core working tree present
 with its capability packages.
 
-⚠️ **Workspace is currently running LEAN (core + contacts only).** The other 6
-feature dirs (`mail calendar drive text calc google-takeout-import`) plus the two
+⚠️ **Workspace is currently running LEAN (core + contacts + mail).** `mail` was
+unparked and re-added to `pnpm-workspace.yaml` as part of §14. The other 5
+feature dirs (`calendar drive text calc google-takeout-import`) plus the two
 test stubs (`share-stub`, `shortcut-stub`) are PARKED at `~/code/tinycld/.parked/`
 and removed from `pnpm-workspace.yaml`, so `getPackages()` doesn't scan them and the
 app boots as a lean core+contacts shell. To restore the full workspace: move the
@@ -825,3 +832,124 @@ code kept as **one shared copy** (not duplicated per consumer). Committed on bra
 - **The other feature servers** (mail/drive/calendar/calc/text) are still Era-1 and
   blocked on §11 fork adoption (§12 Remaining) — unchanged by this work.
 - The `manifest.ts` version mismatch was fixed for contacts (`0.1.2`).
+
+---
+
+## 14. Mail migrated — de-org + core/mailproto (done 2026-07-25)
+
+`mail` is the second feature migrated to single-org, following the contacts
+template (§13). Committed on branch `multi-org` across three repos (mail,
+tinycld, contacts). **Mail is now unparked and a live workspace member.**
+
+### The state mail was found in
+
+A **half-finished de-org**: migrations (`15b815e`) and the TS client (`587363a`)
+had been converted; the 12.5k-line Go server had not. It was broken two ways:
+
+1. **Could not build** — `audit.ResolveOrg` and `notify.NotifyParams.OrgID` no
+   longer exist in core (8 compile errors). It also lacked the sobek-fork
+   `replace`, though unparking fixed that for free: the generator emits it.
+2. **Would have been silently wrong if it did** — the `user_org` FK fields kept
+   their NAMES while their referent changed from a junction id to a `users` id.
+   Membership checks, notifications and folder-filtered search would each have
+   matched **zero rows, with HTTP 200 and no error**.
+
+Finding #2 is the important one and it was **reproduced live**: with the old
+`ts.user_org` column, `GET /api/mail/search?q=…&folder=inbox` returns
+`{"total":0}` — and the **entire Go unit suite still passes**. Only the live
+smoke test catches this class. Budget for it when migrating drive/calendar/calc/text.
+
+### Decisions (locked with the user)
+
+- **Extract the protocol engine to core now**, but do **not** build the
+  host-side multi-org IMAP/SMTP listener — §11 says that path becomes a proxy
+  once per-org isolation lands, so a listener built today is known-throwaway.
+- **Multi-org tenants get no IMAP/SMTP yet** (§5: tenants can't be treated as
+  untrusted until OS-process isolation).
+- Mail's FTS **stays in mail**. Core's `fts` is single-table, owner-scoped and
+  deliberately refuses `snippet()` as an XSS sink; mail's is a two-index union
+  with `<mark>` highlighting, 8 structured filters and a SQL fallback. Not a fit.
+
+### What shipped
+
+**Schema** (`mail`): `mail_mailbox_members.user_org` and
+`mail_thread_state.user_org` renamed → **`user`** (edited in place; indexes, the
+`mail_folder_counts` view and the RLS rules rebuilt). The rename is what turns
+the silent zero-row matches into loud errors.
+
+**Go** (`mail`): `auth.go` collapsed 4 org helpers → `verifyMailboxMembership`
++ `verifyAdmin(auth)` reading `users.role`; 6 `audit.ResolveOrg` configs, the
+dead per-org settings cache, `getOrgSettings` and the `org_provisioning` hook
+deleted; `user_org` hooks rebound to `users`; `imap_session.go` lost
+`orgID`/`userOrgID` and its Login fan-out collapsed to one query;
+`endpoints_search.go` lost an N+1. Two latent bugs fixed en route:
+`filterImportantMail` queried a nonexistent `contacts_contacts`.`emails` (so it
+never matched — now `contacts`.`email`, tolerating the package's absence), and
+notification deep-links now target `/mail`.
+
+**`core.App` widening** (mail + `core/carddav`): every method mail calls on
+`app` is on the `core.App` interface — `Start`/`Execute`/`RootCmd` appear
+nowhere — so ~50 signatures were widened. carddav's comment claiming it needed
+the concrete app "for record Save/Delete" was simply wrong (both are `core.App`
+methods). Only `Register(app *pocketbase.PocketBase)` keeps the concrete type
+(the generator's contract + core's `audit` API). **This is what makes protocol
+code host-agnostic, and it is the cheap prerequisite for any future sharing —
+do it for drive/calendar/calc/text too.**
+
+**`tinycld.org/core/mailproto`** (new, ~560 lines): the TLS plumbing (cert
+reloader, hardened suites, env-or-autocert resolution) and the IMAP/SMTP
+listener lifecycle, including the fail-loud guard that refuses to fall through
+to a plain dev listener when production has no TLS. Mail's three listener files
+went from ~570 lines to 62 thin adapters.
+
+**Sessions deliberately did NOT move.** They are saturated with mail's data
+model (threads, folders, IMAP UIDs, flags, mailbox membership); config-driving
+them would mean reimplementing that schema as configuration, far beyond what
+`carddav.Source`'s ~8-field map does. They stay in mail and are injected
+(`NewIMAPSession` / `smtp.Backend`). The inbound MX listener also keeps its own
+bind loop (opt-in, single plain listener, hostname-derived domain) and shares
+only the TLS resolution. `IdleNotifier` is a type, not a package global, so a
+multi-org host can hold one per tenant.
+
+### Verified
+
+- Go: mail builds/vets/tests; core `mailproto`+`carddav`+`fts`+`coreserver`
+  green; the assembled app-shell binary builds with mail linked.
+- Router: builds, vets, and `TestIntegration_MultiOrgCardDAV` still passes
+  (it passes `inst.app`, which satisfies `core.App`).
+- TS: mail check (138 unit) + contacts check (20 unit) + app-shell checks green.
+- **Live single-tenant smoke** (fresh DB, forked binary): no
+  `orgs`/`user_org`/`org_provisioning`; both mail FKs → `_pb_users_auth_`;
+  `users.role` enum intact; plain / **folder-filtered** / **starred** search all
+  return 1 with `<mark>` highlighting; guest sees 0 mail_domains while a member
+  sees 1; IMAP LOGIN→LIST→SELECT→SEARCH→STORE over the extracted listener; the
+  `handleUserCreated` hook auto-provisioned a personal mailbox.
+- **Playwright: mail 36/36, contacts 5/5.**
+
+### Gotchas for the next feature
+
+1. **`GOWORK=off go test` does NOT work for a member** — core resolves only via
+   `go.work`. Run plain `go build/vet/test` from `<member>/server`.
+2. **Regenerate after changing migrations**: `cd tinycld && pnpm run
+   packages:generate`. `pbSchema.ts` is generated from the on-disk migrations;
+   a stale copy produces a wall of confusing type errors in *core and other
+   members*, which looks like a much bigger breakage than it is.
+3. **e2e assertions must be scoped to the package's own UI.** Contacts' specs
+   used bare `getByText('Alice')` and broke the moment mail was installed —
+   mail's sidebar renders "Hey Alice, I submitted a PR…". Fixed by asserting on
+   `[data-testid^="contact-row-"]`. Expect the same class of breakage as more
+   packages come back.
+4. **Kill stray dev servers before running e2e.** A leftover process holding
+   `:1993` made all 8 mail IMAP specs fail with `ECONNREFUSED :1193` — the e2e
+   harness sets `IMAP_ADDR` but not `IMAPS_ADDR`, so the dev implicit-TLS
+   listener collides and aborts IMAP startup entirely.
+5. `pnpm run lint` no longer hardcodes members (it derives them via
+   `getPackages()`), so a partial assembly lints cleanly.
+
+### Remaining
+
+- **drive / calendar / calc / text** are still Era-1 and un-de-orged. Mail is now
+  the richest template; contacts remains the simplest.
+- **Wiring `mailproto` into the router** is intentionally NOT done — it waits on
+  OS-process isolation (§5 #3), at which point CardDAV/IMAP become proxies to
+  per-org backends rather than host-side handlers.

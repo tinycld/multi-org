@@ -1,6 +1,7 @@
 package controlplane
 
 import (
+	"context"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -9,7 +10,6 @@ import (
 	"github.com/pocketbase/pocketbase"
 
 	"tinycld.org/multi-org/internal/orgmanager"
-	"tinycld.org/multi-org/internal/progcache"
 	"tinycld.org/multi-org/internal/store"
 )
 
@@ -66,15 +66,16 @@ func TestIntegration_CreateOrgToLoadWithSchema(t *testing.T) {
 
 	// Now drive the full runtime chain: OrgLookup (real, DB-backed) → manager.load.
 	mgr := orgmanager.New(orgmanager.Config{
-		Root:      root,
-		Store:     s,
-		Programs:  progcache.New(),
-		LookupOrg: OrgLookup(cp.App),
-		HooksPool: 2,
+		Root:         root,
+		Store:        s,
+		TenantBinary: buildTenantBinary(t),
+		Logger:       quietLogger(),
+		LookupOrg:    OrgLookup(cp.App),
+		HooksPool:    2,
 	})
 	defer mgr.Shutdown()
 
-	inst, err := mgr.Get("acme")
+	inst, err := mgr.Get(context.Background(), "acme")
 	if err != nil {
 		t.Fatalf("manager.Get(acme) via real lookup: %v", err)
 	}
@@ -139,15 +140,16 @@ func TestIntegration_CreateOrgToLoadWithTSSchema(t *testing.T) {
 
 	// Drive the full runtime chain: OrgLookup (real, DB-backed) → manager.load.
 	mgr := orgmanager.New(orgmanager.Config{
-		Root:      root,
-		Store:     s,
-		Programs:  progcache.New(),
-		LookupOrg: OrgLookup(cp.App),
-		HooksPool: 2,
+		Root:         root,
+		Store:        s,
+		TenantBinary: buildTenantBinary(t),
+		Logger:       quietLogger(),
+		LookupOrg:    OrgLookup(cp.App),
+		HooksPool:    2,
 	})
 	defer mgr.Shutdown()
 
-	inst, err := mgr.Get("acme")
+	inst, err := mgr.Get(context.Background(), "acme")
 	if err != nil {
 		t.Fatalf("manager.Get(acme) via real lookup: %v", err)
 	}

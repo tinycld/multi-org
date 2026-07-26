@@ -33,7 +33,7 @@ const (
 type Params struct {
 	BaseDomain      string
 	ControlPlaneMux http.Handler
-	GetOrg          func(slug string) (http.Handler, error)
+	GetOrg          func(ctx context.Context, slug string) (http.Handler, error)
 
 	// TLSMode selects TLS termination; empty defaults to TLSProxy.
 	TLSMode TLSMode

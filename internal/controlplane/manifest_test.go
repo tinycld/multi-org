@@ -120,6 +120,10 @@ const manifest = {
     version: '0.2.2',
     description: 'Cloud file storage, with WebDAV',
     hooks: { directory: 'pb-hooks' },
+    quota: [
+        { collection: 'drive_items', sizeField: 'size', ownerField: 'created_by' },
+        { collection: 'drive_item_versions', sizeField: 'size', ownerField: 'created_by' },
+    ],
     webdav: {
         prefix: '/drive',
         collection: 'drive_items',
@@ -217,6 +221,61 @@ func TestWebDAVSources_RoundTripThroughWire(t *testing.T) {
 	}
 	if !reflect.DeepEqual(sources[0], decoded[0]) {
 		t.Fatalf("round trip changed the Source:\n before %+v\n after  %+v", sources[0], decoded[0])
+	}
+}
+
+// A quota source with no ownerField is shared data: it counts toward the org
+// ceiling but must never be charged to a user. Losing that distinction on the
+// wire would bill one person for a whole mailbox.
+func TestQuotaSources_ReadsManifestJSON(t *testing.T) {
+	files, err := emitManifestJSON(map[string][]byte{"manifest.ts": []byte(driveManifestTS)})
+	if err != nil {
+		t.Fatalf("emit: %v", err)
+	}
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, manifestJSONFile), files[manifestJSONFile], 0o644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	sources, err := QuotaSources([]lockfile.ResolvedPackage{{Name: "drive", Dir: dir}})
+	if err != nil {
+		t.Fatalf("QuotaSources: %v", err)
+	}
+	if len(sources) != 2 {
+		t.Fatalf("got %d sources, want 2", len(sources))
+	}
+	for _, s := range sources {
+		if s.Slug != "drive" || s.SizeField != "size" || s.OwnerField != "created_by" {
+			t.Errorf("source wrong: %+v", s)
+		}
+	}
+
+	decoded := davconfig.DecodeQuota(davconfig.EncodeQuota(sources))
+	if !reflect.DeepEqual(sources, decoded) {
+		t.Fatalf("wire round trip changed the sources:\n before %+v\n after  %+v", sources, decoded)
+	}
+}
+
+func TestQuotaSources_PreservesUnownedSource(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, manifestJSONFile),
+		[]byte(`{"slug":"mail","quota":[{"collection":"mail_messages","sizeField":"total_size"}]}`),
+		0o644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	sources, err := QuotaSources([]lockfile.ResolvedPackage{{Name: "mail", Dir: dir}})
+	if err != nil {
+		t.Fatalf("QuotaSources: %v", err)
+	}
+	if len(sources) != 1 {
+		t.Fatalf("got %d sources, want 1", len(sources))
+	}
+	if sources[0].OwnerField != "" {
+		t.Fatalf("OwnerField = %q, want empty — shared data has nobody to charge", sources[0].OwnerField)
+	}
+	if davconfig.DecodeQuota(davconfig.EncodeQuota(sources))[0].OwnerField != "" {
+		t.Fatal("the wire round trip must preserve an absent owner")
 	}
 }
 

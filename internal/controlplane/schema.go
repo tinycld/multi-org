@@ -62,6 +62,11 @@ func createOrgs(app core.App) (*core.Collection, error) {
 	c.Fields.Add(&core.JSONField{Name: "custom_domains"})
 	c.Fields.Add(&core.JSONField{Name: "lockfile"})
 	c.Fields.Add(&core.TextField{Name: "display_name"})
+	// The org's storage ceiling in bytes (0 = unlimited). This is the operator's
+	// commercial decision — the plan the org was sold — so it lives HERE and not
+	// in the tenant's own `settings`, where that org's superusers could raise it.
+	// The manager materializes it into the org's runtime config at spawn.
+	c.Fields.Add(&core.NumberField{Name: "storage_limit_bytes"})
 	c.Fields.Add(&core.AutodateField{Name: "created", OnCreate: true})
 	c.Fields.Add(&core.AutodateField{Name: "updated", OnCreate: true, OnUpdate: true})
 	c.AddIndex("idx_orgs_slug", true, "slug", "")

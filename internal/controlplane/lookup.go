@@ -16,9 +16,10 @@ func OrgLookup(app core.App) orgmanager.LookupFunc {
 			return orgmanager.OrgRecord{}, false
 		}
 		return orgmanager.OrgRecord{
-			Slug:     rec.GetString("slug"),
-			Status:   rec.GetString("status"),
-			Lockfile: []byte(rec.GetString("lockfile")),
+			Slug:              rec.GetString("slug"),
+			Status:            rec.GetString("status"),
+			Lockfile:          []byte(rec.GetString("lockfile")),
+			StorageLimitBytes: int64(rec.GetInt("storage_limit_bytes")),
 		}, true
 	}
 }

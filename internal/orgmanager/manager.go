@@ -17,6 +17,7 @@ import (
 	"golang.org/x/sync/singleflight"
 
 	"tinycld.org/core/carddav"
+	"tinycld.org/core/quota"
 	"tinycld.org/core/webdav"
 	"tinycld.org/multi-org/internal/davconfig"
 	"tinycld.org/multi-org/internal/lockfile"
@@ -52,6 +53,11 @@ type OrgRecord struct {
 	Slug     string
 	Status   string
 	Lockfile []byte
+
+	// StorageLimitBytes is the org's ceiling (0 = unlimited), set by the
+	// operator on the control-plane record. Materialized into the org's runtime
+	// config so the tenant enforces it but cannot change it.
+	StorageLimitBytes int64
 }
 
 // LookupFunc resolves an org's control-plane record by slug.
@@ -83,6 +89,10 @@ type Config struct {
 	// WebDAVSources is CardDAVSources' counterpart for WebDAV trees (read from
 	// each package's `webdav` manifest block).
 	WebDAVSources func(resolved []lockfile.ResolvedPackage) ([]webdav.Source, error)
+
+	// QuotaSources returns the storage-bearing collections an org's resolved
+	// package set declares (from each package's `quota` manifest block).
+	QuotaSources func(resolved []lockfile.ResolvedPackage) ([]quota.Source, error)
 }
 
 // crashState tracks a slug's consecutive unexpected exits. It lives on the
@@ -208,7 +218,12 @@ func (m *OrgManager) load(ctx context.Context, slug string) (*OrgInstance, error
 		return nil, fmt.Errorf("webdav config %s: %w", slug, err)
 	}
 
-	inst, err := m.spawn(ctx, slug, orgDir, davConfig, webdavConfig)
+	quotaConfig, err := m.writeQuotaConfig(orgDir, rec, resolved)
+	if err != nil {
+		return nil, fmt.Errorf("quota config %s: %w", slug, err)
+	}
+
+	inst, err := m.spawn(ctx, slug, orgDir, davConfig, webdavConfig, quotaConfig)
 	if err != nil {
 		m.noteCrash(slug)
 		return nil, err
@@ -226,7 +241,7 @@ func (m *OrgManager) load(ctx context.Context, slug string) (*OrgInstance, error
 }
 
 // spawn starts the tenant process and waits for it to report readiness.
-func (m *OrgManager) spawn(ctx context.Context, slug, orgDir, davConfig, webdavConfig string) (*OrgInstance, error) {
+func (m *OrgManager) spawn(ctx context.Context, slug, orgDir, davConfig, webdavConfig, quotaConfig string) (*OrgInstance, error) {
 	sockPath, err := m.socketPath(slug)
 	if err != nil {
 		return nil, err
@@ -251,6 +266,7 @@ func (m *OrgManager) spawn(ctx context.Context, slug, orgDir, davConfig, webdavC
 		BinaryPath:    m.cfg.TenantBinary,
 		CardDAVConfig: davConfig,
 		WebDAVConfig:  webdavConfig,
+		QuotaConfig:   quotaConfig,
 		HooksPool:     m.cfg.HooksPool,
 		Drain:         drainTimeout,
 		ReadyFile:     readyW,
@@ -488,6 +504,52 @@ func (m *OrgManager) writeCardDAVConfig(orgDir string, resolved []lockfile.Resol
 		return "", err
 	}
 	return path, nil
+}
+
+// writeQuotaConfig materializes the org's storage ceiling where the tenant can
+// read it.
+//
+// It comes from the control-plane record rather than the org's own settings
+// because each tenant has its own superusers: a limit stored inside the org
+// could be raised by the org. Writing it here makes the plan limit the
+// operator's to set and the tenant's only to obey.
+//
+// A zero limit still writes the file — "explicitly unlimited" and "no config"
+// should not be distinguishable to the tenant, and the file's presence is what
+// tells serve-org the router is managing this.
+func (m *OrgManager) writeQuotaConfig(orgDir string, rec OrgRecord, resolved []lockfile.ResolvedPackage) (string, error) {
+	var sources []quota.Source
+	if m.cfg.QuotaSources != nil {
+		var err error
+		sources, err = m.cfg.QuotaSources(resolved)
+		if err != nil {
+			return "", err
+		}
+	}
+
+	runtimeDir := filepath.Join(orgDir, ".runtime")
+	if err := os.MkdirAll(runtimeDir, 0o755); err != nil {
+		return "", err
+	}
+	path := filepath.Join(runtimeDir, "quota.json")
+
+	body, err := json.Marshal(quotaConfigFile{
+		StorageLimitBytes: rec.StorageLimitBytes,
+		Sources:           davconfig.EncodeQuota(sources),
+	})
+	if err != nil {
+		return "", err
+	}
+	if err := os.WriteFile(path, body, 0o644); err != nil {
+		return "", err
+	}
+	return path, nil
+}
+
+// quotaConfigFile is the wire shape of .runtime/quota.json.
+type quotaConfigFile struct {
+	StorageLimitBytes int64                   `json:"storageLimitBytes"`
+	Sources           []davconfig.QuotaSource `json:"sources"`
 }
 
 // writeWebDAVConfig is writeCardDAVConfig's counterpart for WebDAV trees. Same

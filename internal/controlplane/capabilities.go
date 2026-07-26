@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 
 	"tinycld.org/core/carddav"
+	"tinycld.org/core/quota"
 	"tinycld.org/core/webdav"
 	"tinycld.org/multi-org/internal/lockfile"
 )
@@ -45,6 +46,11 @@ type manifestCapabilities struct {
 			Updated  string `json:"updated"`
 		} `json:"fields"`
 	} `json:"webdav"`
+	Quota []struct {
+		Collection string `json:"collection"`
+		SizeField  string `json:"sizeField"`
+		OwnerField string `json:"ownerField"`
+	} `json:"quota"`
 }
 
 // CardDAVSources reads each resolved package's materialized manifest.json and
@@ -128,6 +134,40 @@ func WebDAVSources(resolved []lockfile.ResolvedPackage) ([]webdav.Source, error)
 				Updated:  wd.Fields.Updated,
 			},
 		})
+	}
+	return sources, nil
+}
+
+// QuotaSources reads each resolved package's materialized manifest.json and
+// returns the quota.Source for every collection a package declares as
+// storage-bearing.
+//
+// Unlike the DAV sources these are pure data with no Go counterpart, so a
+// tenant enforces exactly what the single-org app does. A source with no
+// ownerField counts toward the org ceiling only — shared data has nobody to
+// charge.
+func QuotaSources(resolved []lockfile.ResolvedPackage) ([]quota.Source, error) {
+	var sources []quota.Source
+	for _, pkg := range resolved {
+		mc, ok, err := readManifestCapabilities(pkg.Dir)
+		if err != nil {
+			return nil, err
+		}
+		if !ok || len(mc.Quota) == 0 {
+			continue
+		}
+		slug := mc.Slug
+		if slug == "" {
+			slug = pkg.Name
+		}
+		for _, q := range mc.Quota {
+			sources = append(sources, quota.Source{
+				Slug:       slug,
+				Collection: q.Collection,
+				SizeField:  q.SizeField,
+				OwnerField: q.OwnerField,
+			})
+		}
 	}
 	return sources, nil
 }

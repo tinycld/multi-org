@@ -32,6 +32,7 @@ import (
 	"github.com/pocketbase/pocketbase/plugins/jsvm"
 
 	"tinycld.org/core/carddav"
+	"tinycld.org/core/quota"
 	"tinycld.org/core/webdav"
 	"tinycld.org/multi-org/internal/davconfig"
 )
@@ -44,6 +45,7 @@ func main() {
 		slug         = flag.String("slug", "", "org slug (identification and logging only)")
 		hooksPool    = flag.Int("hooks-pool", 15, "jsvm hook runtime pool size")
 		webdavConfig = flag.String("webdav-config", "", "path to the org's materialized webdav.json")
+		quotaConfig  = flag.String("quota-config", "", "path to the org's materialized quota.json")
 		davConfig    = flag.String("carddav-config", "", "path to the CardDAV source JSON")
 		drain        = flag.Duration("drain", 10*time.Second, "graceful shutdown budget")
 		confinePkg   = flag.String("confine-packages", "", "remount this dir read-only in our mount namespace")
@@ -62,13 +64,13 @@ func main() {
 		ready = os.NewFile(uintptr(*readyFD), "ready")
 	}
 
-	if err := run(*orgDir, *socketPath, *slug, *hooksPool, *davConfig, *webdavConfig, *confinePkg, *drain, ready); err != nil {
+	if err := run(*orgDir, *socketPath, *slug, *hooksPool, *davConfig, *webdavConfig, *quotaConfig, *confinePkg, *drain, ready); err != nil {
 		reportNotReady(ready, err)
 		log.Fatalf("serve-org: %v", err)
 	}
 }
 
-func run(orgDir, socketPath, slug string, hooksPool int, davConfigPath, webdavConfigPath, confinePkg string,
+func run(orgDir, socketPath, slug string, hooksPool int, davConfigPath, webdavConfigPath, quotaConfigPath, confinePkg string,
 	drain time.Duration, ready *os.File) error {
 
 	// Confinement steps that must happen inside our own mount namespace. Go
@@ -88,6 +90,11 @@ func run(orgDir, socketPath, slug string, hooksPool int, davConfigPath, webdavCo
 	davSources, err := loadWebDAVSources(webdavConfigPath)
 	if err != nil {
 		return fmt.Errorf("load webdav config: %w", err)
+	}
+
+	quotaCfg, err := loadQuotaConfig(quotaConfigPath)
+	if err != nil {
+		return fmt.Errorf("load quota config: %w", err)
 	}
 
 	app := pocketbase.NewWithConfig(pocketbase.Config{
@@ -120,6 +127,15 @@ func run(orgDir, socketPath, slug string, hooksPool int, davConfigPath, webdavCo
 		Sandboxed: true,
 	}); err != nil {
 		return fmt.Errorf("jsvm register: %w", err)
+	}
+
+	// Storage ceilings. The org limit comes from the router's runtime config,
+	// NOT this org's settings — its superusers must not be able to raise the
+	// plan they were sold. core/quota binds record hooks, so every write path
+	// in the tenant is covered even though no feature Go is linked here.
+	if err := quota.Register(app, davconfig.DecodeQuota(quotaCfg.Sources),
+		quota.FixedLimits(quotaCfg.StorageLimitBytes)); err != nil {
+		return fmt.Errorf("quota register: %w", err)
 	}
 
 	if err := app.Bootstrap(); err != nil {
@@ -219,6 +235,30 @@ func run(orgDir, socketPath, slug string, hooksPool int, davConfigPath, webdavCo
 		return err
 	}
 	return nil
+}
+
+// quotaConfig is the shape of .runtime/quota.json, written by the router.
+type quotaConfig struct {
+	StorageLimitBytes int64                   `json:"storageLimitBytes"`
+	Sources           []davconfig.QuotaSource `json:"sources"`
+}
+
+func loadQuotaConfig(path string) (quotaConfig, error) {
+	if path == "" {
+		return quotaConfig{}, nil
+	}
+	body, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return quotaConfig{}, nil
+		}
+		return quotaConfig{}, err
+	}
+	var cfg quotaConfig
+	if err := json.Unmarshal(body, &cfg); err != nil {
+		return quotaConfig{}, err
+	}
+	return cfg, nil
 }
 
 func loadWebDAVSources(path string) ([]webdav.Source, error) {

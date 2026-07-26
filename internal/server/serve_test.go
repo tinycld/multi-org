@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -11,7 +12,7 @@ func TestBuildHandler_RoutesAdminAndOrg(t *testing.T) {
 	h := BuildHandler(Params{
 		BaseDomain:      "tinycld.org",
 		ControlPlaneMux: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { adminHit = true }),
-		GetOrg: func(slug string) (http.Handler, error) {
+		GetOrg: func(ctx context.Context, slug string) (http.Handler, error) {
 			return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(204) }), nil
 		},
 	})

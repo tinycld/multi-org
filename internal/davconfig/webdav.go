@@ -1,6 +1,9 @@
 package davconfig
 
-import "tinycld.org/core/webdav"
+import (
+	"tinycld.org/core/quota"
+	"tinycld.org/core/webdav"
+)
 
 // The WebDAV wire format, mirroring tinycld.org/core/webdav's Source/FieldMap
 // for the same reason the CardDAV mirror exists: core's types carry no JSON
@@ -74,6 +77,45 @@ func DecodeWebDAV(sources []WebDAVSource) []webdav.Source {
 				Owner:    s.Fields.Owner,
 				Updated:  s.Fields.Updated,
 			},
+		})
+	}
+	return out
+}
+
+// The quota wire format. Mirrored for the same reason as the DAV ones:
+// tinycld.org/core/quota's Source carries no JSON tags, so marshalling it
+// directly would make this file's shape depend on Go field names staying stable
+// across a repo boundary.
+type QuotaSource struct {
+	Slug       string `json:"slug"`
+	Collection string `json:"collection"`
+	SizeField  string `json:"sizeField"`
+	OwnerField string `json:"ownerField"`
+}
+
+// EncodeQuota converts core's Sources into the wire form.
+func EncodeQuota(sources []quota.Source) []QuotaSource {
+	out := make([]QuotaSource, 0, len(sources))
+	for _, s := range sources {
+		out = append(out, QuotaSource{
+			Slug:       s.Slug,
+			Collection: s.Collection,
+			SizeField:  s.SizeField,
+			OwnerField: s.OwnerField,
+		})
+	}
+	return out
+}
+
+// DecodeQuota converts the wire form back into core's Sources.
+func DecodeQuota(sources []QuotaSource) []quota.Source {
+	out := make([]quota.Source, 0, len(sources))
+	for _, s := range sources {
+		out = append(out, quota.Source{
+			Slug:       s.Slug,
+			Collection: s.Collection,
+			SizeField:  s.SizeField,
+			OwnerField: s.OwnerField,
 		})
 	}
 	return out

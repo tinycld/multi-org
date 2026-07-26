@@ -34,6 +34,9 @@ type SpawnRequest struct {
 	// WebDAVConfig is the path to the org's materialized webdav.json, or empty
 	// when no package declares a webdav block.
 	WebDAVConfig string
+	// QuotaConfig is the path to the org's materialized quota.json, carrying
+	// the storage ceiling the operator assigned.
+	QuotaConfig string
 
 	HooksPool int
 	Drain     time.Duration

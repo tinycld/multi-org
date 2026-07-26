@@ -1,17 +1,25 @@
 package controlplane
 
 import (
+	"context"
 	"encoding/base64"
+	"fmt"
+	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 
+	"github.com/pocketbase/pocketbase"
 	"github.com/pocketbase/pocketbase/core"
+	"github.com/pocketbase/pocketbase/plugins/jsvm"
 
 	"tinycld.org/multi-org/internal/orgmanager"
-	"tinycld.org/multi-org/internal/progcache"
 	"tinycld.org/multi-org/internal/store"
 )
 
@@ -58,14 +66,80 @@ const manifest = {
 export default manifest
 `
 
+var (
+	tenantBinOnce sync.Once
+	tenantBinPath string
+	tenantBinErr  error
+)
+
+// buildTenantBinary compiles cmd/serve-org once per test run. CardDAV now runs
+// inside the tenant process, so proving it works needs the real binary.
+func buildTenantBinary(t *testing.T) string {
+	t.Helper()
+	if testing.Short() {
+		t.Skip("skipping real-binary test in short mode")
+	}
+	tenantBinOnce.Do(func() {
+		dir, err := os.MkdirTemp("", "serve-org-bin")
+		if err != nil {
+			tenantBinErr = err
+			return
+		}
+		out := filepath.Join(dir, "serve-org")
+		cmd := exec.Command("go", "build", "-o", out, "tinycld.org/multi-org/cmd/serve-org")
+		if combined, err := cmd.CombinedOutput(); err != nil {
+			tenantBinErr = fmt.Errorf("build serve-org: %v\n%s", err, combined)
+			return
+		}
+		tenantBinPath = out
+	})
+	if tenantBinErr != nil {
+		t.Fatal(tenantBinErr)
+	}
+	return tenantBinPath
+}
+
+func quietLogger() *slog.Logger { return slog.New(slog.NewTextHandler(io.Discard, nil)) }
+
 // TestIntegration_MultiOrgCardDAV drives the full multi-org CardDAV path:
-// publish a contacts package (carddav manifest + schema) → provision an org →
-// seed a user/org/contact in that tenant DB → PROPFIND/REPORT the org's CardDAV
-// endpoint through inst.Mux() and confirm the seeded contact is returned as a
-// vCard. A second org is provisioned and confirmed to serve ONLY its own
-// contact — the multiplex proof.
+// publish a contacts package (carddav manifest + schema) → provision two orgs →
+// seed each tenant DB → REPORT each org's CardDAV endpoint through its proxy
+// and confirm each serves ONLY its own contact.
+//
+// With per-process isolation this exercises the real path end to end: the host
+// resolves sources and writes them to the org's runtime dir, the tenant process
+// reads them and mounts its own CardDAV routes against its own DB, and the
+// response travels back over the unix socket.
 func TestIntegration_MultiOrgCardDAV(t *testing.T) {
 	root := t.TempDir()
+	mgr, p := setupCardDAVOrgs(t, root)
+	defer mgr.Shutdown()
+
+	seedOrg(t, p, root, "acme", "alice@acme.test", "Alice", "Acme")
+	seedOrg(t, p, root, "globex", "bob@globex.test", "Bob", "Globex")
+
+	acmeVCF := carddavReport(t, mgr, "acme", "alice@acme.test")
+	if !strings.Contains(acmeVCF, "Alice") {
+		t.Errorf("acme CardDAV should contain Alice, got:\n%s", acmeVCF)
+	}
+	if strings.Contains(acmeVCF, "Bob") {
+		t.Errorf("acme CardDAV leaked globex's Bob:\n%s", acmeVCF)
+	}
+
+	globexVCF := carddavReport(t, mgr, "globex", "bob@globex.test")
+	if !strings.Contains(globexVCF, "Bob") {
+		t.Errorf("globex CardDAV should contain Bob, got:\n%s", globexVCF)
+	}
+	if strings.Contains(globexVCF, "Alice") {
+		t.Errorf("globex CardDAV leaked acme's Alice:\n%s", globexVCF)
+	}
+}
+
+// setupCardDAVOrgs boots a control plane, publishes the contacts package, and
+// returns a manager wired to spawn real tenant processes.
+func setupCardDAVOrgs(t *testing.T, root string) (*orgmanager.OrgManager, *Provisioner) {
+	t.Helper()
+	bin := buildTenantBinary(t)
 
 	cp, err := New(filepath.Join(root, "pb_control", "pb_data"))
 	if err != nil {
@@ -74,7 +148,7 @@ func TestIntegration_MultiOrgCardDAV(t *testing.T) {
 	if err := cp.App.Bootstrap(); err != nil {
 		t.Fatal(err)
 	}
-	defer cp.App.ResetBootstrapState()
+	t.Cleanup(func() { _ = cp.App.ResetBootstrapState() })
 	if err := cpInitForTest(cp); err != nil {
 		t.Fatal(err)
 	}
@@ -94,48 +168,47 @@ func TestIntegration_MultiOrgCardDAV(t *testing.T) {
 	mgr := orgmanager.New(orgmanager.Config{
 		Root:           root,
 		Store:          s,
-		Programs:       progcache.New(),
+		TenantBinary:   bin,
+		Logger:         quietLogger(),
 		LookupOrg:      OrgLookup(cp.App),
 		HooksPool:      2,
 		CardDAVSources: CardDAVSources,
 	})
-	defer mgr.Shutdown()
-
-	// Two orgs, each with its own contact, prove independent backends.
-	seedOrg(t, p, mgr, "acme", "alice@acme.test", "Alice", "Acme")
-	seedOrg(t, p, mgr, "globex", "bob@globex.test", "Bob", "Globex")
-
-	acmeVCF := carddavReport(t, mgr, "acme", "alice@acme.test")
-	if !strings.Contains(acmeVCF, "Alice") {
-		t.Errorf("acme CardDAV should contain Alice, got:\n%s", acmeVCF)
-	}
-	if strings.Contains(acmeVCF, "Bob") {
-		t.Errorf("acme CardDAV leaked globex's Bob:\n%s", acmeVCF)
-	}
-
-	globexVCF := carddavReport(t, mgr, "globex", "bob@globex.test")
-	if !strings.Contains(globexVCF, "Bob") {
-		t.Errorf("globex CardDAV should contain Bob, got:\n%s", globexVCF)
-	}
-	if strings.Contains(globexVCF, "Alice") {
-		t.Errorf("globex CardDAV leaked acme's Alice:\n%s", globexVCF)
-	}
+	return mgr, p
 }
 
-// seedOrg provisions an org and inserts a user + one contact owned by that user
-// into the tenant's DB via the tenant app (driving records directly is the
-// standard PB integration-test approach). Single-org: the contact's owner is the
-// user's id directly — no membership row.
-func seedOrg(t *testing.T, p *Provisioner, mgr *orgmanager.OrgManager, slug, email, first, orgName string) {
+// seedOrg provisions an org and inserts a user + one contact into its DB.
+//
+// The host no longer holds a tenant app object, so seeding opens the tenant's
+// database directly — the test process is the host and has filesystem access.
+// This must happen BEFORE the tenant process spawns, since two processes must
+// not hold the same SQLite database open for writing.
+func seedOrg(t *testing.T, p *Provisioner, root, slug, email, first, orgName string) {
 	t.Helper()
 	if _, err := p.CreateOrg(slug, orgName, map[string]string{"contacts": "1.0.0"}); err != nil {
 		t.Fatalf("CreateOrg(%s): %v", slug, err)
 	}
-	inst, err := mgr.Get(slug)
-	if err != nil {
-		t.Fatalf("Get(%s): %v", slug, err)
+
+	orgDir := filepath.Join(root, "pb_orgs", slug)
+	app := pocketbase.NewWithConfig(pocketbase.Config{
+		DefaultDataDir:  filepath.Join(orgDir, "pb_data"),
+		HideStartBanner: true,
+	})
+	if err := jsvm.Register(app, jsvm.Config{
+		HooksDir:      filepath.Join(orgDir, "pb_hooks"),
+		MigrationsDir: filepath.Join(orgDir, "pb_migrations"),
+		HooksWatch:    false,
+		Sandboxed:     true,
+	}); err != nil {
+		t.Fatalf("seed jsvm register(%s): %v", slug, err)
 	}
-	app := inst.App()
+	if err := app.Bootstrap(); err != nil {
+		t.Fatalf("seed bootstrap(%s): %v", slug, err)
+	}
+	defer app.ResetBootstrapState()
+	if err := app.RunAllMigrations(); err != nil {
+		t.Fatalf("seed migrations(%s): %v", slug, err)
+	}
 
 	users, err := app.FindCollectionByNameOrId("users")
 	if err != nil {
@@ -148,7 +221,10 @@ func seedOrg(t *testing.T, p *Provisioner, mgr *orgmanager.OrgManager, slug, ema
 		t.Fatalf("save user: %v", err)
 	}
 
-	cCol, _ := app.FindCollectionByNameOrId("contacts")
+	cCol, err := app.FindCollectionByNameOrId("contacts")
+	if err != nil {
+		t.Fatalf("contacts collection: %v", err)
+	}
 	c := core.NewRecord(cCol)
 	c.Set("owner", user.Id)
 	c.Set("vcard_uid", "urn:uuid:"+slug+"-1")
@@ -162,10 +238,10 @@ func seedOrg(t *testing.T, p *Provisioner, mgr *orgmanager.OrgManager, slug, ema
 }
 
 // carddavReport issues an addressbook-query REPORT against the org's CardDAV
-// endpoint through inst.Mux() and returns the multistatus body.
+// endpoint through the proxy and returns the multistatus body.
 func carddavReport(t *testing.T, mgr *orgmanager.OrgManager, slug, email string) string {
 	t.Helper()
-	inst, err := mgr.Get(slug)
+	inst, err := mgr.Get(context.Background(), slug)
 	if err != nil {
 		t.Fatalf("Get(%s): %v", slug, err)
 	}
@@ -192,42 +268,18 @@ func basicAuth(user, pass string) string {
 	return base64.StdEncoding.EncodeToString([]byte(user + ":" + pass))
 }
 
-// TestIntegration_MultiOrgCardDAV_Challenges401 confirms the CardDAV endpoint
-// challenges for auth (route mounted from config) rather than 404ing.
+// TestIntegration_MultiOrgCardDAV_Challenges401 confirms the tenant mounts its
+// CardDAV routes from the config the host handed down, rather than 404ing.
 func TestIntegration_MultiOrgCardDAV_Challenges401(t *testing.T) {
 	root := t.TempDir()
-	cp, err := New(filepath.Join(root, "pb_control", "pb_data"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := cp.App.Bootstrap(); err != nil {
-		t.Fatal(err)
-	}
-	defer cp.App.ResetBootstrapState()
-	if err := cpInitForTest(cp); err != nil {
-		t.Fatal(err)
-	}
+	mgr, p := setupCardDAVOrgs(t, root)
+	defer mgr.Shutdown()
 
-	s := store.New(root)
-	p := NewProvisioner(cp.App, root, s, func(string) {})
-	files := map[string][]byte{
-		"manifest.ts":                          []byte(contactsCardDAVManifest),
-		"pb-migrations/1700000000_contacts.js": []byte(contactsSchemaMigration),
-	}
-	if err := p.PublishPackage("contacts", "1.0.0", files, "official"); err != nil {
-		t.Fatalf("PublishPackage: %v", err)
-	}
 	if _, err := p.CreateOrg("acme", "Acme", map[string]string{"contacts": "1.0.0"}); err != nil {
 		t.Fatalf("CreateOrg: %v", err)
 	}
 
-	mgr := orgmanager.New(orgmanager.Config{
-		Root: root, Store: s, Programs: progcache.New(),
-		LookupOrg: OrgLookup(cp.App), HooksPool: 2, CardDAVSources: CardDAVSources,
-	})
-	defer mgr.Shutdown()
-
-	inst, err := mgr.Get("acme")
+	inst, err := mgr.Get(context.Background(), "acme")
 	if err != nil {
 		t.Fatalf("Get: %v", err)
 	}

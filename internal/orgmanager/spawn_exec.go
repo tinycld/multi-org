@@ -56,6 +56,9 @@ func buildCmd(ctx context.Context, req SpawnRequest, log *slog.Logger) *exec.Cmd
 	if req.WebDAVConfig != "" {
 		args = append(args, "--webdav-config", req.WebDAVConfig)
 	}
+	if req.QuotaConfig != "" {
+		args = append(args, "--quota-config", req.QuotaConfig)
+	}
 	if req.ConfinePackages {
 		args = append(args, "--confine-packages", req.PackagesDir)
 	}

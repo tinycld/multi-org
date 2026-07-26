@@ -284,9 +284,13 @@ func (p *Provisioner) RegisterRoutes() {
 // bootstrapTenantOnce opens a fresh tenant app just long enough to run its
 // migrations at provision time. jsvm is registered so the materialized JS
 // migrations in pb_migrations are picked up (without it only the Go core
-// migrations run and the tenant boots with no application collections). This is
-// a transient one-shot app, so ProgramSource is left nil — cross-org program
-// sharing is only relevant on the long-lived runtime load path (orgmanager).
+// migrations run and the tenant boots with no application collections).
+//
+// NOTE: this runs untrusted tenant migration JS INSIDE the control-plane
+// process. It is sandboxed (jsvm Sandboxed mode) but not OS-isolated, unlike
+// the runtime path, where every org runs in its own confined process. Moving
+// provision-time migrations into a one-shot isolated subprocess of serve-org is
+// known outstanding work — see the README's security section.
 func bootstrapTenantOnce(orgDir string) error {
 	pb := pocketbase.NewWithConfig(pocketbase.Config{
 		DefaultDataDir:  filepath.Join(orgDir, "pb_data"),

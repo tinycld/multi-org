@@ -193,12 +193,20 @@ so they cannot cross a process boundary — a tenant gets nil hooks, and a nil
 hook means unrestricted. Authorization originally rode there, which silently
 made a tenant-served tree readable by any member of the org.
 
-The fix generalizes: **never put an access decision in a lifted hook.** Ask the
-rule engine instead (`app.CanAccessRecord` against the collection's own
-List/View/Update/Delete rules). A rule is a string, so it travels in the schema
-and a tenant enforces it identically; it is also the same definition the REST
-API and the web UI use, so the two cannot drift. Hooks are for work that is not
-an access decision — drive's remaining two are quota and the version snapshot.
+The fix generalizes: **never put an enforcement boundary in a lifted hook.** A
+Go closure cannot cross a process boundary, so anything a tenant must enforce
+has to be expressible as data or as something core owns.
+
+Both of drive's boundaries moved out as a result:
+- **Authorization** → the collection's own PB rules, via `app.CanAccessRecord`.
+  A rule is a string, travels in the schema, and is the same definition the REST
+  API and web UI use, so the two cannot drift.
+- **Quota** → `core/quota`, bound as a record hook. Every write goes through
+  `app.Save`, so REST, WebDAV and IMAP are covered by construction rather than
+  each protocol remembering to check.
+
+What is left in `Hooks` is the version snapshot — not a boundary, so losing it
+in a tenant costs history rather than safety.
 
 Measure before deciding — `grep -o "<pkg>_[a-z_]*"` per file cleanly separated
 mail's 721 generic lines from its schema-bound ones.
@@ -354,9 +362,17 @@ matches:
   UpdateRule for PUT-over/MOVE, DeleteRule for DELETE) instead of taking Go
   permission callbacks. A rule is a string and travels in the schema, so a
   tenant enforces exactly what the single-org app does, from the one definition
-  in the migration. **Remaining gap, much smaller:** `CheckQuota` and
-  `BeforeOverwrite` are still Go hooks, so a tenant-served write skips quota
-  accounting and does not archive the previous version.
+  in the migration.
+- ~~A tenant-served write skips quota accounting.~~ **CLOSED.** `core/quota`
+  enforces both ceilings as record hooks, so every write path is covered
+  including inside a tenant. The org ceiling comes from `orgs.storage_limit_bytes`
+  on the control plane, materialized to `<orgDir>/.runtime/quota.json` — NOT from
+  the tenant's own `settings`, where its superusers could raise the plan they were
+  sold. Sources ride the same file from each package's `quota` manifest block, so
+  the total spans drive and mail.
+  **Remaining gap, small:** `BeforeOverwrite` is still a Go hook, so a
+  tenant-served overwrite does not archive the previous version. That loses
+  history; it does not let anyone exceed a limit.
 - **Tenant VMs still get no `$` bindings and no hook points.** `serve-org` sets
   neither `OnInit` nor `OnLoaderInit`, because reaching them means importing
   `coreserver`, which drags Sentry, webpush, postmark and go-message into the

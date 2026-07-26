@@ -1,16 +1,16 @@
 # multitenant
 
-A single-process, multi-tenant router for [PocketBase](https://pocketbase.io). One
-process hosts many organizations: a fronting HTTPS server dispatches by subdomain
-to either a **control-plane** PocketBase app (the org/package/deployment registry
-+ provisioning API) or a lazily-loaded **tenant** PocketBase app. Each tenant is a
-stock PocketBase whose `pb_hooks`/`pb_public` are materialized as symlink farms
-from a content-versioned package store, and whose compiled JS hook programs are
-**shared across orgs** via a process-wide cache.
+A multi-tenant router for [PocketBase](https://pocketbase.io). A fronting HTTPS
+server dispatches by subdomain to either a **control-plane** PocketBase app (the
+org/package/deployment registry + provisioning API, in-process) or a lazily
+spawned **tenant process**. Each tenant is a stock PocketBase running in its own
+OS process — confined to its own uid, mount and PID namespaces, and cgroup on
+Linux — whose `pb_hooks`/`pb_public` are materialized as symlink farms from a
+version-addressed package store. The router reaches each tenant over a per-org
+unix domain socket and never holds a tenant app object.
 
-> **Private module.** This imports a local PocketBase fork that adds a
-> `jsvm.ProgramSource` seam (see [Fork dependency](#fork-dependency)). It is not
-> published.
+> **Private module.** This imports a local PocketBase fork (see
+> [Fork dependency](#fork-dependency)). It is not published.
 
 ## Architecture
 
@@ -21,24 +21,23 @@ from a content-versioned package store, and whose compiled JS hook programs are
         ┌─────────────────▼──────────────────┐
         │ server.Serve → frontrouter          │   subdomain dispatch
         │   admin.*  → control-plane mux       │
-        │   <slug>.* → orgmanager.Get(slug)    │
+        │   <slug>.* → orgmanager.Get(ctx,slug)│
         └───────┬───────────────────┬─────────┘
                 │                   │
        ┌────────▼──────┐   ┌────────▼─────────┐
-       │ control-plane │   │ OrgManager       │  lazy load + singleflight
-       │ PocketBase app│   │  map[slug]*Inst  │  + idle eviction
+       │ control-plane │   │ OrgManager       │  lazy spawn + singleflight
+       │ PocketBase app│   │  map[slug]*Inst  │  + supervise + idle eviction
        │ orgs/packages/│   └────────┬─────────┘
-       │ deployments   │            │ per org:
-       │ + provisioning│   ┌────────▼─────────┐
-       └───────────────┘   │ stock PB app     │
-                           │ + jsvm (hooks)   │
-                           │ + BuildServeMux  │
-        shared, process-wide:                  │
-          • store  (content-versioned packages)│
-          • progcache (SharedProgramCache →    │
-              fork jsvm.ProgramSource)         │
-          • materialize (symlink pb_hooks/     │
-              pb_public from store+lockfile)   │
+       │ deployments   │            │ ReverseProxy over
+       │ + provisioning│            │ <root>/run/<slug>.sock
+       └───────────────┘   ┌────────▼─────────┐
+                           │ serve-org process│  ← OS boundary
+        host-side, shared: │  own uid + netns │
+          • store          │  stock PB + jsvm │
+          • materialize    │  (Sandboxed)     │
+            (symlinks      │  + CardDAV       │
+             pb_hooks/     └──────────────────┘
+             pb_public)      one process per org
 ```
 
 ### Packages
@@ -48,98 +47,126 @@ from a content-versioned package store, and whose compiled JS hook programs are
 | `internal/store` | Immutable, version-addressed package store (`<root>/packages/<name>/<version>/`). |
 | `internal/lockfile` | Per-org `{name: version}` lockfile; parse + resolve against the store. |
 | `internal/materialize` | Symlink-farm an org's `pb_hooks` (from `server/`) and `pb_public` (from `client/dist/`) from resolved packages. |
-| `internal/progcache` | `SharedProgramCache` implementing the fork's `jsvm.ProgramSource` — identical hook source across orgs shares one compiled `*goja.Program`. |
 | `internal/controlplane` | Control-plane PocketBase app: `orgs`/`packages`/`deployments` schema, `Provisioner` (create/deploy/suspend/resume/archive/publish), HTTP routes, and the DB-backed `OrgLookup`. |
-| `internal/orgmanager` | Lazy per-org app loader: materialize → bootstrap stock PB + jsvm (with shared cache) → `BuildServeMux`. Singleflight-collapsed loads, `Evict`, idle-eviction sweeper. |
+| `internal/orgmanager` | Lazy per-org process supervisor: materialize → spawn `serve-org` → readiness handshake → reverse proxy. Singleflight-collapsed spawns, crash supervision with backoff, drain-then-kill `Evict`, idle sweeper. |
+| `internal/orgerr` | The three sentinels (`ErrOrgNotFound` / `ErrOrgNotActive` / `ErrOrgUnavailable`) the front router classifies into 404 / 503. |
+| `internal/davconfig` | JSON wire format for the CardDAV source list the host hands each tenant. |
 | `internal/frontrouter` | Plain `http.Handler`: `Host` → subdomain → control-plane / org / apex-redirect. |
 | `internal/server` | Single `http.Server` + wildcard autocert TLS + graceful shutdown. |
-| `cmd/serve-multi` | Wires it all together. |
+| `cmd/serve-multi` | The router. Wires it all together. |
+| `cmd/serve-org` | The tenant. One org, stock PocketBase + sandboxed jsvm + CardDAV, on a unix socket. |
 
 ## Running
 
+Both binaries are required — the router spawns the tenant one:
+
 ```sh
-go build ./cmd/serve-multi
-MT_ROOT=./mt_data MT_BASE_DOMAIN=tinycld.org MT_ADDR=:443 ./serve-multi
+go build -o bin/ ./cmd/serve-multi ./cmd/serve-org
+MT_ROOT=./mt_data MT_BASE_DOMAIN=tinycld.org MT_ADDR=:443 ./bin/serve-multi
 ```
 
-Env: `MT_ROOT` (data root, default `./mt_data`), `MT_BASE_DOMAIN` (default
-`tinycld.org`), `MT_ADDR` (default `:443`).
+`serve-org` is resolved next to the `serve-multi` executable by default, so a
+deployed pair stays together without configuration.
 
-## Tenant JS security boundary
+| Env | Default | Purpose |
+|---|---|---|
+| `MT_ROOT` | `./mt_data` | Data root: package store, control plane, per-org dirs. |
+| `MT_BASE_DOMAIN` | `tinycld.org` | Subdomain dispatch base. |
+| `MT_ADDR` | `:443` | Listen address. |
+| `MT_TLS_MODE` | `proxy` | `proxy` / `file` / `autocert`. |
+| `MT_TLS_CERT`, `MT_TLS_KEY` | — | Required for `file`. |
+| `MT_SUPERUSER_EMAIL`, `MT_SUPERUSER_PASSWORD` | — | Upserts the control-plane superuser on boot. Without it every provisioning route 401s. |
+| `MT_TENANT_BINARY` | sibling `serve-org` | Override the tenant executable path. |
+| `MT_TENANT_UID_BASE`, `MT_TENANT_UID_RANGE` | — | **Linux.** The uid window tenants are mapped into. Unset ⇒ tenants run as the host user and are **not** confined. |
+| `MT_CGROUP_ROOT` | — | **Linux.** cgroup v2 dir to place tenants under. |
 
-Tenant hooks and migrations run under the fork's jsvm **Sandboxed** mode
-(`jsvm.Config{Sandboxed: true}`): a deny-by-default allowlist that withholds
-the host-reaching bindings — `$os` (exec / env / raw filesystem), `$http`
-(outbound HTTP), `$filesystem`, and `$filepath` — from both the hook and
-migration runtimes; neuters `process.env` / `process.argv` so the host
-environment (e.g. `MT_SUPERUSER_PASSWORD`) is unreachable; withholds
-`$apis.static` (a raw directory-serving primitive whose root is caller-chosen);
-denies file-based `require()` (only native modules like `process`/`console`/
-`buffer` load); and restricts `$template` to `loadString` (no `loadFiles`/
-`loadFS`). Both the runtime load path (`orgmanager.load`) and the provision
-path (`controlplane.bootstrapTenantOnce`) enable it, and both use
-`jsvm.Register` (returning the error) rather than `MustRegister`, so a hook or
-migration that throws at load fails only that one org's load/provisioning
-instead of panicking the shared process.
+None of these reach a tenant process: children are spawned with an explicitly
+constructed environment (see the security section).
 
-> **⚠️ This is blast-radius reduction, NOT attacker containment.** It is the
-> WordPress `disable_functions` / `open_basedir` tier: it raises the bar but
-> does not hold against a determined hostile author in a shared process.
->
-> **Demonstrated in-process bypass (open):** `$app.db()` hands tenant JS a raw
-> SQL surface over the shared connection. A sandboxed hook can run
-> `ATTACH DATABASE '<other-org>/data.db'` inside a transaction and read another
-> org's secrets (and create arbitrary `.db` files) — arbitrary host-file
-> read/write, reaching the same headline threat the binding allowlist set out
-> to close. Our SQLite driver (modernc) exposes **no authorizer API**, so this
-> class cannot be cleanly contained in-process; `$app` similarly exposes
-> `newFilesystem`, `createBackup`/`restoreBackup`, etc. The recurring pattern —
-> each audit finding another capability re-entering through a *kept* surface —
-> is the signal that **allowlisting the full stock `$app`/DB API against a
-> hostile author in one shared process is the wrong altitude.**
->
-> Also unaddressed in-process: sobek engine escapes, and CPU / memory /
-> wall-clock DoS (no resource limits).
+## Tenant security boundary
 
-**The actual security boundary is OS-level per-process isolation, and it is now
-the required next deliverable** (not an optional hardening). Each org's app must
-run in its own process confined to its own directory (per-uid + a filesystem
-namespace/chroot so `ATTACH '<abs path>'` physically fails at the OS layer),
-with cgroup CPU/memory limits and a scrubbed environment. That layer confines
-filesystem, DB, resource, and *unknown-future* vectors uniformly — which
-in-process allowlisting provably cannot. The `GetOrg → http.Handler` seam in
-`frontrouter` is where a reverse-proxy-to-subprocess drops in without reworking
-dispatch. **Until it lands, do not treat tenant authors as untrusted in
-production.**
+**The boundary is the OS process.** Each org runs in its own `serve-org`
+process, and on Linux that process is confined: its own uid (so another org's
+`pb_data` is unreadable by the kernel's own rules), its own mount and PID
+namespaces, and its own cgroup. The package store is bind-mounted read-only at
+its real absolute path, because `materialize` fills `pb_hooks`/`pb_migrations`
+with absolute symlinks into it — a naive `chroot` to the org directory would
+break every one of them.
+
+This closes the class of exploit that in-process allowlisting provably could
+not. The motivating case: `$app.db()` hands tenant JS a raw SQL surface, so a
+sandboxed hook could run `ATTACH DATABASE '<other-org>/data.db'` and read
+another org's secrets. Our SQLite driver (modernc) exposes no authorizer API, so
+that could not be denied at the driver layer — but a process that cannot open
+the file at all does not need to. The same boundary covers filesystem, resource,
+and *unknown-future* vectors uniformly, which is the point: four successive
+audits each found another capability re-entering through a *kept* binding, and
+that pattern is what per-process isolation ends.
+
+`TestConfinement_*` in `internal/orgmanager` asserts these properties directly
+(cross-org `ATTACH` fails, tenants run as distinct non-root uids, host secrets
+are absent from the child environment). **They require Linux and root**, so they
+do not run on a macOS dev box — see the caveat below.
+
+### Retained in-process hardening (defence in depth)
+
+The fork's jsvm **Sandboxed** mode stays on inside every tenant process
+(`jsvm.Config{Sandboxed: true}`): it withholds `$os`, `$http`, `$filesystem` and
+`$filepath` from both the hook and migration runtimes, neuters `process.env` /
+`process.argv`, withholds `$apis.static`, denies file-based `require()`, and
+restricts `$template` to `loadString`. It is cheap and it narrows the blast
+radius, but it is no longer what the security model rests on.
+
+Tenants are also spawned with an environment built from an explicit allowlist
+rather than a filter over `os.Environ()`, so host secrets (`MT_SUPERUSER_PASSWORD`,
+`MT_TLS_KEY`, and anything added later) are excluded by construction.
+
+`jsvm.Register` is used rather than `MustRegister`, so a hook or migration that
+throws at load fails that one org's spawn — reported to the router over the
+readiness pipe — instead of panicking anything shared.
+
+> **⚠️ macOS is not a security boundary.** Namespaces, cgroups and uid
+> separation are Linux-only. The darwin spawner runs a plain subprocess and logs
+> a warning saying so. It exists so the router runs on a development machine;
+> **do not host untrusted tenants on it.**
+
+> **⚠️ Provisioning is still in-process.** `POST /api/orgs` runs a tenant's
+> migration JS via `bootstrapTenantOnce` inside the control-plane process
+> (sandboxed, but not OS-isolated). Moving that to a one-shot isolated
+> subprocess is deliberately out of scope for this change and remains open.
+
+### Process hygiene
+
+`serve-multi` puts all of its work in `run() error` and keeps `log.Fatal` in
+`main` alone. That is load-bearing, not style: `log.Fatal` and `os.Exit` skip
+deferred functions, so calling either after a tenant could exist orphans every
+child process — they outlive the router and keep holding its port and sockets.
+Any new failure path must `return err`, never exit in place.
+
+### Resource limits
+
+`serve-multi` creates a per-tenant cgroup when `MT_CGROUP_ROOT` is set, but does
+not yet write limits into it. CPU/memory/pids caps are an operator concern for
+now; a runaway tenant can still starve the host.
+
 
 ## Operator prerequisites & known gaps
 
-This module composes correctly at the transport, caching, and provisioning layers
-(the end-to-end test boots two isolated orgs that serve their own JS hook routes
-and share the program cache). The following must be handled before it hosts a real
-tenant. They are deliberately out of the initial implementation scope.
+This module composes correctly at the transport, isolation, and provisioning
+layers (the end-to-end tests spawn two real tenant processes that serve their own
+JS hook routes and their own CardDAV over separate sockets). The following must
+still be handled before it hosts a real tenant.
 
-### 1. Control-plane superuser (required to use the provisioning API)
+### 1. Linux CI for the confinement tests
 
-Every provisioning route (`POST /api/orgs`, `/deploy`, etc.) is guarded by
-`apis.RequireSuperuserAuth()`. A fresh `mt_data` has **no superuser**, so nothing
-can call them. Before provisioning any org, create one against the control-plane
-data dir, e.g. with a PocketBase superuser command against
-`<MT_ROOT>/pb_control/pb_data`, or add an env-driven bootstrap step to
-`cmd/serve-multi` (e.g. create a superuser from `MT_ADMIN_EMAIL`/`MT_ADMIN_PASSWORD`
-on first boot). **Not yet wired.**
+`TestConfinement_*` assert the security properties this architecture exists to
+provide, and they require Linux and root. There is no CI for this repo, so on a
+macOS dev box they silently skip — meaning **the boundary itself is currently
+unverified by any automated run.** Everything else (spawn, proxy, lifecycle,
+crash handling, CardDAV, the sandbox) is covered on darwin. Standing up a Linux
+runner is the highest-value gap to close.
 
-### 2. Tenant application schema (where tenant collections come from)
-
-`materialize` wires a package's `server/*.pb.js` → `pb_hooks` and
-`client/dist/**` → `pb_public`. It does **not** populate a tenant's
-`pb_migrations`, and `CreateOrg` creates that dir empty. So a freshly provisioned
-tenant boots as a stock PocketBase with hooks and static assets but **no
-application collections**. Deciding how tenant schema is provisioned — a third
-materialize link step from a package `pb_migrations/`, or JS migrations shipped
-some other way — is an open design decision. **Not yet implemented.**
-
-### 3. Wildcard TLS
+### 2. Wildcard TLS
 
 `server.Serve` uses autocert with a permissive `HostPolicy`. A wildcard
 `*.MT_BASE_DOMAIN` certificate **cannot** be issued via HTTP-01; operators must
@@ -156,31 +183,43 @@ supply a DNS-01 solver or a pre-issued wildcard cert. The autocert cache lives a
   router routes those to the control plane / apex redirect — so an org created
   with such a slug would be unreachable. Add the router's reserved labels to the
   slug-rejection set.
-- **Integration test:** the `CreateOrg → OrgLookup → orgmanager.load` chain (a real
-  control-plane record driving a real org boot) is verified by hand and covered
-  transitively, but has no single dedicated test; the e2e test uses a stub lookup.
 - **peerVersions solver:** `lockfile.Resolve` only checks that referenced versions
   exist in the store. The full `peerVersions` compatibility solver (spec §7) is a
   follow-on the `CreateOrg`/`Deploy` path can call before materializing.
+- **Cold start:** a tenant boot is PocketBase bootstrap + migrations + JS compile,
+  i.e. hundreds of ms to seconds, paid by the first request after the 30-minute
+  idle sweep evicts an org. There is no warm pool. Cross-org compiled-program
+  sharing is also gone by construction (each process compiles its own) — that is
+  the accepted cost of isolation.
+- **Per-org memory:** N resident orgs are now N PocketBase processes rather than N
+  apps in one heap. This, not CPU, is what bounds orgs-per-host.
 
 ## Fork dependency
 
 `go.mod` has:
 
 ```
-replace github.com/pocketbase/pocketbase => /Users/nas/code/vendor/pocketbase
+replace github.com/pocketbase/pocketbase => ../pocketbase
 ```
 
-The router builds against a local PocketBase fork checked out on a branch that
-adds two seams:
+The fork (branch `feat/multitenant-fork`) adds two seams this module still uses:
 
-- **`jsvm.ProgramSource`** — the optional hook cache the `SharedProgramCache`
-  implements (the cross-org memory-sharing win; proven by
-  `TestE2E_SecondOrgAddsNoNewPrograms`).
 - **`apis.BuildServeMux`** — builds a per-app `http.Handler` without starting a
-  server, so the router can mount one mux per org.
+  server. Used for the **control plane**, which shares the router's process with
+  the front server. Tenants no longer need it: each serves its own listener in
+  its own process via stock `apis.Serve`.
+- **`jsvm.Config.Sandboxed`** — the deny-by-default binding allowlist, retained
+  as defence in depth inside each tenant process.
 
-`ProgramSource` is being upstreamed as its own PR; `BuildServeMux` is a planned
-second PR. When both land in an upstream PocketBase release, drop the `replace`
-and require that release — the router's use of PocketBase is otherwise a plain
-library import.
+**`jsvm.ProgramSource` no longer has a consumer here.** It existed to share
+compiled hook programs across orgs in one process; per-process isolation ends
+that by construction (a `*sobek.Program` is a Go heap object with interior
+pointers, and sobek has no bytecode serialization, so there is nothing to share
+across an address-space boundary). It is still worth upstreaming on its own
+merits for single-process embedders — just note this repo no longer exercises it.
+
+Tenants also rely on one piece of **upstream** behaviour: `apis.Serve` uses
+`core.ServeEvent.Listener` verbatim when set, which is how `serve-org` serves on
+a unix socket without any fork change.
+
+When `BuildServeMux` lands upstream, drop the `replace` and require that release.

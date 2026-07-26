@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 
 	"tinycld.org/core/carddav"
+	"tinycld.org/core/webdav"
 	"tinycld.org/multi-org/internal/lockfile"
 )
 
@@ -30,6 +31,20 @@ type manifestCapabilities struct {
 			RevField string            `json:"revField"`
 		} `json:"vcard"`
 	} `json:"carddav"`
+	WebDAV *struct {
+		Prefix     string `json:"prefix"`
+		Collection string `json:"collection"`
+		Fields     struct {
+			Name     string `json:"name"`
+			Parent   string `json:"parent"`
+			IsFolder string `json:"isFolder"`
+			Size     string `json:"size"`
+			MimeType string `json:"mimeType"`
+			File     string `json:"file"`
+			Owner    string `json:"owner"`
+			Updated  string `json:"updated"`
+		} `json:"fields"`
+	} `json:"webdav"`
 }
 
 // CardDAVSources reads each resolved package's materialized manifest.json and
@@ -68,6 +83,49 @@ func CardDAVSources(resolved []lockfile.ResolvedPackage) ([]carddav.Source, erro
 				},
 				Simple:   cd.VCard.Simple,
 				RevField: cd.VCard.RevField,
+			},
+		})
+	}
+	return sources, nil
+}
+
+// WebDAVSources reads each resolved package's materialized manifest.json and
+// returns the webdav.Source for every package that declares a `webdav` block.
+// This is the orgmanager.Config.WebDAVSources hook.
+//
+// The Sources returned carry no Hooks: authorization, quota and versioning are
+// Go callbacks that cannot cross the process boundary, so a tenant serves the
+// tree with core's default access model (authenticated, unrestricted per item).
+// A package needing per-item authorization inside a tenant must express it in
+// the collection's PocketBase rules. See HANDOFF.
+func WebDAVSources(resolved []lockfile.ResolvedPackage) ([]webdav.Source, error) {
+	var sources []webdav.Source
+	for _, pkg := range resolved {
+		mc, ok, err := readManifestCapabilities(pkg.Dir)
+		if err != nil {
+			return nil, err
+		}
+		if !ok || mc.WebDAV == nil {
+			continue
+		}
+		wd := mc.WebDAV
+		slug := mc.Slug
+		if slug == "" {
+			slug = pkg.Name
+		}
+		sources = append(sources, webdav.Source{
+			Slug:       slug,
+			Prefix:     wd.Prefix,
+			Collection: wd.Collection,
+			Fields: webdav.FieldMap{
+				Name:     wd.Fields.Name,
+				Parent:   wd.Fields.Parent,
+				IsFolder: wd.Fields.IsFolder,
+				Size:     wd.Fields.Size,
+				MimeType: wd.Fields.MimeType,
+				File:     wd.Fields.File,
+				Owner:    wd.Fields.Owner,
+				Updated:  wd.Fields.Updated,
 			},
 		})
 	}

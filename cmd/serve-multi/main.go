@@ -4,7 +4,9 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"log"
+	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
@@ -17,12 +19,20 @@ import (
 
 	"tinycld.org/multi-org/internal/controlplane"
 	"tinycld.org/multi-org/internal/orgmanager"
-	"tinycld.org/multi-org/internal/progcache"
 	"tinycld.org/multi-org/internal/server"
 	"tinycld.org/multi-org/internal/store"
 )
 
 func main() {
+	// run() owns every deferred cleanup, including reaping tenant processes.
+	// main must therefore not call log.Fatal/os.Exit for anything that happens
+	// after a tenant could exist — those skip defers and orphan the children.
+	if err := run(); err != nil {
+		log.Fatal(err)
+	}
+}
+
+func run() error {
 	root := getenv("MT_ROOT", "./mt_data")
 	baseDomain := getenv("MT_BASE_DOMAIN", "tinycld.org")
 	addr := getenv("MT_ADDR", ":443")
@@ -30,32 +40,37 @@ func main() {
 	tlsCert := os.Getenv("MT_TLS_CERT")
 	tlsKey := os.Getenv("MT_TLS_KEY")
 
+	// The tenant binary defaults to a sibling of this one, so a deployed pair
+	// stays together without configuration.
+	tenantBinary := getenv("MT_TENANT_BINARY", defaultTenantBinary())
+
 	cp, err := controlplane.New(filepath.Join(root, "pb_control", "pb_data"))
 	if err != nil {
-		log.Fatalf("control plane: %v", err)
+		return fmt.Errorf("control plane: %w", err)
 	}
 	// Init bootstraps + runs system migrations + applies the control-plane schema
 	// (app-scoped, so it never leaks into tenant DBs).
 	if err := cp.Init(); err != nil {
-		log.Fatalf("init control plane: %v", err)
+		return fmt.Errorf("init control plane: %w", err)
 	}
 	defer cp.App.ResetBootstrapState()
 
 	if err := ensureSuperuser(cp.App); err != nil {
-		log.Fatalf("bootstrap superuser: %v", err)
+		return fmt.Errorf("bootstrap superuser: %w", err)
 	}
 
 	pkgStore := store.New(root)
-	programs := progcache.New()
 
 	mgr := orgmanager.New(orgmanager.Config{
 		Root:           root,
 		Store:          pkgStore,
-		Programs:       programs,
 		LookupOrg:      controlplane.OrgLookup(cp.App),
 		HooksPool:      15,
 		MaxIdle:        30 * time.Minute,
+		TenantBinary:   tenantBinary,
+		Logger:         slog.Default(),
 		CardDAVSources: controlplane.CardDAVSources,
+		WebDAVSources:  controlplane.WebDAVSources,
 	})
 	defer mgr.Shutdown()
 
@@ -64,7 +79,7 @@ func main() {
 
 	controlMux, err := apis.BuildServeMux(cp.App, apis.ServeConfig{})
 	if err != nil {
-		log.Fatalf("control-plane mux: %v", err)
+		return fmt.Errorf("control-plane mux: %w", err)
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
@@ -74,8 +89,8 @@ func main() {
 	err = server.Serve(ctx, addr, server.Params{
 		BaseDomain:      baseDomain,
 		ControlPlaneMux: controlMux,
-		GetOrg: func(slug string) (http.Handler, error) {
-			inst, err := mgr.Get(slug)
+		GetOrg: func(ctx context.Context, slug string) (http.Handler, error) {
+			inst, err := mgr.Get(ctx, slug)
 			if err != nil {
 				return nil, err
 			}
@@ -86,8 +101,18 @@ func main() {
 		KeyFile:  tlsKey,
 	})
 	if err != nil {
-		log.Fatalf("serve: %v", err)
+		return fmt.Errorf("serve: %w", err)
 	}
+	return nil
+}
+
+// defaultTenantBinary resolves serve-org next to this executable.
+func defaultTenantBinary() string {
+	exe, err := os.Executable()
+	if err != nil {
+		return "serve-org"
+	}
+	return filepath.Join(filepath.Dir(exe), "serve-org")
 }
 
 func getenv(k, def string) string {

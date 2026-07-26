@@ -4,8 +4,10 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"reflect"
 	"testing"
 
+	"tinycld.org/multi-org/internal/davconfig"
 	"tinycld.org/multi-org/internal/lockfile"
 )
 
@@ -36,9 +38,9 @@ export default manifest
 
 func TestEmitManifestJSON_ParsesTSDefaultExport(t *testing.T) {
 	files := map[string][]byte{
-		"manifest.ts":                  []byte(contactsManifestTS),
-		"pb-hooks/contacts.pb.ts":      []byte(`onRecordCreate(() => {}, 'contacts')`),
-		"pb-migrations/x_create.js":    []byte(`migrate(() => {})`),
+		"manifest.ts":               []byte(contactsManifestTS),
+		"pb-hooks/contacts.pb.ts":   []byte(`onRecordCreate(() => {}, 'contacts')`),
+		"pb-migrations/x_create.js": []byte(`migrate(() => {})`),
 	}
 	out, err := emitManifestJSON(files)
 	if err != nil {
@@ -107,6 +109,111 @@ func TestCardDAVSources_ReadsManifestJSON(t *testing.T) {
 	}
 	if s.VCard.Name.Given != "first_name" || s.VCard.Simple["EMAIL"] != "email" {
 		t.Errorf("vcard map wrong: %+v", s.VCard)
+	}
+}
+
+// driveManifestTS mirrors the `webdav` block drive ships.
+const driveManifestTS = `
+const manifest = {
+    name: 'Drive',
+    slug: 'drive',
+    version: '0.2.2',
+    description: 'Cloud file storage, with WebDAV',
+    hooks: { directory: 'pb-hooks' },
+    webdav: {
+        prefix: '/drive',
+        collection: 'drive_items',
+        fields: {
+            name: 'name',
+            parent: 'parent',
+            isFolder: 'is_folder',
+            size: 'size',
+            mimeType: 'mime_type',
+            file: 'file',
+            owner: 'created_by',
+            updated: 'updated',
+        },
+    },
+}
+export default manifest
+`
+
+func TestWebDAVSources_ReadsManifestJSON(t *testing.T) {
+	files, err := emitManifestJSON(map[string][]byte{"manifest.ts": []byte(driveManifestTS)})
+	if err != nil {
+		t.Fatalf("emit: %v", err)
+	}
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, manifestJSONFile), files[manifestJSONFile], 0o644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	sources, err := WebDAVSources([]lockfile.ResolvedPackage{{Name: "drive", Version: "0.2.2", Dir: dir}})
+	if err != nil {
+		t.Fatalf("WebDAVSources: %v", err)
+	}
+	if len(sources) != 1 {
+		t.Fatalf("got %d sources, want 1", len(sources))
+	}
+	s := sources[0]
+	if s.Slug != "drive" || s.Prefix != "/drive" || s.Collection != "drive_items" {
+		t.Errorf("source basics wrong: %+v", s)
+	}
+	if s.Fields.Name != "name" || s.Fields.Parent != "parent" || s.Fields.IsFolder != "is_folder" {
+		t.Errorf("tree fields wrong: %+v", s.Fields)
+	}
+	if s.Fields.Owner != "created_by" || s.Fields.File != "file" || s.Fields.Size != "size" {
+		t.Errorf("blob/owner fields wrong: %+v", s.Fields)
+	}
+	// Hooks cannot cross the process boundary; a tenant-served tree gets core's
+	// default access model. Asserting this keeps the limitation visible.
+	if s.Hooks.CanRead != nil || s.Hooks.CheckQuota != nil {
+		t.Error("Sources read from a manifest must carry no Go hooks")
+	}
+}
+
+func TestWebDAVSources_SkipsPackagesWithoutWebDAV(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, manifestJSONFile), []byte(`{"slug":"contacts"}`), 0o644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	empty := t.TempDir()
+
+	sources, err := WebDAVSources([]lockfile.ResolvedPackage{
+		{Name: "contacts", Dir: dir},
+		{Name: "nothing", Dir: empty},
+	})
+	if err != nil {
+		t.Fatalf("WebDAVSources: %v", err)
+	}
+	if len(sources) != 0 {
+		t.Errorf("expected no sources, got %d", len(sources))
+	}
+}
+
+// A Source that survives the wire round-trip must still build a FileSystem —
+// i.e. the three mirrored struct definitions actually agree.
+func TestWebDAVSources_RoundTripThroughWire(t *testing.T) {
+	files, err := emitManifestJSON(map[string][]byte{"manifest.ts": []byte(driveManifestTS)})
+	if err != nil {
+		t.Fatalf("emit: %v", err)
+	}
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, manifestJSONFile), files[manifestJSONFile], 0o644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	sources, err := WebDAVSources([]lockfile.ResolvedPackage{{Name: "drive", Dir: dir}})
+	if err != nil {
+		t.Fatalf("WebDAVSources: %v", err)
+	}
+
+	decoded := davconfig.DecodeWebDAV(davconfig.EncodeWebDAV(sources))
+	if len(decoded) != 1 {
+		t.Fatalf("round trip produced %d sources, want 1", len(decoded))
+	}
+	if !reflect.DeepEqual(sources[0], decoded[0]) {
+		t.Fatalf("round trip changed the Source:\n before %+v\n after  %+v", sources[0], decoded[0])
 	}
 }
 

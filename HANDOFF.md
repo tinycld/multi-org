@@ -523,6 +523,14 @@ listing + direct GET (404) — while an enabled owner gets 200 on the same file.
 Admin re-enable restores all of it.
 
 *Still open here:*
+- **Disable rotates the token key, so re-enabling forces a fresh sign-in.**
+  `handleAccountDisable` calls `RefreshTokenKey()` — without it a suspension
+  would be advisory for hours, since the caller's existing JWT (and any other
+  signed-in device) keeps working until it expires. The cost is that the
+  session cannot be resumed after an admin re-enables: the user must log in
+  again. That is the right trade for a suspension, but it is a deliberate
+  choice, not an accident, and it is why the disable copy says "you'll be
+  signed out everywhere".
 - **Mail delivery to a disabled user's mailbox** is unaddressed — bounce,
   silently accept, or hold? The account can't sign in, but SMTP doesn't consult
   `disabled`.

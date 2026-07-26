@@ -31,6 +31,7 @@ import (
 	"github.com/pocketbase/pocketbase/core"
 	"github.com/pocketbase/pocketbase/plugins/jsvm"
 
+	"tinycld.org/core/caldav"
 	"tinycld.org/core/carddav"
 	"tinycld.org/core/quota"
 	"tinycld.org/core/webdav"
@@ -45,6 +46,7 @@ func main() {
 		slug         = flag.String("slug", "", "org slug (identification and logging only)")
 		hooksPool    = flag.Int("hooks-pool", 15, "jsvm hook runtime pool size")
 		webdavConfig = flag.String("webdav-config", "", "path to the org's materialized webdav.json")
+		caldavConfig = flag.String("caldav-config", "", "path to the org's materialized caldav.json")
 		quotaConfig  = flag.String("quota-config", "", "path to the org's materialized quota.json")
 		davConfig    = flag.String("carddav-config", "", "path to the CardDAV source JSON")
 		drain        = flag.Duration("drain", 10*time.Second, "graceful shutdown budget")
@@ -64,13 +66,13 @@ func main() {
 		ready = os.NewFile(uintptr(*readyFD), "ready")
 	}
 
-	if err := run(*orgDir, *socketPath, *slug, *hooksPool, *davConfig, *webdavConfig, *quotaConfig, *confinePkg, *drain, ready); err != nil {
+	if err := run(*orgDir, *socketPath, *slug, *hooksPool, *davConfig, *caldavConfig, *webdavConfig, *quotaConfig, *confinePkg, *drain, ready); err != nil {
 		reportNotReady(ready, err)
 		log.Fatalf("serve-org: %v", err)
 	}
 }
 
-func run(orgDir, socketPath, slug string, hooksPool int, davConfigPath, webdavConfigPath, quotaConfigPath, confinePkg string,
+func run(orgDir, socketPath, slug string, hooksPool int, davConfigPath, caldavConfigPath, webdavConfigPath, quotaConfigPath, confinePkg string,
 	drain time.Duration, ready *os.File) error {
 
 	// Confinement steps that must happen inside our own mount namespace. Go
@@ -90,6 +92,11 @@ func run(orgDir, socketPath, slug string, hooksPool int, davConfigPath, webdavCo
 	davSources, err := loadWebDAVSources(webdavConfigPath)
 	if err != nil {
 		return fmt.Errorf("load webdav config: %w", err)
+	}
+
+	calSources, err := loadCalDAVSources(caldavConfigPath)
+	if err != nil {
+		return fmt.Errorf("load caldav config: %w", err)
 	}
 
 	quotaCfg, err := loadQuotaConfig(quotaConfigPath)
@@ -197,6 +204,26 @@ func run(orgDir, socketPath, slug string, hooksPool int, davConfigPath, webdavCo
 			}
 		}
 
+		if len(calSources) > 0 {
+			// Same as WebDAV above: no HostBindings, so `caldavHook` handlers a
+			// package ships do not run in a tenant. Every access check still
+			// does — core evaluates the collections' own PocketBase rules,
+			// which travel in the schema rather than as Go closures.
+			if h, _ := caldav.HandlerFor(e.App, calSources, caldav.HostBindings{}); h != nil {
+				serve := func(re *core.RequestEvent) error {
+					h.ServeHTTP(re.Response, re.Request)
+					return nil
+				}
+				// Prefix-driven, not hardcoded: a package chooses where its
+				// calendar tree mounts via the manifest's caldav.prefix.
+				for _, src := range calSources {
+					e.Router.Any(src.Prefix, serve)
+					e.Router.Any(src.Prefix+"/{path...}", serve)
+				}
+				e.Router.Any("/.well-known/caldav", serve)
+			}
+		}
+
 		if err := e.Next(); err != nil {
 			return err
 		}
@@ -277,6 +304,24 @@ func loadWebDAVSources(path string) ([]webdav.Source, error) {
 		return nil, err
 	}
 	return davconfig.DecodeWebDAV(wire), nil
+}
+
+func loadCalDAVSources(path string) ([]caldav.Source, error) {
+	if path == "" {
+		return nil, nil
+	}
+	body, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	var wire []davconfig.CalDAVSource
+	if err := json.Unmarshal(body, &wire); err != nil {
+		return nil, err
+	}
+	return davconfig.DecodeCalDAV(wire), nil
 }
 
 func loadCardDAVSources(path string) ([]carddav.Source, error) {

@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 
+	"tinycld.org/core/caldav"
 	"tinycld.org/core/carddav"
 	"tinycld.org/core/quota"
 	"tinycld.org/core/webdav"
@@ -46,6 +47,34 @@ type manifestCapabilities struct {
 			Updated  string `json:"updated"`
 		} `json:"fields"`
 	} `json:"webdav"`
+	CalDAV *struct {
+		Prefix             string `json:"prefix"`
+		CalendarCollection string `json:"calendarCollection"`
+		EventCollection    string `json:"eventCollection"`
+		Calendar           struct {
+			Name        string `json:"name"`
+			Description string `json:"description"`
+		} `json:"calendar"`
+		Event struct {
+			Calendar    string         `json:"calendar"`
+			UID         string         `json:"uid"`
+			Owner       string         `json:"owner"`
+			Title       string         `json:"title"`
+			Description string         `json:"description"`
+			Location    string         `json:"location"`
+			Start       string         `json:"start"`
+			End         string         `json:"end"`
+			AllDay      string         `json:"allDay"`
+			Recurrence  string         `json:"recurrence"`
+			Guests      string         `json:"guests"`
+			Reminder    string         `json:"reminder"`
+			BusyStatus  string         `json:"busyStatus"`
+			Visibility  string         `json:"visibility"`
+			Updated     string         `json:"updated"`
+			Created     string         `json:"created"`
+			Defaults    map[string]any `json:"defaults"`
+		} `json:"event"`
+	} `json:"caldav"`
 	Quota []struct {
 		Collection string `json:"collection"`
 		SizeField  string `json:"sizeField"`
@@ -99,11 +128,12 @@ func CardDAVSources(resolved []lockfile.ResolvedPackage) ([]carddav.Source, erro
 // returns the webdav.Source for every package that declares a `webdav` block.
 // This is the orgmanager.Config.WebDAVSources hook.
 //
-// The Sources returned carry no Hooks: authorization, quota and versioning are
-// Go callbacks that cannot cross the process boundary, so a tenant serves the
-// tree with core's default access model (authenticated, unrestricted per item).
-// A package needing per-item authorization inside a tenant must express it in
-// the collection's PocketBase rules. See HANDOFF.
+// The Sources returned carry no Hooks, because a Go closure cannot cross a
+// process boundary. That no longer costs authorization or quota: core evaluates
+// the collection's own PocketBase rules (a string, which travels in the schema)
+// and core/quota enforces ceilings as record hooks, so a tenant enforces exactly
+// what the single-org app does. What a tenant loses is the version snapshot on
+// overwrite — history, not safety. See HANDOFF.
 func WebDAVSources(resolved []lockfile.ResolvedPackage) ([]webdav.Source, error) {
 	var sources []webdav.Source
 	for _, pkg := range resolved {
@@ -132,6 +162,73 @@ func WebDAVSources(resolved []lockfile.ResolvedPackage) ([]webdav.Source, error)
 				File:     wd.Fields.File,
 				Owner:    wd.Fields.Owner,
 				Updated:  wd.Fields.Updated,
+			},
+		})
+	}
+	return sources, nil
+}
+
+// defaultCalDAVPrefix is where a calendar tree mounts when a manifest omits
+// `prefix`. Clients probe /.well-known/caldav and follow the redirect, so the
+// value only has to be stable, but it must be non-empty: core builds every
+// calendar and object URL from it.
+const defaultCalDAVPrefix = "/caldav"
+
+// CalDAVSources reads each resolved package's materialized manifest.json and
+// returns the caldav.Source for every package that declares a `caldav` block.
+// This is the orgmanager.Config.CalDAVSources hook.
+//
+// As with WebDAV, the Sources carry no Go callbacks: authorization comes from
+// the calendar/event collections' own PocketBase rules, which core evaluates
+// with app.CanAccessRecord, so a tenant enforces the same membership and
+// viewer/editor split as the single-org app. Source.OnError is likewise absent —
+// a tenant has no Sentry hub to report into.
+func CalDAVSources(resolved []lockfile.ResolvedPackage) ([]caldav.Source, error) {
+	var sources []caldav.Source
+	for _, pkg := range resolved {
+		mc, ok, err := readManifestCapabilities(pkg.Dir)
+		if err != nil {
+			return nil, err
+		}
+		if !ok || mc.CalDAV == nil {
+			continue
+		}
+		cd := mc.CalDAV
+		slug := mc.Slug
+		if slug == "" {
+			slug = pkg.Name
+		}
+		prefix := cd.Prefix
+		if prefix == "" {
+			prefix = defaultCalDAVPrefix
+		}
+		sources = append(sources, caldav.Source{
+			Slug:               slug,
+			Prefix:             prefix,
+			CalendarCollection: cd.CalendarCollection,
+			EventCollection:    cd.EventCollection,
+			Calendar: caldav.CalendarMap{
+				Name:        cd.Calendar.Name,
+				Description: cd.Calendar.Description,
+			},
+			Event: caldav.EventMap{
+				Calendar:    cd.Event.Calendar,
+				UID:         cd.Event.UID,
+				Owner:       cd.Event.Owner,
+				Title:       cd.Event.Title,
+				Description: cd.Event.Description,
+				Location:    cd.Event.Location,
+				Start:       cd.Event.Start,
+				End:         cd.Event.End,
+				AllDay:      cd.Event.AllDay,
+				Recurrence:  cd.Event.Recurrence,
+				Guests:      cd.Event.Guests,
+				Reminder:    cd.Event.Reminder,
+				BusyStatus:  cd.Event.BusyStatus,
+				Visibility:  cd.Event.Visibility,
+				Updated:     cd.Event.Updated,
+				Created:     cd.Event.Created,
+				Defaults:    cd.Event.Defaults,
 			},
 		})
 	}

@@ -299,3 +299,209 @@ func TestCardDAVSources_SkipsPackagesWithoutCardDAV(t *testing.T) {
 		t.Errorf("expected no sources, got %d", len(sources))
 	}
 }
+
+// calendarManifestTS mirrors the `caldav` block calendar ships. Kept verbatim
+// from the real manifest so a drift between the two shows up here.
+const calendarManifestTS = `
+const manifest = {
+    name: 'Calendar',
+    slug: 'calendar',
+    version: '0.2.1',
+    description: 'Shared calendars, events and reminders',
+    hooks: { directory: 'pb-hooks' },
+    caldav: {
+        calendarCollection: 'calendar_calendars',
+        eventCollection: 'calendar_events',
+        calendar: {
+            name: 'name',
+            description: 'description',
+        },
+        event: {
+            calendar: 'calendar',
+            uid: 'ical_uid',
+            owner: 'created_by',
+            title: 'title',
+            description: 'description',
+            location: 'location',
+            start: 'start',
+            end: 'end',
+            allDay: 'all_day',
+            recurrence: 'recurrence',
+            guests: 'guests',
+            reminder: 'reminder',
+            busyStatus: 'busy_status',
+            visibility: 'visibility',
+            updated: 'updated',
+            created: 'created',
+            defaults: {
+                busy_status: 'busy',
+                visibility: 'default',
+            },
+        },
+    },
+}
+export default manifest
+`
+
+// writeManifestPkg emits manifest.json from a manifest.ts source into a fresh
+// temp dir, as the store does when a package is published.
+func writeManifestPkg(t *testing.T, manifestTS string) string {
+	t.Helper()
+	files, err := emitManifestJSON(map[string][]byte{"manifest.ts": []byte(manifestTS)})
+	if err != nil {
+		t.Fatalf("emit: %v", err)
+	}
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, manifestJSONFile), files[manifestJSONFile], 0o644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	return dir
+}
+
+func TestCalDAVSources_ReadsManifestJSON(t *testing.T) {
+	dir := writeManifestPkg(t, calendarManifestTS)
+
+	sources, err := CalDAVSources([]lockfile.ResolvedPackage{{Name: "calendar", Version: "0.2.1", Dir: dir}})
+	if err != nil {
+		t.Fatalf("CalDAVSources: %v", err)
+	}
+	if len(sources) != 1 {
+		t.Fatalf("got %d sources, want 1", len(sources))
+	}
+	s := sources[0]
+
+	if s.Slug != "calendar" {
+		t.Errorf("slug = %q", s.Slug)
+	}
+	if s.CalendarCollection != "calendar_calendars" || s.EventCollection != "calendar_events" {
+		t.Errorf("collections wrong: %+v", s)
+	}
+	if s.Calendar.Name != "name" || s.Calendar.Description != "description" {
+		t.Errorf("calendar map wrong: %+v", s.Calendar)
+	}
+	if s.Event.UID != "ical_uid" || s.Event.Calendar != "calendar" || s.Event.Owner != "created_by" {
+		t.Errorf("event identity fields wrong: %+v", s.Event)
+	}
+	if s.Event.Start != "start" || s.Event.End != "end" || s.Event.AllDay != "all_day" {
+		t.Errorf("event time fields wrong: %+v", s.Event)
+	}
+	// Recurrence is the field a flat config could not express on its own — the
+	// codec translates it — so losing the mapping silently drops every RRULE.
+	if s.Event.Recurrence != "recurrence" {
+		t.Errorf("recurrence field = %q, want 'recurrence'", s.Event.Recurrence)
+	}
+	// Defaults cover schema-required fields a minimal VEVENT omits. A tenant
+	// that loses them rejects those PUTs with "cannot be blank" — the live
+	// failure this block exists to prevent.
+	if s.Event.Defaults["busy_status"] != "busy" || s.Event.Defaults["visibility"] != "default" {
+		t.Errorf("event defaults wrong: %+v", s.Event.Defaults)
+	}
+	// A Go func cannot cross the process boundary, so a Source read from a
+	// manifest carries no error reporter. Access checks are unaffected: they
+	// come from the collections' PB rules, which travel in the schema.
+	if s.OnError != nil {
+		t.Error("Sources read from a manifest must carry no Go callbacks")
+	}
+}
+
+// calendar's manifest omits `prefix`, so the default has to fill in — core
+// builds every calendar and object URL from it, and an empty prefix would mount
+// the tree at the site root.
+func TestCalDAVSources_DefaultsPrefix(t *testing.T) {
+	dir := writeManifestPkg(t, calendarManifestTS)
+
+	sources, err := CalDAVSources([]lockfile.ResolvedPackage{{Name: "calendar", Dir: dir}})
+	if err != nil {
+		t.Fatalf("CalDAVSources: %v", err)
+	}
+	if got := sources[0].Prefix; got != "/caldav" {
+		t.Errorf("prefix = %q, want the /caldav default", got)
+	}
+}
+
+func TestCalDAVSources_HonorsExplicitPrefix(t *testing.T) {
+	dir := writeManifestPkg(t, `
+const manifest = {
+    name: 'Rooms', slug: 'rooms', version: '1.0.0', description: 'rooms',
+    caldav: {
+        prefix: '/rooms-cal',
+        calendarCollection: 'room_calendars',
+        eventCollection: 'room_events',
+        calendar: { name: 'name' },
+        event: { calendar: 'calendar', uid: 'uid', start: 'start', end: 'end' },
+    },
+}
+export default manifest
+`)
+
+	sources, err := CalDAVSources([]lockfile.ResolvedPackage{{Name: "rooms", Dir: dir}})
+	if err != nil {
+		t.Fatalf("CalDAVSources: %v", err)
+	}
+	if got := sources[0].Prefix; got != "/rooms-cal" {
+		t.Errorf("prefix = %q, want the manifest's own value", got)
+	}
+}
+
+func TestCalDAVSources_SkipsPackagesWithoutCalDAV(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, manifestJSONFile), []byte(`{"slug":"contacts"}`), 0o644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	empty := t.TempDir()
+
+	sources, err := CalDAVSources([]lockfile.ResolvedPackage{
+		{Name: "contacts", Dir: dir},
+		{Name: "nothing", Dir: empty},
+	})
+	if err != nil {
+		t.Fatalf("CalDAVSources: %v", err)
+	}
+	if len(sources) != 0 {
+		t.Errorf("expected no sources, got %d", len(sources))
+	}
+}
+
+// The three mirrored struct definitions (manifest block, wire type, core Source)
+// must actually agree. A field added to one and forgotten in another silently
+// stops being mapped, which for CalDAV means a property vanishing from every
+// VEVENT a tenant serves.
+func TestCalDAVSources_RoundTripThroughWire(t *testing.T) {
+	dir := writeManifestPkg(t, calendarManifestTS)
+
+	sources, err := CalDAVSources([]lockfile.ResolvedPackage{{Name: "calendar", Dir: dir}})
+	if err != nil {
+		t.Fatalf("CalDAVSources: %v", err)
+	}
+
+	decoded := davconfig.DecodeCalDAV(davconfig.EncodeCalDAV(sources))
+	if len(decoded) != 1 {
+		t.Fatalf("round trip produced %d sources, want 1", len(decoded))
+	}
+	if !reflect.DeepEqual(sources[0], decoded[0]) {
+		t.Fatalf("round trip changed the Source:\n before %+v\n after  %+v", sources[0], decoded[0])
+	}
+}
+
+// Serialized JSON must survive a real file write/read, which is how the tenant
+// actually receives it.
+func TestCalDAVSources_SurvivesJSONFile(t *testing.T) {
+	dir := writeManifestPkg(t, calendarManifestTS)
+	sources, err := CalDAVSources([]lockfile.ResolvedPackage{{Name: "calendar", Dir: dir}})
+	if err != nil {
+		t.Fatalf("CalDAVSources: %v", err)
+	}
+
+	body, err := json.Marshal(davconfig.EncodeCalDAV(sources))
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	var wire []davconfig.CalDAVSource
+	if err := json.Unmarshal(body, &wire); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	decoded := davconfig.DecodeCalDAV(wire)
+	if !reflect.DeepEqual(sources[0], decoded[0]) {
+		t.Fatalf("JSON round trip changed the Source:\n before %+v\n after  %+v", sources[0], decoded[0])
+	}
+}

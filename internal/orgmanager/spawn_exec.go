@@ -53,6 +53,9 @@ func buildCmd(ctx context.Context, req SpawnRequest, log *slog.Logger) *exec.Cmd
 	if req.CardDAVConfig != "" {
 		args = append(args, "--carddav-config", req.CardDAVConfig)
 	}
+	if req.CalDAVConfig != "" {
+		args = append(args, "--caldav-config", req.CalDAVConfig)
+	}
 	if req.WebDAVConfig != "" {
 		args = append(args, "--webdav-config", req.WebDAVConfig)
 	}

@@ -16,6 +16,7 @@ import (
 
 	"golang.org/x/sync/singleflight"
 
+	"tinycld.org/core/caldav"
 	"tinycld.org/core/carddav"
 	"tinycld.org/core/quota"
 	"tinycld.org/core/webdav"
@@ -89,6 +90,10 @@ type Config struct {
 	// WebDAVSources is CardDAVSources' counterpart for WebDAV trees (read from
 	// each package's `webdav` manifest block).
 	WebDAVSources func(resolved []lockfile.ResolvedPackage) ([]webdav.Source, error)
+
+	// CalDAVSources is CardDAVSources' counterpart for calendar trees (read from
+	// each package's `caldav` manifest block).
+	CalDAVSources func(resolved []lockfile.ResolvedPackage) ([]caldav.Source, error)
 
 	// QuotaSources returns the storage-bearing collections an org's resolved
 	// package set declares (from each package's `quota` manifest block).
@@ -213,6 +218,11 @@ func (m *OrgManager) load(ctx context.Context, slug string) (*OrgInstance, error
 		return nil, fmt.Errorf("carddav config %s: %w", slug, err)
 	}
 
+	caldavConfig, err := m.writeCalDAVConfig(orgDir, resolved)
+	if err != nil {
+		return nil, fmt.Errorf("caldav config %s: %w", slug, err)
+	}
+
 	webdavConfig, err := m.writeWebDAVConfig(orgDir, resolved)
 	if err != nil {
 		return nil, fmt.Errorf("webdav config %s: %w", slug, err)
@@ -223,7 +233,12 @@ func (m *OrgManager) load(ctx context.Context, slug string) (*OrgInstance, error
 		return nil, fmt.Errorf("quota config %s: %w", slug, err)
 	}
 
-	inst, err := m.spawn(ctx, slug, orgDir, davConfig, webdavConfig, quotaConfig)
+	inst, err := m.spawn(ctx, slug, orgDir, runtimeConfigs{
+		cardDAV: davConfig,
+		calDAV:  caldavConfig,
+		webDAV:  webdavConfig,
+		quota:   quotaConfig,
+	})
 	if err != nil {
 		m.noteCrash(slug)
 		return nil, err
@@ -240,8 +255,21 @@ func (m *OrgManager) load(ctx context.Context, slug string) (*OrgInstance, error
 	return inst, nil
 }
 
+// runtimeConfigs are the paths to an org's materialized .runtime/*.json files,
+// each empty when no resolved package contributes that capability.
+//
+// Grouped rather than passed as positional strings: they are all the same type,
+// so a mix-up at the call site would hand a tenant the wrong protocol's config
+// and compile cleanly.
+type runtimeConfigs struct {
+	cardDAV string
+	calDAV  string
+	webDAV  string
+	quota   string
+}
+
 // spawn starts the tenant process and waits for it to report readiness.
-func (m *OrgManager) spawn(ctx context.Context, slug, orgDir, davConfig, webdavConfig, quotaConfig string) (*OrgInstance, error) {
+func (m *OrgManager) spawn(ctx context.Context, slug, orgDir string, cfgs runtimeConfigs) (*OrgInstance, error) {
 	sockPath, err := m.socketPath(slug)
 	if err != nil {
 		return nil, err
@@ -264,9 +292,10 @@ func (m *OrgManager) spawn(ctx context.Context, slug, orgDir, davConfig, webdavC
 		OrgDir:        orgDir,
 		SocketPath:    sockPath,
 		BinaryPath:    m.cfg.TenantBinary,
-		CardDAVConfig: davConfig,
-		WebDAVConfig:  webdavConfig,
-		QuotaConfig:   quotaConfig,
+		CardDAVConfig: cfgs.cardDAV,
+		CalDAVConfig:  cfgs.calDAV,
+		WebDAVConfig:  cfgs.webDAV,
+		QuotaConfig:   cfgs.quota,
 		HooksPool:     m.cfg.HooksPool,
 		Drain:         drainTimeout,
 		ReadyFile:     readyW,
@@ -573,6 +602,36 @@ func (m *OrgManager) writeWebDAVConfig(orgDir string, resolved []lockfile.Resolv
 	path := filepath.Join(runtimeDir, "webdav.json")
 
 	body, err := json.Marshal(davconfig.EncodeWebDAV(sources))
+	if err != nil {
+		return "", err
+	}
+	if err := os.WriteFile(path, body, 0o644); err != nil {
+		return "", err
+	}
+	return path, nil
+}
+
+// writeCalDAVConfig is writeCardDAVConfig's counterpart for calendar trees. Same
+// rationale for resolving host-side.
+func (m *OrgManager) writeCalDAVConfig(orgDir string, resolved []lockfile.ResolvedPackage) (string, error) {
+	if m.cfg.CalDAVSources == nil {
+		return "", nil
+	}
+	sources, err := m.cfg.CalDAVSources(resolved)
+	if err != nil {
+		return "", err
+	}
+	if len(sources) == 0 {
+		return "", nil
+	}
+
+	runtimeDir := filepath.Join(orgDir, ".runtime")
+	if err := os.MkdirAll(runtimeDir, 0o755); err != nil {
+		return "", err
+	}
+	path := filepath.Join(runtimeDir, "caldav.json")
+
+	body, err := json.Marshal(davconfig.EncodeCalDAV(sources))
 	if err != nil {
 		return "", err
 	}

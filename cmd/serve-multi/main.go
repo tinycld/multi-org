@@ -71,6 +71,7 @@ func run() error {
 		Logger:         slog.Default(),
 		CardDAVSources: controlplane.CardDAVSources,
 		WebDAVSources:  controlplane.WebDAVSources,
+		CalDAVSources:  controlplane.CalDAVSources,
 		QuotaSources:   controlplane.QuotaSources,
 	})
 	defer mgr.Shutdown()

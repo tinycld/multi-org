@@ -165,11 +165,12 @@ func TestWebDAVSources_ReadsManifestJSON(t *testing.T) {
 	if s.Fields.Owner != "created_by" || s.Fields.File != "file" || s.Fields.Size != "size" {
 		t.Errorf("blob/owner fields wrong: %+v", s.Fields)
 	}
-	// Go hooks cannot cross the process boundary. Authorization no longer rides
-	// here — core evaluates the collection's own PB rules, which DO travel in
-	// the schema — but quota and versioning still do, so a tenant-served write
-	// skips both. Asserting it keeps that limitation visible.
-	if s.Hooks.CheckQuota != nil || s.Hooks.BeforeOverwrite != nil {
+	// Go hooks cannot cross the process boundary, so a Source read from a
+	// manifest carries none. That is no longer a security gap: authorization
+	// comes from the collection's own PB rules and quota from core/quota, both
+	// of which a tenant gets. What remains is the version snapshot, so a
+	// tenant-served overwrite does not archive the previous blob.
+	if s.Hooks.BeforeOverwrite != nil {
 		t.Error("Sources read from a manifest must carry no Go hooks")
 	}
 }

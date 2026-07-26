@@ -165,9 +165,11 @@ func TestWebDAVSources_ReadsManifestJSON(t *testing.T) {
 	if s.Fields.Owner != "created_by" || s.Fields.File != "file" || s.Fields.Size != "size" {
 		t.Errorf("blob/owner fields wrong: %+v", s.Fields)
 	}
-	// Hooks cannot cross the process boundary; a tenant-served tree gets core's
-	// default access model. Asserting this keeps the limitation visible.
-	if s.Hooks.CanRead != nil || s.Hooks.CheckQuota != nil {
+	// Go hooks cannot cross the process boundary. Authorization no longer rides
+	// here — core evaluates the collection's own PB rules, which DO travel in
+	// the schema — but quota and versioning still do, so a tenant-served write
+	// skips both. Asserting it keeps that limitation visible.
+	if s.Hooks.CheckQuota != nil || s.Hooks.BeforeOverwrite != nil {
 		t.Error("Sources read from a manifest must carry no Go hooks")
 	}
 }

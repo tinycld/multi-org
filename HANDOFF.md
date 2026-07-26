@@ -29,16 +29,21 @@ multiplexing. Core assumes one org = one DB.
 
 **Packages ship their own Go** (this reversed an earlier "no feature Go"
 decision). Core provides reusable libraries — `carddav`, `fts`, `audit`,
-`mailer`, `notify`, `thumbnails`, `textextract`, **`mailproto`** — and a package's
-`server/` drives them with its own config. Single copy, no duplication.
+`mailer`, `notify`, `thumbnails`, `textextract`, **`mailproto`**, **`driveshare`**
+— and a package's `server/` drives them with its own config. Single copy, no
+duplication. `driveshare` is the newest: the one definition of "may this user
+read / write / delete this drive_item", shared by drive, text and calc, and the
+Go mirror of the `drive_items` collection rules.
 
 Under isolation this splits cleanly: **feature Go stays out of tenants**, but
 *core* libraries can link into `serve-org` (it is the trusted core process for
 that org). CardDAV and WebDAV do exactly this — driven by declarative config the
 router materializes, never by feature code with full `$app` reach.
 
-**Three features are migrated: `contacts` (simplest template), `mail` (richest),
-and `drive` (the protocol lift + the Go→TS hook seam).**
+**Five features are migrated: `contacts` (simplest template), `mail` (richest),
+`drive` (the protocol lift + the Go→TS hook seam), and `text` + `calc` (the
+realtime/Yjs pair, which also produced `core/driveshare`).** Only `calendar` and
+`google-takeout-import` remain.
 
 Core now also has a **Go→TS hook-point seam** (`coreserver/ts_hooks.go`, plus
 `jsvm.Config.OnLoaderInit` in the fork). It lets host-owned Go call registered
@@ -91,8 +96,8 @@ Original brief: `docs/superpowers/specs/FOLLOWUP-os-process-isolation.md`
 Nothing is pushed. `multi-org/` and `pocketbase/` are gitignored by the parent
 and are **not** pnpm members.
 
-**Workspace is LEAN: core + contacts + mail + drive.** The other four features
-(`calendar text calc google-takeout-import`) plus `share-stub`/
+**Workspace is core + contacts + mail + drive + text + calc.** The remaining two
+features (`calendar google-takeout-import`) plus `share-stub`/
 `shortcut-stub` are parked at `~/code/tinycld/.parked/` and removed from
 `pnpm-workspace.yaml`. To bring one back: move the dir to the workspace root,
 add it to `pnpm-workspace.yaml`, `pnpm install`. Its git repo travels with it,
@@ -102,9 +107,36 @@ and **the generator emits its `server/go.work` with the fork replace for free**.
 
 ## 3. Converting the remaining features
 
-`calendar`, `calc`, `text` are un-migrated. Use **contacts** as the template for a
-simple feature, **mail** for one with a Go server, **drive** for one whose Go
-includes a protocol server worth lifting. Order matters.
+`calendar` and `google-takeout-import` are un-migrated. Use **contacts** as the
+template for a simple feature, **mail** for one with a Go server, **drive** for
+one whose Go includes a protocol server worth lifting, and **text**/**calc** for
+one that drives a realtime room. Order matters.
+
+> **What the text/calc pass added (2026-07-26).** Both had stopped at commit 3 of
+> drive's 12 (pb bump → schema → client), so they carried the schema/client
+> de-org but none of the Go, rename, or e2e work. The result was worse than
+> stale: every share lookup read `drive_items.org`, a column their own step-2
+> migration had deleted, so it returned `""`, tripped a fail-closed guard, and
+> denied **everyone** from every room and render — while building clean and
+> passing every test. Their PB rules still walked `drive_shares.user_org`
+> (renamed to `user` by drive's `321e29a`), which PB now rejects outright at
+> migration-apply time: `pnpm install` fails with `unknown field "user_org"`.
+> That is the loudest signal in the whole migration — use it as the baseline.
+>
+> Three things generalize:
+> - **The triple-duplicated share predicate is now `core/driveshare`.** calc's
+>   own comments admitted it "mirrors the canonical filter in
+>   text/server/authorize.go". Lifting it exposed a real divergence: drive
+>   honors a `created_by` disjunct (a creator reaches their own item without a
+>   share row) and text/calc never did. Core makes it unconditional, which
+>   slightly widens drive's write/delete to match the rules the REST API
+>   already enforces.
+> - **Never delete a "cross-org staleness" test by adapting it.** Rewriting it
+>   for single-org silently inverts its meaning (it grants a real editor share
+>   and then expects denial). Delete it and note that `userorg.OffboardUser`
+>   owns that property now.
+> - **A guard test you have not seen fail is not a guard.** Both RLS suites were
+>   verified by neutering the rule and confirming the deny-side tests go red.
 
 ### 3.1 Unpark and get a real baseline
 
@@ -386,7 +418,7 @@ matches:
   CardDAV into the tenant.
 
 **Feature migration**
-- `calendar`, `calc`, `text` — un-migrated (§3).
+- `calendar`, `google-takeout-import` — un-migrated (§3).
 
 **Upstreaming / release**
 - PR #1 `jsvm.ProgramSource`: **no longer has a consumer here** — per-process
@@ -402,10 +434,121 @@ matches:
 - Give `multi-org` a remote if it should be shared/CI'd.
 
 **Cleanup (non-blocking)**
+
+*App-shell de-org — DONE (2026-07-26).* The follow-up pass fixed four more live
+bugs of the same compiler-blind class, all found only by reading against the
+shipped schema:
+1. **`scripts/reset-demo.ts` reported success while wiping nothing.** It read the
+   deleted `orgs` collection inside `try/catch { return null }`, so the nightly
+   cron (`coreserver/demo_reset.go`, 04:00 daily when `DEMO_RESET_ENABLED`) logged
+   "Demo reset complete" and exited 0 forever. Now wipes per-collection by owner
+   FK — verified by running it twice and confirming steady-state counts.
+2. **Guest share-link visitors silently fell back to anon.**
+   `core/lib/editor/use-share-visitor-role.tsx` filtered on `user_org.user` and
+   expanded `user_org` — a field drive renamed to `user`. The query threw, a bare
+   `catch` swallowed it, and no visitor ever resolved to `guest`.
+3. **Three install specs asserted `'No organizations yet.'`** after bootstrap. The
+   dashboard now defaults to Packages and `OrganizationsTab` is a static
+   explainer, so that text never renders.
+4. **`scripts/test-server-api.ts`** expanded `user_org_via_user.org` on a deleted
+   junction.
+Also: 8 app-shell e2e specs de-slugged (24 dead `/a/` routes), `ORG_SLUG` deleted,
+`admin-organizations.spec.ts` removed (it tested a removed feature and a
+`/api/admin/orgs/{id}/impersonate` endpoint that has no implementation), the two
+install specs rewritten around the surviving setup flow, `EditorIdentity.userOrgId`
+deleted as redundant with `userId` (it had **4** feature-package consumers, not the
+0 an audit reported — the compiler found them), the `[[@userId]]` mention contract
+renamed through core + text + calc, and text's Yjs root-key literals repointed at
+`realtime.RootClientAuthors` / `RootClientFirstSeen` / `RootEditEvents`.
+
+*Deferred deliberately — both assessed and rejected, not forgotten:*
+- **`core/render/httpetag` lift: DON'T.** The "mirrors calc verbatim" comment at
+  `text/server/render_endpoint.go:28` is aspirational — `writeRenderedItem` and
+  `RenderItemHTML` have already diverged. Only ~25 lines per package are genuinely
+  shared (router glue, a sha256, three `Header().Set` calls), and lifting needs a
+  3-method `Renderer` interface plus `url.Values` in the signature, erasing calc's
+  typed `RenderOpts`. text/calc `server/` are separate Go modules; drive has no
+  render endpoint, so there is no third consumer. *Cheap alternative:* lift only
+  `ETag(itemID, updated, version)` into the existing `core/render`.
+- **`core/authorship` lift: NOT YET.** The near-generic claim holds (493 of 652
+  lines have no text coupling) but genericity is the precondition for a cheap
+  lift, not the trigger — a second consumer is. calc registers no
+  `OnDocUpdateContent` callback, ships no blame UI (all 19 authorship TS files are
+  under `text/`), and neither calc nor drive has a TODO asking for it. Lifting now
+  would also give core its first hard `y-crdt` dependency, which
+  `realtime/docruntime.go` deliberately avoids. Lift order when it lands: probe →
+  cache → edit_event_buffer (needs a clock param) → writers → stamper (behind a
+  `StampTarget` interface).
+- **`userOrgId` outside the editor** (~45 sites in `core/components/settings/`,
+  `core/lib/leave-org.ts`) is wired to server contracts
+  (`/api/invite-link/${userOrgId}`, `?user_org_id=…`) — renaming means moving the
+  API paths too. **But first see the leave-org item below: part of that surface
+  calls endpoints that no longer exist.**
+
+*Account lifecycle — DONE (2026-07-26).* `LeaveOrgFlow` called
+`/api/account/leave-org`, which has no Go implementation — a user clicking
+through Settings → Personal got a 404. "Leaving the organization" is meaningless
+when the deployment IS the org, so it was refactored into **disable** (reversible)
+and **delete** (irreversible):
+
+- **`users.disabled`** (core migration `1930000000`), enforced in Go because the
+  schema cannot express it: PB rules can't constrain *which fields* a write
+  touches, so `disabled` is admin-only in `users_guard.go` — otherwise a
+  suspended user could clear their own flag with a plain pbtsdb update. There is
+  no PB `authRule`, so refusing sign-in is a hook (`disabled_guard.go`), bound to
+  **both** `OnRecordAuthWithPasswordRequest` *and* `OnRecordAuthRequest` —
+  password-only would let a live refresh token renew forever.
+- **Two gates, both required.** `driveshare.ResolveRoleForItem` denies disabled
+  users (covers WebDAV, render, realtime), and drive migration `1782000000`
+  appends `@request.auth.disabled != true` to the drive_items/shares/state rules.
+  The REST API evaluates the rules *instead of* the Go, so gating only Go would
+  leave `/api/collections/drive_items/records` wide open — and would have looked
+  correct in every Go unit test. The RLS guard was verified by neutering the
+  clause and confirming the deny-tests go red.
+- **Endpoints:** `/api/account/disable` (self, confirm by own email, rotates the
+  token key so the suspension is immediate), `/api/account/enable` (admin-only),
+  `/api/account/delete` (now routes through `OffboardUser`, restoring the
+  reassign / delete-my-data choice it previously ignored — an omitted plan still
+  means "leave my content", the safe default), and `/api/admin/users/offboard`
+  for admin removal, split out because `/api/account/*` is self-only by
+  construction.
+- **UI:** `core/lib/account.ts` replaces `leave-org.ts` + `account-delete.ts`;
+  `DisableAccountSection` + `DisableAccountFlow` are new, the existing
+  `DeleteAccountModal` gained the content picker, and `RemoveMemberFlow` replaces
+  the admin half of `LeaveOrgFlow`.
+
+Verified live: a disabled user with a live editor share is refused password
+login (403), auth-refresh, the REST read (404) and list (0 rows), and WebDAV
+listing + direct GET (404) — while an enabled owner gets 200 on the same file.
+Admin re-enable restores all of it.
+
+*Still open here:*
+- **Mail delivery to a disabled user's mailbox** is unaddressed — bounce,
+  silently accept, or hold? The account can't sign in, but SMTP doesn't consult
+  `disabled`.
+- **Other packages' collection rules.** Audited, and the gap is small: drive was
+  the one that mattered (it owns shared content). `contacts.listRule` is
+  `owner = @request.auth.id` and mail's message rules are `user ?= @request.auth.id`,
+  so a disabled user reaches only their OWN rows there, never anyone else's.
+  The single genuinely-open rule is `mail_mailbox_aliases.listRule`
+  (`@request.auth.id != ""`, migration 1713000014) — alias metadata rather than
+  message content, so low severity, but it should get the same
+  `@request.auth.disabled != true` clause for consistency.
+
+- **`core/server/userorg/`** is still named for the junction it no longer uses.
+
 - Store "content-addressed" naming is vestigial (`ContentHash`/`manifest` unused).
 - `lockfile.Resolve` doesn't run the `peerVersions` solver yet.
 - Org switcher: `OrganizationsTab` is stubbed pending the router setting a
   parent-domain cookie listing accessible orgs.
+- **Org branding has no source.** `useOrgInfo()` returns `org: null`, so an org
+  name/logo cannot render anywhere — `DocumentTitle` silently drops its org
+  segment, and `getOrgLogoUrl` (`core/lib/use-org-info.ts:23-27`) is unreachable
+  dead code. The router materializes `carddav.json` and `quota.json` into
+  `<orgDir>/.runtime/` but nothing for branding. `document-title.spec.ts` had its
+  org-segment assertions **deleted** rather than reworded, because there is
+  currently no value for them to assert; restoring them means the router
+  materializing branding and `useOrgInfo` reading it.
 
 ---
 

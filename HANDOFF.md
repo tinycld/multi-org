@@ -28,9 +28,9 @@ exponential backoff, drain-then-TERM-then-KILL eviction, and the idle sweeper.
 multiplexing. Core assumes one org = one DB.
 
 **Packages ship their own Go** (this reversed an earlier "no feature Go"
-decision). Core provides reusable libraries — `carddav`, `fts`, `audit`,
-`mailer`, `notify`, `thumbnails`, `textextract`, **`mailproto`**, **`driveshare`**
-— and a package's `server/` drives them with its own config. Single copy, no
+decision). Core provides reusable libraries — `carddav`, **`caldav`**, `fts`,
+`audit`, `mailer`, `notify`, `thumbnails`, `textextract`, **`mailproto`**,
+**`driveshare`** — and a package's `server/` drives them with its own config. Single copy, no
 duplication. `driveshare` is the newest: the one definition of "may this user
 read / write / delete this drive_item", shared by drive, text and calc, and the
 Go mirror of the `drive_items` collection rules.
@@ -40,10 +40,11 @@ Under isolation this splits cleanly: **feature Go stays out of tenants**, but
 that org). CardDAV and WebDAV do exactly this — driven by declarative config the
 router materializes, never by feature code with full `$app` reach.
 
-**Five features are migrated: `contacts` (simplest template), `mail` (richest),
-`drive` (the protocol lift + the Go→TS hook seam), and `text` + `calc` (the
-realtime/Yjs pair, which also produced `core/driveshare`).** Only `calendar` and
-`google-takeout-import` remain.
+**All seven features are migrated: `contacts` (simplest template), `mail`
+(richest), `drive` (the protocol lift + the Go→TS hook seam), `text` + `calc`
+(the realtime/Yjs pair, which also produced `core/driveshare`), `calendar` (which
+produced `core/caldav`), and `google-takeout-import` (client-only, but the
+sharpest instance of mirrored-schema drift).** The feature migration is done.
 
 Core now also has a **Go→TS hook-point seam** (`coreserver/ts_hooks.go`, plus
 `jsvm.Config.OnLoaderInit` in the fork). It lets host-owned Go call registered
@@ -91,26 +92,29 @@ Original brief: `docs/superpowers/specs/FOLLOWUP-os-process-isolation.md`
 | `~/code/tinycld/pocketbase` | `feat/multitenant-fork` | **Must stay checked out here** — the router's `replace ../pocketbase` needs both seams + sobek |
 | `~/code/tinycld/multi-org` | `multi-org` | The router. No remote. |
 | `~/code/tinycld/tinycld` | `multi-org` | App shell + `@tinycld/core` (nested at `tinycld/core`) |
-| `~/code/tinycld/{contacts,mail,drive}` | `multi-org` | Migrated features |
+| `~/code/tinycld/{contacts,mail,drive,text,calc,calendar,google-takeout-import}` | `multi-org` | Migrated features (all seven) |
 
 Nothing is pushed. `multi-org/` and `pocketbase/` are gitignored by the parent
 and are **not** pnpm members.
 
-**Workspace is core + contacts + mail + drive + text + calc.** The remaining two
-features (`calendar google-takeout-import`) plus `share-stub`/
-`shortcut-stub` are parked at `~/code/tinycld/.parked/` and removed from
-`pnpm-workspace.yaml`. To bring one back: move the dir to the workspace root,
-add it to `pnpm-workspace.yaml`, `pnpm install`. Its git repo travels with it,
-and **the generator emits its `server/go.work` with the fork replace for free**.
+**Workspace is core + all seven features** (contacts, mail, drive, text, calc,
+calendar, google-takeout-import). Only `share-stub`/`shortcut-stub` remain parked
+at `~/code/tinycld/.parked/` and out of `pnpm-workspace.yaml`. To bring one back:
+move the dir to the workspace root, add it to `pnpm-workspace.yaml`,
+`pnpm install`. Its git repo travels with it, and **the generator emits its
+`server/go.work` with the fork replace for free**.
 
 ---
 
-## 3. Converting the remaining features
+## 3. Converting a feature
 
-`calendar` and `google-takeout-import` are un-migrated. Use **contacts** as the
-template for a simple feature, **mail** for one with a Go server, **drive** for
-one whose Go includes a protocol server worth lifting, and **text**/**calc** for
-one that drives a realtime room. Order matters.
+Every feature that shipped is migrated, so this section is now a **playbook for
+the next one** (a new package, or a downstream fork catching up) rather than a
+to-do list. Use **contacts** as the template for a simple feature, **mail** for
+one with a Go server, **drive** for one whose Go includes a protocol server worth
+lifting, **text**/**calc** for one that drives a realtime room, and **calendar**
+for one whose protocol server needs both a config lift and a TS customization
+seam. Order matters.
 
 > **What the text/calc pass added (2026-07-26).** Both had stopped at commit 3 of
 > drive's 12 (pb bump → schema → client), so they carried the schema/client
@@ -267,6 +271,66 @@ injected listener first, or every org after the first fails to bind.
 - Virtualized lists (FlashList) mount only visible rows — search to bring a row
   into the window rather than asserting a row that never mounts.
 
+### 3.7 What the calendar + takeout pass added (2026-07-26)
+
+**`calendar` was half-migrated, not un-migrated** — its `multi-org` branch already
+carried de-orged migrations and client (commits `a4ad691`, `d9fddbd`), but the
+entire 1,900-line Go server, `seed.ts`, both Go RLS suites and two e2e specs were
+untouched. Same shape as the text/calc trap: schema and client de-orged, Go left
+reading columns that no longer exist (`lifecycle.go` wrote `cal.Set("org", …)`
+against a dropped field). **Check the member's branch log before believing "un-migrated".**
+
+**`google-takeout-import` owns nothing** — no migrations, no Go, no collections,
+no routes. It writes into **nine collections belonging to four other packages**,
+so all of its breakage was *mirrored foreign schema*: 8 sites still wrote
+`user_org`. Its whole suite was green, 22/22, because `pb` is mocked and the
+filter was never checked against a real collection. **A package that mirrors
+another's schema needs a test that asserts the FIELD NAME**, or its suite
+certifies the bug — one was added.
+
+**CalDAV lifted to `core/caldav`, WebDAV-shaped.** Authorization moved to the
+collections' own PB rules via `app.CanAccessRecord`, which subsumed BOTH
+`resolveCalendarMembership` AND `requireEditorRole` — the event rules already
+encoded the viewer/editor split. The `orEqualsFilter` fan-out and
+`calendarDisplayName` (org-name suffixing) deleted outright; `server/auth.go` was
+a duplicate of `core/davauth`.
+
+Four things generalize:
+
+- **A lift can silently drop a non-obvious concern.** `caldav_sentry.go` was the
+  only place CalDAV errors reached Sentry (go-webdav turns a backend error into an
+  `http.Error` and returns nil, so request middleware never sees it). It became
+  `Source.OnError` + a decorator that wraps the *interface*, so adding a protocol
+  method breaks the build rather than going unreported — and it filters the
+  not-found sentinel so routine 404s don't bury real faults.
+- **`CanAccessRecord` cannot authorize a CREATE.** It evaluates the rule as a
+  query filtered to `id = record.Id`, so an unsaved record matches nothing and
+  every create rule denies. Save inside `RunInTransaction`, evaluate, roll back on
+  refusal — what PB's own create API does. This cost a live 500 and no unit test
+  saw it.
+- **A required field with no schema default breaks a minimal protocol write.**
+  `busy_status`/`visibility` are required selects; a minimal VEVENT carries neither
+  TRANSP nor CLASS, so the save was rejected. Fixed with `Source.Event.Defaults` —
+  **data, not a Go callback**, so a tenant gets them too. Same rule as
+  authorization: anything a tenant must do has to be expressible as data.
+- **iCalendar value types are load-bearing.** A *decoded* RRULE has value type
+  `RECUR`, and `Props.Text()` rejects non-TEXT — returning `""`, so every
+  client-sent recurrence was silently dropped. Emitting one with `SetText()` stamps
+  `VALUE=TEXT` and escapes the separators (`FREQ=WEEKLY\;BYDAY=TU`), which no
+  client can parse. **Both directions were broken and both were invisible to
+  in-memory tests**; only a round trip through real iCalendar *bytes* catches it.
+  There are now five wire-format tests that do exactly that.
+
+Also: denials must be wrapped in `webdav.NewHTTPError(404, …)`. A bare sentinel
+becomes a 500 — the masking still holds, but a routine miss is misreported as a
+server fault. `errors.Is` still matches through the wrapper.
+
+And a caution about diagnosis: an early hypothesis here was that the static
+catch-all (`Router.Any("/{path...}")`) was swallowing DAV GETs, and a guard was
+added to `coreserver/static.go` before a probe test showed the literal route
+already wins. The guard was reverted. **Prove which handler runs before changing
+routing** — the 500 was the DAV handler correctly refusing a GET on a collection.
+
 ---
 
 ## 4. Verify
@@ -276,7 +340,7 @@ injected listener first, or every org after the first fails to bind.
 cd <member>/server && go build ./... && go vet ./... && go test ./...
 
 # Core + assembled app shell
-cd tinycld/core/server && go build ./... && go test ./mailproto/ ./carddav/ ./webdav/ ./davauth/ ./fts/ ./audit/ ./coreserver/
+cd tinycld/core/server && go build ./... && go test ./mailproto/ ./carddav/ ./caldav/ ./webdav/ ./davauth/ ./fts/ ./audit/ ./coreserver/
 cd tinycld/server && go build -o /tmp/tinycld-server .
 
 # Router (must stay green — it imports the same core libs)
@@ -312,11 +376,19 @@ matches:
    through the renamed field) — not just an unfiltered list.
 3. Check an RLS boundary live (a `guest` denied where a `member` is not).
 4. Drive any protocol server end-to-end. For WebDAV that means the full cycle
-   (PROPFIND / PUT / GET / MKCOL / MOVE / DELETE), plus:
+   (PROPFIND / PUT / GET / MKCOL / MOVE / DELETE); for CalDAV, PROPFIND / PUT /
+   GET / DELETE **through real iCalendar bytes**, including a **minimal** VEVENT
+   (no TRANSP/CLASS — that is what catches a required-field-with-no-default) and a
+   complex `RRULE` (a decoded rule is RECUR-typed, so a Text()-based read drops it
+   and a SetText()-based write mangles it — see §3.7). Plus:
    - `OPTIONS` must answer `Dav: 1, 2` — class 2 is what makes Finder mount
      read-write, and losing the `NewMemLS` lock system silently downgrades it.
    - Another user's path must return **404, not 403**. Not-found masking is what
-     stops a probe confirming a path exists.
+     stops a probe confirming a path exists — and check the STATUS, not just the
+     refusal: a bare error sentinel surfaces as 500, which masks correctly but
+     misreports a routine miss as a server fault.
+   - A **create** must be exercised, not just an update. `CanAccessRecord` filters
+     on `id = record.Id`, so it cannot authorize an unsaved record (§3.7).
 5. If the feature ships TS hook points, boot **with a handler registered and
    again without one**, and diff the behaviour. Both bugs in the drive migration
    (the jsvm ordering, the shorthand handler) were invisible to unit tests and
@@ -411,14 +483,19 @@ matches:
   tenant binary — the process the isolation model most wants small. Needs a
   narrow bindings-only package that both `coreserver` and `serve-org` can share.
   Until then, `webdavHook` and `$drive.*` work single-tenant only.
-- CardDAV now runs **inside** each tenant process (core lib, `core.App`-driven,
-  fed by `<orgDir>/.runtime/carddav.json`). IMAP/SMTP are the remaining case:
+- CardDAV **and CalDAV** now run **inside** each tenant process (core libs,
+  `core.App`-driven, fed by `<orgDir>/.runtime/carddav.json` and `caldav.json`).
+  CalDAV followed the **WebDAV** shape, not CardDAV's: a `Source` field map plus
+  four opt-in TS hook points (`beforeWrite`, `beforeDelete`, `canRead`,
+  `filterList` — no `beforeMove`, since CalDAV has no cross-calendar move). Like
+  `webdavHook`, `caldavHook` works **single-tenant only** until tenant VMs get
+  bindings. IMAP/SMTP are the remaining case:
   `mailproto` is still **unwired**, and it binds fixed TCP ports, so it cannot
   run per-tenant as-is — it needs an injected listener before it can follow
   CardDAV into the tenant.
 
-**Feature migration**
-- `calendar`, `google-takeout-import` — un-migrated (§3).
+**Feature migration — DONE (2026-07-26).** All seven features are migrated; see
+§3.7 for what the last pass added.
 
 **Upstreaming / release**
 - PR #1 `jsvm.ProgramSource`: **no longer has a consumer here** — per-process
@@ -434,6 +511,20 @@ matches:
 - Give `multi-org` a remote if it should be shared/CI'd.
 
 **Cleanup (non-blocking)**
+
+*Cross-tenant watch list (if a router ever shares ONE PocketBase instance).*
+`google-takeout-import` dedups by name/uid with no owner predicate —
+`batch-inserter.ts:145` (calendars by name), `:185` (`ical_uid`), `:349`
+(`message_id`), `:86` (`vcard_uid`). Harmless today: the reads run under the
+caller's credentials, so each collection's list rule narrows them, and one
+deployment is one org. Under a shared instance they would match across tenants.
+Flagged in a comment at the calendar site.
+
+*Version-pin inconsistency, cosmetic.* `peerVersions['@tinycld/core']` disagrees
+across members — drive and mail say `>=0.4.0 <0.5.0`, contacts and calendar say
+`>=0.0.4 <0.1.0`, and `core/package.json` says `0.0.4`. Nothing enforces it yet
+(`lockfile.Resolve` doesn't run the solver — see below), so it is latent, but the
+next release should settle on one range.
 
 *App-shell de-org — DONE (2026-07-26).* The follow-up pass fixed four more live
 bugs of the same compiler-blind class, all found only by reading against the
@@ -552,7 +643,8 @@ Admin re-enable restores all of it.
 - **Org branding has no source.** `useOrgInfo()` returns `org: null`, so an org
   name/logo cannot render anywhere — `DocumentTitle` silently drops its org
   segment, and `getOrgLogoUrl` (`core/lib/use-org-info.ts:23-27`) is unreachable
-  dead code. The router materializes `carddav.json` and `quota.json` into
+  dead code. The router materializes `carddav.json`, `caldav.json` and
+  `quota.json` into
   `<orgDir>/.runtime/` but nothing for branding. `document-title.spec.ts` had its
   org-segment assertions **deleted** rather than reworded, because there is
   currently no value for them to assert; restoring them means the router

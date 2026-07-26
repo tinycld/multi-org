@@ -2,7 +2,11 @@ module tinycld.org/multi-org
 
 go 1.26.3
 
-replace github.com/pocketbase/pocketbase => ../pocketbase
+// The fork is vendored in the tinycld repo (tinycld/third_party/pocketbase), which
+// is its single source of truth — core and the app server resolve it from there
+// too. The router must link the same copy: it shares core's libraries, and a
+// second checkout would drift silently.
+replace github.com/pocketbase/pocketbase => ../tinycld/third_party/pocketbase
 
 replace tinycld.org/core => ../tinycld/core/server
 

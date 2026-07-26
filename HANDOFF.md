@@ -177,7 +177,7 @@ WebDAV (drive) landed between the two and turns that binary into a spectrum:
 | Lift shape | When | Example |
 |---|---|---|
 | **Pure data** | the feature's contribution is a flat field map | `carddav.Source` |
-| **Data + Go callbacks** | protocol is generic, but a few decisions are saturated with the schema | `webdav.Source` + `Hooks` |
+| **Data + Go callbacks** | protocol is generic, but a few *non-access* decisions are schema-bound | `webdav.Source` + `Hooks` |
 | **Transport only** | the session itself speaks the schema | `mailproto` + `NewIMAPSession` |
 
 A file tree is *data* as far as the protocol cares (name, size, parent, blob),
@@ -188,12 +188,17 @@ map and `Hooks` carries five Go callbacks (`CanRead`, `CanWrite`, `CanDelete`,
 `CheckQuota`, `BeforeOverwrite`). Drive's ~900 lines of protocol code became a
 40-line config literal.
 
-**The cost of that middle shape:** `Hooks` are Go func values, so they cannot
-cross a process boundary. A tenant reading `webdav.json` gets the tree with
-core's DEFAULT access model — a nil hook means unrestricted — which is broader
-than the single-tenant app, where drive's hooks narrow it. A package whose tree
-needs per-item authorization inside a tenant must express it in the collection's
-PocketBase rules. This is live and unresolved; see §6.
+**The cost of that middle shape, and the lesson:** `Hooks` are Go func values,
+so they cannot cross a process boundary — a tenant gets nil hooks, and a nil
+hook means unrestricted. Authorization originally rode there, which silently
+made a tenant-served tree readable by any member of the org.
+
+The fix generalizes: **never put an access decision in a lifted hook.** Ask the
+rule engine instead (`app.CanAccessRecord` against the collection's own
+List/View/Update/Delete rules). A rule is a string, so it travels in the schema
+and a tenant enforces it identically; it is also the same definition the REST
+API and the web UI use, so the two cannot drift. Hooks are for work that is not
+an access decision — drive's remaining two are quota and the version snapshot.
 
 Measure before deciding — `grep -o "<pkg>_[a-z_]*"` per file cleanly separated
 mail's 721 generic lines from its schema-bound ones.
@@ -343,14 +348,15 @@ matches:
   limits; a runaway tenant can still starve the host. (Brief decision #6.)
 
 **Protocol servers**
-- **A tenant-served WebDAV tree is broader than the single-tenant one.**
-  `webdav.Source.Hooks` are Go func values and cannot cross the process
-  boundary, so `controlplane.WebDAVSources` returns Sources with nil hooks and a
-  tenant serves the tree with core's default (authenticated, unrestricted per
-  item) model. Drive's `CanRead`/`CanWrite`/`CanDelete` narrow it only in-process.
-  Options: express the rules in the collection's PB rules, or extend the wire
-  format with a declarative permission shape. **Do not ship a tenant WebDAV tree
-  to untrusted orgs until this is closed.**
+- ~~A tenant-served WebDAV tree is broader than the single-tenant one.~~
+  **CLOSED.** Core evaluates the collection's own PocketBase rules
+  (`app.CanAccessRecord`: ListRule for listings, ViewRule for Stat/GET,
+  UpdateRule for PUT-over/MOVE, DeleteRule for DELETE) instead of taking Go
+  permission callbacks. A rule is a string and travels in the schema, so a
+  tenant enforces exactly what the single-org app does, from the one definition
+  in the migration. **Remaining gap, much smaller:** `CheckQuota` and
+  `BeforeOverwrite` are still Go hooks, so a tenant-served write skips quota
+  accounting and does not archive the previous version.
 - **Tenant VMs still get no `$` bindings and no hook points.** `serve-org` sets
   neither `OnInit` nor `OnLoaderInit`, because reaching them means importing
   `coreserver`, which drags Sentry, webpush, postmark and go-message into the

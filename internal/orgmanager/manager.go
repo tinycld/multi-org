@@ -98,6 +98,15 @@ type Config struct {
 	// QuotaSources returns the storage-bearing collections an org's resolved
 	// package set declares (from each package's `quota` manifest block).
 	QuotaSources func(resolved []lockfile.ResolvedPackage) ([]quota.Source, error)
+
+	// PackageSlugs returns the manifest slugs of an org's resolved package
+	// set. Written to .runtime/packages.json and read by serve-org, which
+	// uses it to gate FEATURE Go registration against the pinned menu the
+	// tenant binary links (internal/tenantpkgs) — an org that has not
+	// installed a package must not get its hooks or background goroutines.
+	// Host-side for the same reason as the DAV sources: the host already
+	// holds the resolved list, and the child must not walk the store.
+	PackageSlugs func(resolved []lockfile.ResolvedPackage) ([]string, error)
 }
 
 // crashState tracks a slug's consecutive unexpected exits. It lives on the
@@ -233,11 +242,17 @@ func (m *OrgManager) load(ctx context.Context, slug string) (*OrgInstance, error
 		return nil, fmt.Errorf("quota config %s: %w", slug, err)
 	}
 
+	packagesConfig, err := m.writePackagesConfig(orgDir, resolved)
+	if err != nil {
+		return nil, fmt.Errorf("packages config %s: %w", slug, err)
+	}
+
 	inst, err := m.spawn(ctx, slug, orgDir, runtimeConfigs{
-		cardDAV: davConfig,
-		calDAV:  caldavConfig,
-		webDAV:  webdavConfig,
-		quota:   quotaConfig,
+		cardDAV:  davConfig,
+		calDAV:   caldavConfig,
+		webDAV:   webdavConfig,
+		quota:    quotaConfig,
+		packages: packagesConfig,
 	})
 	if err != nil {
 		m.noteCrash(slug)
@@ -262,10 +277,11 @@ func (m *OrgManager) load(ctx context.Context, slug string) (*OrgInstance, error
 // so a mix-up at the call site would hand a tenant the wrong protocol's config
 // and compile cleanly.
 type runtimeConfigs struct {
-	cardDAV string
-	calDAV  string
-	webDAV  string
-	quota   string
+	cardDAV  string
+	calDAV   string
+	webDAV   string
+	quota    string
+	packages string
 }
 
 // spawn starts the tenant process and waits for it to report readiness.
@@ -288,18 +304,19 @@ func (m *OrgManager) spawn(ctx context.Context, slug, orgDir string, cfgs runtim
 
 	log := m.cfg.Logger
 	proc, err := m.cfg.Spawner.Spawn(ctx, SpawnRequest{
-		Slug:          slug,
-		OrgDir:        orgDir,
-		SocketPath:    sockPath,
-		BinaryPath:    m.cfg.TenantBinary,
-		CardDAVConfig: cfgs.cardDAV,
-		CalDAVConfig:  cfgs.calDAV,
-		WebDAVConfig:  cfgs.webDAV,
-		QuotaConfig:   cfgs.quota,
-		HooksPool:     m.cfg.HooksPool,
-		Drain:         drainTimeout,
-		ReadyFile:     readyW,
-		PackagesDir:   filepath.Join(m.cfg.Root, "packages"),
+		Slug:           slug,
+		OrgDir:         orgDir,
+		SocketPath:     sockPath,
+		BinaryPath:     m.cfg.TenantBinary,
+		CardDAVConfig:  cfgs.cardDAV,
+		CalDAVConfig:   cfgs.calDAV,
+		WebDAVConfig:   cfgs.webDAV,
+		QuotaConfig:    cfgs.quota,
+		PackagesConfig: cfgs.packages,
+		HooksPool:      m.cfg.HooksPool,
+		Drain:          drainTimeout,
+		ReadyFile:      readyW,
+		PackagesDir:    filepath.Join(m.cfg.Root, "packages"),
 	}, log)
 	// The write end belongs to the child now; the host must close its copy or
 	// it will never observe EOF when the child dies.
@@ -596,6 +613,40 @@ func (m *OrgManager) writeQuotaConfig(orgDir string, rec OrgRecord, resolved []l
 type quotaConfigFile struct {
 	StorageLimitBytes int64                   `json:"storageLimitBytes"`
 	Sources           []davconfig.QuotaSource `json:"sources"`
+}
+
+// writePackagesConfig materializes the org's resolved package slugs where the
+// tenant can read them. Like quota.json it is ALWAYS written when the hook is
+// wired — an empty slug list must be indistinguishable from "no packages
+// installed" (register no feature Go), never from "config missing".
+func (m *OrgManager) writePackagesConfig(orgDir string, resolved []lockfile.ResolvedPackage) (string, error) {
+	if m.cfg.PackageSlugs == nil {
+		return "", nil
+	}
+	slugs, err := m.cfg.PackageSlugs(resolved)
+	if err != nil {
+		return "", err
+	}
+
+	runtimeDir := filepath.Join(orgDir, ".runtime")
+	if err := os.MkdirAll(runtimeDir, 0o755); err != nil {
+		return "", err
+	}
+	path := filepath.Join(runtimeDir, "packages.json")
+
+	body, err := json.Marshal(packagesConfigFile{Slugs: slugs})
+	if err != nil {
+		return "", err
+	}
+	if err := os.WriteFile(path, body, 0o644); err != nil {
+		return "", err
+	}
+	return path, nil
+}
+
+// packagesConfigFile is the wire shape of .runtime/packages.json.
+type packagesConfigFile struct {
+	Slugs []string `json:"slugs"`
 }
 
 // writeWebDAVConfig is writeCardDAVConfig's counterpart for WebDAV trees. Same

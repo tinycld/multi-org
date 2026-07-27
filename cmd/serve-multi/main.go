@@ -73,6 +73,7 @@ func run() error {
 		WebDAVSources:  controlplane.WebDAVSources,
 		CalDAVSources:  controlplane.CalDAVSources,
 		QuotaSources:   controlplane.QuotaSources,
+		PackageSlugs:   controlplane.PackageSlugs,
 	})
 	defer mgr.Shutdown()
 

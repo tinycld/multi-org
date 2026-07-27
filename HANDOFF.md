@@ -22,14 +22,32 @@ log of this file and of the four repos.
 
 ## 1. Where things stand
 
-> **⚠ OPEN CRITICAL — read `docs/FINDING-tenant-composition-gap.md` first.**
-> A tenant is NOT the same server as single-org. `serve-org` hand-rolls a
-> subset of `coreserver.Register` (jsvm + quota only), so every tenant is
-> missing the users field guard, the disabled-user guard, notify, realtime,
-> userorg, schema hooks and the DAV CORS bypass. Proven consequence: with no
-> field guard bound, `users.updateRule` alone lets a plain member PATCH their
-> own role to `owner`. This is the root cause of the calendar takeover (P1-5),
-> and it is unfixed.
+> **✅ RESOLVED (2026-07-27) — `docs/FINDING-tenant-composition-gap.md`.**
+> A tenant used to hand-roll a subset of `coreserver.Register` (jsvm + quota
+> only), missing the users field guard, the disabled-user guard, notify,
+> realtime, userorg and the DAV CORS bypass — so `users.updateRule` alone let a
+> plain member PATCH their own role to `owner`. Fixed: `coreserver` now has a
+> shared composition set (`registerSharedEarly`/`registerSharedCore`) and a
+> `RegisterTenant` entry point that `serve-org` calls instead of hand-listing
+> registrations. A reflection-based parity test
+> (`coreserver/composition_parity_test.go`) fails if the two compositions ever
+> diverge without a recorded host-only reason, and `coreserver/tenant_test.go`
+> is the permanent regression coverage for both proven holes. The tenant now
+> also wires the jsvm `$`-binding / hook-point seams (see §6).
+>
+> **✅ Feature-package Go now links into tenants too (2026-07-27) —
+> `docs/SCOPE-tenant-feature-go.md` is CLOSED** as its option (b): serve-org
+> links a hand-pinned menu (`internal/tenantpkgs` + go.mod replaces — never
+> generator-emitted), gated per org by `.runtime/packages.json` /
+> `--packages-config`. Every Go-bearing feature split into
+> `registerShared` + host-only tail with `Register` (host) / `RegisterTenant`
+> (tenant) entries and its own composition-parity test: mail's IMAP/SMTP
+> listeners and the drive/calendar/contacts DAV mounts are host-only (a tenant
+> mounts DAV from materialized config, and the router owns every listening
+> socket); everything else — record hooks, endpoints, guards, FTS, workers —
+> runs in a tenant. `TestTenant_FeatureGoIsGatedByPackageSet` proves the gate
+> through the real binary in both polarities. This deleted calendar's P1-5
+> pb-hook and populated the tenant's `userorg` reassignable registry.
 
 **The router works, and tenants now run in their own OS processes.** A booted
 `serve-multi` (proxy mode) bootstraps a superuser from env, provisions an org via
@@ -68,12 +86,13 @@ which is why CardDAV, CalDAV and WebDAV became core libraries fed by
 declarative config the router materializes. It is not that their Go was
 untrusted; it is that they listen.
 
-Nothing about this makes feature Go *forbidden* in a tenant. `serve-org` links
-no feature package **today** — its `main` has no `packages/*` import and the
-generator emits `package_extensions.go` into the app server only — so any
-enforcement that lives solely in a feature's request hooks is absent from a
-tenant right now. That is a fact about the current build wiring to design
-against (see §7 / calendar), not a principle forbidding it.
+Feature Go is not forbidden in a tenant — and since 2026-07-27 it RUNS there:
+`serve-org` links the pinned feature menu (`internal/tenantpkgs`, gated by the
+org's resolved package set), calling each feature's `RegisterTenant` — the
+shared composition minus port listeners and DAV mounts. Enforcement in a
+feature's request hooks therefore covers tenants for menu packages; collection
+rules remain the layer that travels with the schema and covers packages
+outside the menu. See `docs/SCOPE-tenant-feature-go.md` for the decisions.
 
 **All seven features are migrated: `contacts` (simplest template), `mail`
 (richest), `drive` (the protocol lift + the Go→TS hook seam), `text` + `calc`
@@ -391,7 +410,8 @@ go test ./internal/orgmanager/ -run TestTenant -v
 # The confinement tests — the ones that actually prove the boundary — are
 # `//go:build linux`, so on darwin they are NOT COMPILED: `-run TestConfinement`
 # prints "no tests to run" and exits 0. That is a vacuous pass, not a skip.
-# Cross-compile at minimum:
+# Cross-compile at minimum (this works even with feature Go linked: dropping
+# goheif for doctaculous removed the last cgo dep from the tenant graph):
 GOOS=linux go build ./... && GOOS=linux go test -c -o /dev/null ./internal/orgmanager/
 sudo go test ./internal/orgmanager/ -run TestConfinement -v   # on a Linux host
 
@@ -520,19 +540,25 @@ matches:
   **Remaining gap, small:** `BeforeOverwrite` is still a Go hook, so a
   tenant-served overwrite does not archive the previous version. That loses
   history; it does not let anyone exceed a limit.
-- **Tenant VMs still get no `$` bindings and no hook points.** `serve-org` sets
-  neither `OnInit` nor `OnLoaderInit`, because reaching them means importing
-  `coreserver`, which drags Sentry, webpush, postmark and go-message into the
-  tenant binary — the process the isolation model most wants small. Needs a
-  narrow bindings-only package that both `coreserver` and `serve-org` can share.
-  Until then, `webdavHook` and `$drive.*` work single-tenant only.
+- ~~**Tenant VMs still get no `$` bindings and no hook points.**~~ **CLOSED
+  (2026-07-27).** The import objection dissolved when `serve-org` moved onto
+  `coreserver.RegisterTenant` (composition-gap fix, §1): the linker prunes the
+  host-only functions, and the heavy deps belong to subsystems a tenant should
+  run anyway. `RegisterTenant` passes `buildJsvmOnInit`/`buildJsvmOnLoaderInit`,
+  so a tenant's VMs carry core's `$`-bindings and register Go→TS hook handlers.
+  ~~Only binders from core sub-packages exist~~ **CLOSED (2026-07-27):**
+  feature Go now links via the pinned menu (`docs/SCOPE-tenant-feature-go.md`),
+  so an enabled package's own binders (`$drive.*`, `$contacts.*`) exist in
+  that org's VMs too — proven by `TestTenant_FeatureGoIsGatedByPackageSet`,
+  which also proves an org WITHOUT the package gets none of them.
 - CardDAV **and CalDAV** now run **inside** each tenant process (core libs,
-  `core.App`-driven, fed by `<orgDir>/.runtime/carddav.json` and `caldav.json`).
+  `core.App`-driven, fed by `<orgDir>/.runtime/carddav.json` and `caldav.json`),
+  mounted by `RegisterTenant` via `webdav.Register`/`caldav.Register` — the same
+  path the single-org app uses, with the host bindings wired.
   CalDAV followed the **WebDAV** shape, not CardDAV's: a `Source` field map plus
   four opt-in TS hook points (`beforeWrite`, `beforeDelete`, `canRead`,
-  `filterList` — no `beforeMove`, since CalDAV has no cross-calendar move). Like
-  `webdavHook`, `caldavHook` works **single-tenant only** until tenant VMs get
-  bindings. IMAP/SMTP are the remaining case:
+  `filterList` — no `beforeMove`, since CalDAV has no cross-calendar move).
+  IMAP/SMTP are the remaining case:
   `mailproto` is still **unwired**, and it binds fixed TCP ports, so it cannot
   run per-tenant as-is — it needs an injected listener before it can follow
   CardDAV into the tenant.

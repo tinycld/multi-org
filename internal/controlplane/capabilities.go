@@ -84,9 +84,10 @@ type manifestCapabilities struct {
 
 // CardDAVSources reads each resolved package's materialized manifest.json and
 // returns the carddav.Source for every package that declares a `carddav` block.
-// This is the orgmanager.Config.CardDAVSources hook: the host serves CardDAV over
-// the tenant's own DB (single-org scope), driven purely by package config,
-// because a tenant links no feature package. Packages without a manifest.json
+// This is the orgmanager.Config.CardDAVSources hook: a tenant mounts CardDAV
+// from this materialized config rather than from feature Go — the features'
+// own DAV mounts are host-only, so the materialized lists stay the single
+// source of truth for what a tenant serves. Packages without a manifest.json
 // or a carddav block are skipped.
 func CardDAVSources(resolved []lockfile.ResolvedPackage) ([]carddav.Source, error) {
 	var sources []carddav.Source
@@ -268,6 +269,27 @@ func QuotaSources(resolved []lockfile.ResolvedPackage) ([]quota.Source, error) {
 		}
 	}
 	return sources, nil
+}
+
+// PackageSlugs returns the manifest slug of every resolved package (falling
+// back to the store name when a package ships no manifest.json or no slug).
+// This is the orgmanager.Config.PackageSlugs hook: serve-org reads the result
+// from .runtime/packages.json to gate feature Go registration against the
+// pinned menu the tenant binary links (internal/tenantpkgs).
+func PackageSlugs(resolved []lockfile.ResolvedPackage) ([]string, error) {
+	slugs := make([]string, 0, len(resolved))
+	for _, pkg := range resolved {
+		mc, ok, err := readManifestCapabilities(pkg.Dir)
+		if err != nil {
+			return nil, err
+		}
+		slug := pkg.Name
+		if ok && mc.Slug != "" {
+			slug = mc.Slug
+		}
+		slugs = append(slugs, slug)
+	}
+	return slugs, nil
 }
 
 // readManifestCapabilities loads and parses <pkgDir>/manifest.json. The bool is

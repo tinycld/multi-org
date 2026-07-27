@@ -178,9 +178,17 @@ Same class as Phase 0, lower reachability. Land immediately after.
 - [ ] **P1-5 🟠 Move calendar's member-authz gates into rules** — `calendar`.
   **DONE 2026-07-27** (migration `1830000004` + a bootstrap pb-hook). But see
   `docs/FINDING-tenant-composition-gap.md`: this fix treats a symptom. The root
-  cause is that `serve-org` binds none of core's guards either, so every
-  Go-held guard has the same exposure. That is unfixed and larger than this
-  item.
+  cause was that `serve-org` bound none of CORE's guards either, so every
+  Go-held guard had the same exposure. **That root cause is now FIXED**
+  (2026-07-27): `serve-org` composes via `coreserver.RegisterTenant`, so core's
+  guards (users field guard, disabled-user guard, org-pkg guard) run in every
+  tenant, with a parity test preventing silent re-divergence.
+  `docs/SCOPE-tenant-feature-go.md` **landed later the same day**: calendar's
+  FEATURE Go now links into tenants (pinned menu, gated by the org's package
+  set), so the interim pb-hook was deleted — the Go bootstrap hook
+  (`registerOwnerMembershipBootstrap`) covers both compositions and
+  `tenant_hooks_bootstrap_test.go` binds it the way a tenant runs it. The
+  rules from `1830000004` remain the tenant's authorization backstop.
   **D2 resolved: calendar IS in scope for tenant hosting, so the gates must
   become rules.** A tenant links no feature package, so today a tenant user could
   `POST calendar_members {calendar: <any>, user: self, role: "owner"}` and take

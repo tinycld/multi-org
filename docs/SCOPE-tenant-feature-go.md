@@ -1,6 +1,7 @@
 # Scope — linking feature Go into the tenant process
 
-**Status:** proposal, not started. Written 2026-07-27.
+**Status:** **CLOSED** 2026-07-27 — implemented as D1 + D2 with step 5 resolved
+as option (b). See "How it was closed" at the end.
 **Motivates:** REMEDIATION-PLAN P1-5 (calendar member authz), and the whole
 class of findings shaped "enforcement lives in Go a tenant never runs".
 
@@ -207,3 +208,92 @@ rushing it into a security remediation is how the next review's findings get
 written. For P1-5 now, take the cheap proven path (pb-hook, ~30 lines, already
 tested green in the tenant configuration and falsifiable), and schedule this
 separately — at which point the pb-hook becomes redundant and can be deleted.
+
+---
+
+## How it was closed (2026-07-27)
+
+Implemented as **D1 (one binary, runtime gating) + D2 (packages.json)**, with
+step 5 resolved as **option (b)** — the pinned canonical menu — and two design
+additions the proposal did not anticipate, both found by reading the feature
+`Register()`s before wiring them in.
+
+**Step 5, decided: option (b).** The menu is hand-pinned in
+`multi-org/internal/tenantpkgs` (slug → tenant entry) plus six `replace
+tinycld.org/packages/<slug> => ../<slug>/server` directives in `go.mod` — the
+same sibling-checkout shape as the existing core replace, and **never
+generator-emitted**, so the tenant binary cannot silently depend on a
+developer's workspace assembly (option (a)'s failure mode). The recorded
+trade: hosted packages outside the menu are TS-hooks/rules-only.
+`TestMenuIsThePinnedSet` pins the contents so a menu change is a named,
+deliberate edit.
+
+**Addition 1 — features needed a host/tenant seam of their own.** Calling a
+feature's `Register(app)` in a tenant was never viable as-is: mail's
+`Register` starts IMAP/SMTP/inbound-SMTP TCP listeners on `OnServe` (and in
+production a failed listener aborts the boot), and drive/calendar/contacts
+mount their own DAV servers — which a tenant already mounts from materialized
+config, so linking them naively double-binds the routes. And a hand-rolled
+"tenant subset" per feature would recreate exactly the drift
+`FINDING-tenant-composition-gap.md` closed. So each Go-bearing feature got the
+same structure coreserver got: one `registerShared` (single source of truth),
+`Register(app)` = shared + an explicit host-only tail with reasons (mail's
+listeners; the DAV mounts), `RegisterTenant(app)` = shared only, and a
+composition-parity test per split feature
+(`rlstest.HookHandlerCounts`/`AssertCompositionDiff`, verified red). text and
+calc have no host-only tail; their two entries are identical by construction.
+
+**Addition 2 — mail is IN the menu, listeners host-only.** The proposal's
+implicit assumption that a feature is all-or-nothing was wrong for mail: a
+tenant-hosted mail org previously had no `/api/mail/send|search|draft`, no
+webhooks, no FTS sync, no mailbox lifecycle at all. With the split, all of
+that runs in a tenant; only the port-binding listeners stay host-only
+(per-tenant IMAP/SMTP still needs injected listeners — HANDOFF §6, mailproto).
+
+**D2 as proposed.** `orgmanager` writes `<orgDir>/.runtime/packages.json`
+(resolved manifest slugs, host-side via `controlplane.PackageSlugs` — the
+child must not walk the store) and passes `--packages-config`; like
+quota.json it is always written when the hook is wired, so "no packages" and
+"config missing" are indistinguishable. `serve-org` feeds the slugs to
+`tenantpkgs.Register` through `coreserver.TenantOptions.RegisterExtras` — a
+new seam mirroring the host's `Options.RegisterExtras`, called before quota
+(feature record hooks must precede the enforcement hook) and before jsvm
+(feature `$`-bindings must exist when the org's hook files run).
+
+**D3 as proposed: unchanged.** The DAV protocol servers keep coming from the
+materialized source lists; the features' own mounts are host-only. The WebDAV
+`BeforeOverwrite` version snapshot therefore remains single-org-only
+(history, not safety).
+
+**D4 / step 7.** `GOOS=linux go build ./...` and
+`GOOS=linux go test -c ./internal/orgmanager/` both pass with features
+linked. (Linking drive briefly broke the full cross-compile — goheif's cgo
+dav1d cannot build with CGO_ENABLED=0 — but goheif was dropped the same day:
+core/thumbnails now renders HEIC/HEIF through doctaculous's pure-Go decoder,
+removing the last cgo dep from the tenant graph.) Re-running
+`TestConfinement_*` with features linked still requires a Linux host, as
+before.
+
+**Step 6, tests.** `TestTenant_FeatureGoIsGatedByPackageSet` spawns the real
+serve-org binary twice: an org WITH contacts in its lockfile observes the
+`$contacts` jsvm binding, an org WITHOUT does not — one test, both polarities,
+through the real store → lockfile → packages.json → `--packages-config` path.
+`TestRegisterGatesBySlug` covers the gate at unit level;
+`packages_config_test.go` covers the materialization; the per-feature parity
+tests cover the split.
+
+**What this closed elsewhere.** P1-5's interim pb-hook (the tenant
+owner-membership bootstrap in `calendar/pb-hooks/calendar.pb.ts`) is
+**deleted** — calendar's Go bootstrap hook
+(`registerOwnerMembershipBootstrap`, split out for testability) now runs in
+tenants, and `tenant_hooks_bootstrap_test.go` binds it the way a tenant runs
+it. The FINDING's "account-delete cannot settle feature-owned rows in a
+tenant" item also closes for menu packages: `userorg.RegisterReassignable`
+runs from each feature's shared set, so the reassignable registry is populated
+in a tenant.
+
+**What stays open.** Per-tenant IMAP/SMTP (injected listeners); the WebDAV
+version-snapshot-on-overwrite in tenants (D3's deferred second question);
+`TestConfinement_*` still need a Linux host; and hosted third-party packages
+with Go remain a product question — option (c) is the recorded escape hatch
+if that answer ever changes.

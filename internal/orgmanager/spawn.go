@@ -40,6 +40,11 @@ type SpawnRequest struct {
 	// QuotaConfig is the path to the org's materialized quota.json, carrying
 	// the storage ceiling the operator assigned.
 	QuotaConfig string
+	// PackagesConfig is the path to the org's materialized packages.json — the
+	// resolved package slugs the child uses to gate feature Go registration
+	// against its pinned menu (internal/tenantpkgs). Empty when the host wires
+	// no PackageSlugs hook (the child then registers no feature Go).
+	PackagesConfig string
 
 	HooksPool int
 	Drain     time.Duration

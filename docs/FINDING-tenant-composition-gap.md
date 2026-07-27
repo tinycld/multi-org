@@ -1,7 +1,7 @@
 # Finding — a tenant is not the same server as single-org
 
 **Found:** 2026-07-27, while tracing whether the calendar takeover was real.
-**Status:** unfixed. Scoped here; no code written.
+**Status:** **FIXED** 2026-07-27 — see "How it was closed" at the end.
 **Severity:** privilege escalation in every tenant, independent of installed
 packages.
 
@@ -129,3 +129,78 @@ calendar takeover, and `CanAccessRecord` on the users rule) which were deleted
 rather than committed — the permanent coverage belongs with the fix, asserting
 the tenant configuration directly. `calendar/server/tenant_rules_authz_test.go`
 is the pattern: shipped rules, real pb-hooks, no feature Go bound.
+
+---
+
+## How it was closed (2026-07-27)
+
+The tenant now calls the **same composition root** the app does, exactly as the
+"Direction for the fix" section proposed.
+
+**One source of truth for the shared set.** `coreserver.Register` was split so
+that everything both compositions run lives in `registerSharedEarly`
+(Sentry + SystemConfig, which must precede any OnServe binding) and
+`registerSharedCore` (the guards, invites, account lifecycle, notify, realtime,
+audit, org-pkg guard, DAV CORS bypass). A new
+`coreserver.RegisterTenant(app, TenantOptions)` composes a tenant from those
+two plus the tenant-shaped engine wiring: sandboxed jsvm **with the `$`-binding
+and hook-point seams wired** (`OnInit`/`OnLoaderInit` — so `webdavHook` /
+`caldavHook` now dispatch in a tenant, closing that HANDOFF §6 item), quota
+with `FixedLimits` from the router's config, and the DAV protocol servers from
+the materialized source lists. `serve-org` deleted its hand-rolled jsvm+quota
+block and its hand-mounted DAV handlers; it now calls `RegisterTenant` and owns
+only transport (socket, readiness pipe, confinement, shutdown).
+
+**The audit, resolved.** Every registration in `Register` is now either shared
+or in an explicit host-only tail, each host-only entry carrying a reason in
+`server.go`:
+
+| registration | disposition | reason |
+|---|---|---|
+| users field guard, disabled-user guard, org_pkg_enabled guard | **shared** | authorization; the whole finding |
+| invites, invite-links, password-reset mailer | **shared** | per-org account flows; mail is inert until the org has creds |
+| account delete/disable/enable, admin offboard | **shared** | per-org account lifecycle |
+| notify + comment-mention hooks, realtime broker | **shared** | per-org notifications / collab |
+| audit hooks, users demo-audit hook | **shared** | per-org forensic trail |
+| DAV CORS bypass | **shared** | tenant mounts the same protocols |
+| Sentry + SystemConfig | **shared** | inert until the org's system_settings carry creds |
+| package install/upgrade | host-only | router owns deploys; a self-restarting tenant escapes supervision |
+| super-admin, VAPID admin endpoints | host-only | admin console is the control plane's |
+| OTA app-update endpoints | host-only | served from the host build archive; an org dir has none |
+| setup bootstrap / installer | host-only | control plane provisions tenants; AppURL is P2-4 |
+| demo start/lead/reset | host-only | marketing-site machinery |
+| schema-gen hooks | host-only | regenerates workspace TS; a tenant has no workspace |
+| static/SPA serving | host-only | host-shaped; tenant static serving is separate open work |
+
+**Impossible to reintroduce silently.**
+`coreserver/composition_parity_test.go` composes one app via `Register` and one
+via `RegisterTenant`, enumerates every `On*` hook by reflection, and requires
+the per-hook handler-count difference to equal an allowlist (`hostOnlyHookDiff`)
+that mirrors the table above. Adding a registration to `Register` without
+deciding tenant-or-not fails the test with the offending hook name.
+
+**Regression coverage for the proven holes.** `coreserver/tenant_test.go`
+composes a real tenant via `RegisterTenant`, serves through the router mux, and
+asserts a member's self-PATCH to `role=owner` is 403 and a disabled user's
+password-auth and auth-refresh are 403. Both were verified red with the guards
+removed from the shared set (the finding's whole history is tests that could
+not fail).
+
+**Not closed here, tracked elsewhere:** ~~feature-package Go still does not
+link into a tenant~~ **CLOSED 2026-07-27** — `docs/SCOPE-tenant-feature-go.md`
+landed (pinned menu in `multi-org/internal/tenantpkgs`, gated by
+`.runtime/packages.json`, features split into `Register`/`RegisterTenant`),
+which also deleted calendar's P1-5 pb-hook and closed the account-delete
+reassignable-registry gap for menu packages (`userorg.RegisterReassignable`
+runs from each feature's shared set in a tenant). Still open: invite/reset
+mail delivers only once an org has mail creds, and tenant AppURL (P2-4) and
+tenant static serving remain their own items.
+
+---
+
+## How it was closed (2026-07-27)
+
+The tenant now calls the same composition root as the app. Concretely:
+
+- **`coreserver.RegisterTenant(app, TenantOptions)`** (`coreserver/tenant.go`)
+  is the tenant-shaped entry point. The shared set

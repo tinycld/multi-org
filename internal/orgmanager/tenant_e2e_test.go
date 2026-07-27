@@ -48,6 +48,17 @@ func buildTenantBinary(t *testing.T) string {
 			tenantBinErr = fmt.Errorf("build serve-org: %v\n%s", err, combined)
 			return
 		}
+		// MkdirTemp creates the dir 0700. The confinement tests exec this
+		// binary as a tenant uid, which needs traversal on the dir and read
+		// on the binary.
+		if err := os.Chmod(dir, 0o755); err != nil {
+			tenantBinErr = err
+			return
+		}
+		if err := os.Chmod(out, 0o755); err != nil {
+			tenantBinErr = err
+			return
+		}
 		tenantBinPath = out
 	})
 

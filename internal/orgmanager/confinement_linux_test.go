@@ -8,8 +8,11 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 
 	"tinycld.org/multi-org/internal/store"
@@ -35,6 +38,15 @@ func newConfinedManager(t *testing.T, orgs map[string]string) *OrgManager {
 	requireConfinementEnv(t)
 	bin := buildTenantBinary(t)
 	root := t.TempDir()
+
+	// t.TempDir() and its parent are 0700 and owned by root (these tests run
+	// as root); the tenant uids must be able to traverse down to their own
+	// org dirs beneath it. Traversal-only, matching a production root.
+	for _, p := range []string{root, filepath.Dir(root)} {
+		if err := os.Chmod(p, 0o711); err != nil {
+			t.Fatal(err)
+		}
+	}
 
 	s := store.New(root)
 	lookup := map[string]OrgRecord{}
@@ -128,50 +140,170 @@ func TestConfinement_TenantsRunAsDistinctNonRootUIDs(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	status, err := os.ReadFile(fmt.Sprintf("/proc/%d/status", inst.proc.Pid()))
+	// The child runs in its own user namespace, where it is uid 0 so it can
+	// mount its package store read-only. What matters is the uid the HOST
+	// kernel checks file access against, which is what stat on /proc/<pid>
+	// reports — /proc/<pid>/status's Uid: line is namespace-relative and would
+	// read 0 even when confinement is working perfectly.
+	st, err := os.Stat(fmt.Sprintf("/proc/%d", inst.proc.Pid()))
 	if err != nil {
-		t.Fatalf("read child status: %v", err)
+		t.Fatalf("stat child proc: %v", err)
 	}
-	uidLine := ""
-	for _, line := range strings.Split(string(status), "\n") {
-		if strings.HasPrefix(line, "Uid:") {
-			uidLine = line
-			break
-		}
+	hostUID := st.Sys().(*syscall.Stat_t).Uid
+	if hostUID == 0 {
+		t.Fatal("tenant is running as host root")
 	}
-	if uidLine == "" {
-		t.Fatal("could not read the child's uid")
-	}
-	if strings.Contains(uidLine, "\t0\t") {
-		t.Fatalf("tenant is running as root: %q", uidLine)
+	if want := uint32(tenantUID("alpha", 60000, 500)); hostUID != want {
+		t.Fatalf("tenant host uid = %d, want %d", hostUID, want)
 	}
 }
 
 // The package store is shared and immutable; a tenant must not be able to
 // rewrite code another org will execute.
+//
+// The probe targets a real store file — the hook source another org would load
+// — from inside the tenant's own mount namespace, and asserts BOTH layers that
+// are supposed to stop it:
+//
+//   - ownership: the store is root's, the tenant is not;
+//   - the read-only bind mount confinePackages establishes, which is the layer
+//     that still holds against a process that has defeated the first.
+//
+// The second probe runs as root deliberately. As the tenant uid the write is
+// refused on ownership alone, so that assertion stays green with the mount
+// removed — which is exactly how the old version of this test certified a
+// confinement it never exercised.
 func TestConfinement_PackageStoreIsReadOnly(t *testing.T) {
 	requireConfinementEnv(t)
 
 	mgr := newConfinedManager(t, map[string]string{
-		"writer": `routerAdd('GET','/write',(e)=>{
-			try {
-				$os.writeFile('/tmp/should-not-work', 'x', 0644)
-				e.json(200, {wrote: true})
-			} catch (err) {
-				e.json(200, {wrote: false, error: String(err)})
-			}
-		})`,
+		"writer": `routerAdd('GET','/ping',(e)=>e.json(200,{ok:true}))`,
 	})
 
 	inst, err := mgr.Get(context.Background(), "writer")
 	if err != nil {
 		t.Fatal(err)
 	}
-	rec := httptest.NewRecorder()
-	inst.Mux().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/write", nil))
-	if strings.Contains(rec.Body.String(), `"wrote":true`) {
-		t.Fatalf("tenant wrote to the host filesystem: %s", rec.Body.String())
+
+	target := filepath.Join(mgr.cfg.Root, "packages", "@tinycld", "writer", "1.0.0", "server", "main.pb.js")
+	original, err := os.ReadFile(target)
+	if err != nil {
+		t.Fatalf("package store layout changed; probe target missing: %v", err)
 	}
+
+	uid := tenantUID("writer", 60000, 500)
+	script := fmt.Sprintf("echo pwned > %s", target)
+
+	if err := runInMountNS(t, inst.proc.Pid(), uid, script); err == nil {
+		t.Error("tenant uid rewrote a package-store file that other orgs execute")
+	}
+	if err := runInMountNS(t, inst.proc.Pid(), 0, script); err == nil {
+		t.Error("the package store is writable inside the tenant's mount namespace: " +
+			"the read-only bind mount is not in effect")
+	}
+
+	body, err := os.ReadFile(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(body) != string(original) {
+		t.Fatalf("package store file was modified: %s", body)
+	}
+}
+
+// runInMountNS runs a shell command inside the given pid's mount namespace as
+// the given uid — i.e. against exactly the filesystem view the tenant process
+// sees. uid 0 probes the mount itself rather than file ownership.
+func runInMountNS(t *testing.T, pid, uid int, script string) error {
+	t.Helper()
+	cmd := exec.Command("nsenter", "--mount=/proc/"+strconv.Itoa(pid)+"/ns/mnt",
+		"--setuid", strconv.Itoa(uid), "--setgid", strconv.Itoa(uid),
+		"/bin/sh", "-c", script)
+	out, err := cmd.CombinedOutput()
+	if err != nil && strings.Contains(string(out), "executable file not found") {
+		t.Skipf("nsenter unavailable: %s", out)
+	}
+	return err
+}
+
+// Each org's socket must live in its own directory owned by that tenant's uid
+// alone, with the parent run dir staying root-owned. A shared socket directory
+// chowned to whichever tenant spawned last hands that tenant every other org's
+// rendezvous point: it can unlink a sibling's socket and bind its own in the
+// same place to intercept that org's traffic.
+func TestConfinement_SocketDirIsPerOrg(t *testing.T) {
+	requireConfinementEnv(t)
+
+	mgr := newConfinedManager(t, map[string]string{
+		"alpha": `routerAdd('GET','/ping',(e)=>e.json(200,{ok:true}))`,
+		"beta":  `routerAdd('GET','/ping',(e)=>e.json(200,{ok:true}))`,
+	})
+
+	alpha, err := mgr.Get(context.Background(), "alpha")
+	if err != nil {
+		t.Fatalf("alpha: %v", err)
+	}
+	beta, err := mgr.Get(context.Background(), "beta")
+	if err != nil {
+		t.Fatalf("beta: %v", err)
+	}
+
+	uidAlpha := tenantUID("alpha", 60000, 500)
+	uidBeta := tenantUID("beta", 60000, 500)
+	if uidAlpha == uidBeta {
+		t.Fatalf("test slugs hash to the same uid (%d); pick different slugs", uidAlpha)
+	}
+
+	alphaDir := filepath.Dir(alpha.sockPath)
+	betaDir := filepath.Dir(beta.sockPath)
+	if alphaDir == betaDir {
+		t.Fatalf("both tenants share the socket directory %s", alphaDir)
+	}
+
+	// The directory holding all the per-org socket dirs must remain root's:
+	// whoever owns it can rename or unlink any org's socket dir wholesale.
+	parent := filepath.Dir(alphaDir)
+	pst, err := os.Stat(parent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if uid := pst.Sys().(*syscall.Stat_t).Uid; uid != 0 {
+		t.Fatalf("socket parent dir %s is owned by uid %d, want root", parent, uid)
+	}
+	if perm := pst.Mode().Perm(); perm&0o022 != 0 {
+		t.Fatalf("socket parent dir %s is group/other-writable: %o", parent, perm)
+	}
+
+	ast, err := os.Stat(alphaDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if uid := ast.Sys().(*syscall.Stat_t).Uid; uid != uint32(uidAlpha) {
+		t.Fatalf("alpha's socket dir %s is owned by uid %d, want %d", alphaDir, uid, uidAlpha)
+	}
+	if perm := ast.Mode().Perm(); perm != 0o700 {
+		t.Fatalf("alpha's socket dir %s has mode %o, want 0700", alphaDir, perm)
+	}
+
+	// And the kernel must actually enforce it: as beta's uid, alpha's socket
+	// can be neither seen nor removed.
+	if err := runAsUID(uidBeta, "test -e "+alpha.sockPath); err == nil {
+		t.Fatalf("tenant beta (uid %d) can stat alpha's socket %s", uidBeta, alpha.sockPath)
+	}
+	_ = runAsUID(uidBeta, "rm -f "+alpha.sockPath)
+	if _, err := os.Stat(alpha.sockPath); err != nil {
+		t.Fatalf("tenant beta (uid %d) unlinked alpha's socket: %v", uidBeta, err)
+	}
+}
+
+// runAsUID runs a shell command under the given uid/gid, the way a hostile
+// tenant process would execute.
+func runAsUID(uid int, script string) error {
+	cmd := exec.Command("/bin/sh", "-c", script)
+	cmd.SysProcAttr = &syscall.SysProcAttr{
+		Credential: &syscall.Credential{Uid: uint32(uid), Gid: uint32(uid)},
+	}
+	return cmd.Run()
 }
 
 // The child must not be able to read the host's environment.

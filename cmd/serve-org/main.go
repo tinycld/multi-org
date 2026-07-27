@@ -7,8 +7,18 @@
 // holds a full $app/DB surface — a boundary in-process allowlisting provably
 // could not provide.
 //
-// It links no feature Go. CardDAV and WebDAV come from core and are driven
-// entirely by the declarative source lists the host materialized.
+// It links no feature Go today: this main imports no `tinycld.org/packages/*`,
+// and the generator emits `package_extensions.go` (which calls each feature's
+// Register) into the APP server, not here. Any enforcement a feature keeps
+// solely in its request hooks is therefore absent from a tenant — design for
+// that, and put authorization in collection rules, which travel in the schema.
+//
+// That is current build wiring, not a prohibition. The architectural rule is
+// narrower and is about ports: a service that must BIND A PORT moves into core
+// so the router can open it. A tenant serves on a unix socket the router hands
+// down and the router owns every listening socket, so a feature cannot bring
+// its own listener. That is why CardDAV, CalDAV and WebDAV are core libraries
+// driven by declarative source lists the host materialized.
 package main
 
 import (
@@ -139,7 +149,7 @@ func run(orgDir, socketPath, slug string, hooksPool int, davConfigPath, caldavCo
 	// Storage ceilings. The org limit comes from the router's runtime config,
 	// NOT this org's settings — its superusers must not be able to raise the
 	// plan they were sold. core/quota binds record hooks, so every write path
-	// in the tenant is covered even though no feature Go is linked here.
+	// in the tenant is covered even though no feature package is linked here.
 	if err := quota.Register(app, davconfig.DecodeQuota(quotaCfg.Sources),
 		quota.FixedLimits(quotaCfg.StorageLimitBytes)); err != nil {
 		return fmt.Errorf("quota register: %w", err)

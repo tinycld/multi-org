@@ -103,17 +103,44 @@ func (s *linuxSpawner) Spawn(ctx context.Context, req SpawnRequest, log *slog.Lo
 
 	if s.conf.UIDBase > 0 && s.conf.UIDRange > 0 {
 		uid := tenantUID(req.Slug, s.conf.UIDBase, s.conf.UIDRange)
+		// The child has to remount the package store read-only inside its own
+		// mount namespace (see cmd/serve-org --confine-packages), and mount(2)
+		// needs CAP_SYS_ADMIN over that namespace — which a process that has
+		// setuid'd to a plain host uid does not hold. A single-uid user
+		// namespace squares that circle: inside it the child is uid 0 with
+		// full capabilities over the namespaces it owns, while on the host it
+		// is the tenant uid and the kernel enforces file separation against
+		// every other tenant exactly as before.
+		attr.Cloneflags |= syscall.CLONE_NEWUSER
+		attr.UidMappings = []syscall.SysProcIDMap{{ContainerID: 0, HostID: uid, Size: 1}}
+		attr.GidMappings = []syscall.SysProcIDMap{{ContainerID: 0, HostID: uid, Size: 1}}
+		attr.GidMappingsEnableSetgroups = true
 		attr.Credential = &syscall.Credential{
-			Uid: uint32(uid),
-			Gid: uint32(uid),
+			Uid: 0, // userns uid 0 == host uid `uid`
+			Gid: 0,
 		}
 		if err := chownTree(req.OrgDir, uid); err != nil {
 			return nil, fmt.Errorf("chown org dir for %s: %w", req.Slug, err)
 		}
-		// The child creates the socket after dropping privileges, so the
-		// directory holding it must be writable by the tenant uid.
-		if err := os.Chown(filepath.Dir(req.SocketPath), uid, uid); err != nil {
+		// The child creates the socket itself, so its per-org directory must
+		// be writable by the tenant uid — but ONLY that directory. Its parent
+		// holds every org's socket dir and must stay the host's: a tenant
+		// owning the shared parent could unlink and rebind sibling sockets.
+		// The parent is healed explicitly because pre-per-org layouts chowned
+		// it to whichever tenant spawned last.
+		sockDir := filepath.Dir(req.SocketPath)
+		if err := os.Chown(sockDir, uid, uid); err != nil {
 			return nil, fmt.Errorf("chown socket dir for %s: %w", req.Slug, err)
+		}
+		if err := os.Chmod(sockDir, 0o700); err != nil {
+			return nil, fmt.Errorf("chmod socket dir for %s: %w", req.Slug, err)
+		}
+		parent := filepath.Dir(sockDir)
+		if err := os.Chown(parent, 0, 0); err != nil {
+			return nil, fmt.Errorf("chown socket parent dir for %s: %w", req.Slug, err)
+		}
+		if err := os.Chmod(parent, 0o711); err != nil {
+			return nil, fmt.Errorf("chmod socket parent dir for %s: %w", req.Slug, err)
 		}
 	}
 
@@ -130,13 +157,31 @@ func (s *linuxSpawner) Spawn(ctx context.Context, req SpawnRequest, log *slog.Lo
 	return &execProcess{cmd: cmd}, nil
 }
 
-// chownTree gives the tenant uid ownership of its own directory subtree.
+// chownTree gives the tenant uid exclusive ownership of its own directory
+// subtree.
+//
+// Ownership alone does not isolate anything: a pb_data left at the default
+// 0644 is readable by every other tenant uid on the host, which is precisely
+// the cross-org `ATTACH DATABASE` read this boundary exists to close. So the
+// modes are narrowed to owner-only as we go. Symlinks are skipped — the mode
+// on a symlink is meaningless and chmod would follow it into the shared
+// package store.
 func chownTree(root string, uid int) error {
 	return filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			return err
 		}
-		return os.Lchown(path, uid, uid)
+		if err := os.Lchown(path, uid, uid); err != nil {
+			return err
+		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			return nil
+		}
+		mode := os.FileMode(0o600)
+		if info.IsDir() {
+			mode = 0o700
+		}
+		return os.Chmod(path, mode)
 	})
 }
 

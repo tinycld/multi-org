@@ -85,8 +85,9 @@ type manifestCapabilities struct {
 // CardDAVSources reads each resolved package's materialized manifest.json and
 // returns the carddav.Source for every package that declares a `carddav` block.
 // This is the orgmanager.Config.CardDAVSources hook: the host serves CardDAV over
-// the tenant's own DB (single-org scope), driven purely by package config — no
-// feature Go. Packages without a manifest.json or a carddav block are skipped.
+// the tenant's own DB (single-org scope), driven purely by package config,
+// because a tenant links no feature package. Packages without a manifest.json
+// or a carddav block are skipped.
 func CardDAVSources(resolved []lockfile.ResolvedPackage) ([]carddav.Source, error) {
 	var sources []carddav.Source
 	for _, pkg := range resolved {

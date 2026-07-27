@@ -50,3 +50,74 @@ func TestStore_VersionDirMissing(t *testing.T) {
 		t.Fatal("expected error for missing version")
 	}
 }
+
+// A package name and version reach filepath.Join unvalidated, from a lockfile
+// (lockfile.go) or a publish request body (provisioning.go). Both are
+// superuser-supplied today, which is why this is low severity — but "..%2F"
+// segments escape the store root entirely, so a publish could write anywhere
+// the router process can reach and a resolve could hand a tenant a directory
+// outside the store.
+func TestStore_RejectsPathTraversal(t *testing.T) {
+	root := t.TempDir()
+	s := New(root)
+
+	hostile := []struct{ name, version string }{
+		{"../../../etc", "1.0.0"},
+		{"@tinycld/core", "../../../../tmp"},
+		{"..", "1.0.0"},
+		{"a/../../b", "1.0.0"},
+		{"@tinycld/core", ".."},
+		{"", "1.0.0"},
+		{"@tinycld/core", ""},
+	}
+
+	for _, tc := range hostile {
+		t.Run(tc.name+"@"+tc.version, func(t *testing.T) {
+			err := s.Publish(tc.name, tc.version, map[string][]byte{"a.js": []byte("x")})
+			if err == nil {
+				t.Errorf("Publish(%q, %q) was accepted; it must be rejected", tc.name, tc.version)
+			}
+			if _, err := s.VersionDir(tc.name, tc.version); err == nil {
+				t.Errorf("VersionDir(%q, %q) resolved; it must be rejected", tc.name, tc.version)
+			}
+		})
+	}
+}
+
+// The file paths inside a publish are the same problem one level down: a
+// relative path with .. segments escapes the version directory.
+func TestStore_RejectsTraversalInFileNames(t *testing.T) {
+	root := t.TempDir()
+	s := New(root)
+
+	err := s.Publish("pkg", "1.0.0", map[string][]byte{
+		"../../../escaped.js": []byte("x"),
+	})
+	if err == nil {
+		t.Fatal("a file path escaping the version dir was accepted")
+	}
+	if _, err := os.Stat(filepath.Join(root, "escaped.js")); err == nil {
+		t.Fatal("the file was written outside the store root")
+	}
+}
+
+// The positive control: ordinary scoped names and semver versions still work.
+// Without it, rejecting everything would pass the tests above.
+func TestStore_AcceptsOrdinaryNames(t *testing.T) {
+	root := t.TempDir()
+	s := New(root)
+
+	for _, tc := range []struct{ name, version string }{
+		{"@tinycld/core", "2.4.0"},
+		{"@acme/custom-pkg", "0.1.0-beta.1"},
+		{"mail", "1.0.0"},
+		{"google-takeout-import", "1.2.3+build.4"},
+	} {
+		if err := s.Publish(tc.name, tc.version, map[string][]byte{"a.js": []byte("x")}); err != nil {
+			t.Errorf("Publish(%q, %q): %v", tc.name, tc.version, err)
+		}
+		if _, err := s.VersionDir(tc.name, tc.version); err != nil {
+			t.Errorf("VersionDir(%q, %q): %v", tc.name, tc.version, err)
+		}
+	}
+}

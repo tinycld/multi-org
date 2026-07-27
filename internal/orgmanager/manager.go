@@ -345,27 +345,44 @@ const maxSocketPath = 100
 
 // socketPath resolves an org's socket, falling back to a short path under the
 // system temp dir when MT_ROOT is deep enough to overrun the kernel's limit.
+//
+// Each socket lives in its own per-org directory. The Linux spawner chowns
+// that directory — and only that directory — to the tenant's uid; a shared
+// socket directory would end up owned by whichever tenant spawned last, and
+// owning the directory is owning every org's socket: unlink a sibling's and
+// bind your own in its place to intercept that org's traffic. The parent is
+// traversal-only (0711): tenants pass through it to reach their own dir but
+// cannot list it or unlink each other's.
 func (m *OrgManager) socketPath(slug string) (string, error) {
-	primary := filepath.Join(m.cfg.Root, "run", slug+".sock")
+	runDir := filepath.Join(m.cfg.Root, "run")
+	primary := filepath.Join(runDir, slug, slug+".sock")
 	if len(primary) <= maxSocketPath {
-		if err := os.MkdirAll(filepath.Dir(primary), 0o700); err != nil {
+		if err := os.MkdirAll(runDir, 0o711); err != nil {
 			return "", fmt.Errorf("%w: create run dir for %s: %v", orgerr.ErrOrgUnavailable, slug, err)
+		}
+		if err := os.MkdirAll(filepath.Dir(primary), 0o700); err != nil {
+			return "", fmt.Errorf("%w: create socket dir for %s: %v", orgerr.ErrOrgUnavailable, slug, err)
 		}
 		return primary, nil
 	}
 
 	// The socket is a rendezvous point, not state: it is recreated on every
-	// spawn and removed on teardown, so relocating it costs nothing. Keeping
-	// it inside a private per-root directory preserves the access control the
-	// 0700 run dir provides.
+	// spawn and removed on teardown, so relocating it costs nothing. The
+	// fallback exists because the primary overran sun_path, so it spends its
+	// budget carefully: the slug appears only as the per-org directory name
+	// and the socket itself keeps a fixed short basename.
 	digest := sha256.Sum256([]byte(m.cfg.Root))
-	fallbackDir := filepath.Join(os.TempDir(), fmt.Sprintf("mt-%x", digest[:6]))
-	if err := os.MkdirAll(fallbackDir, 0o700); err != nil {
-		return "", fmt.Errorf("%w: create socket dir for %s: %v", orgerr.ErrOrgUnavailable, slug, err)
-	}
-	fallback := filepath.Join(fallbackDir, slug+".sock")
+	fallbackParent := filepath.Join(os.TempDir(), fmt.Sprintf("mt-%x", digest[:6]))
+	fallbackDir := filepath.Join(fallbackParent, slug)
+	fallback := filepath.Join(fallbackDir, "s.sock")
 	if len(fallback) > maxSocketPath {
 		return "", fmt.Errorf("%w: socket path for %s exceeds %d bytes", orgerr.ErrOrgUnavailable, slug, maxSocketPath)
+	}
+	if err := os.MkdirAll(fallbackParent, 0o711); err != nil {
+		return "", fmt.Errorf("%w: create socket parent dir for %s: %v", orgerr.ErrOrgUnavailable, slug, err)
+	}
+	if err := os.MkdirAll(fallbackDir, 0o700); err != nil {
+		return "", fmt.Errorf("%w: create socket dir for %s: %v", orgerr.ErrOrgUnavailable, slug, err)
 	}
 	return fallback, nil
 }

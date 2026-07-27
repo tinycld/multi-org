@@ -4,6 +4,12 @@ Companion to `HANDOFF.md` §7. Every finding in §7.1–§7.5 appears here exact
 once, assigned to a phase. Phase order is by **risk of shipping without it**,
 then by dependency.
 
+> **Status reconciliation — 2026-07-27.** The checkboxes below had drifted
+> from the code: every Phase 0 item and most of Phase 1 were implemented but
+> never checked off. Each item marked `[x]` below was re-verified against the
+> shipped code/migrations on 2026-07-27 (evidence noted inline). Items left
+> `[ ]` were re-verified as genuinely open, except where noted "unverified".
+
 **How to work this doc.** Phases 0–3 are merge blockers. Each item carries its
 §7 severity, the repo to commit in, and a **Done when** line that names the
 verification — a fix without one is not finished. Check items off in place and
@@ -53,6 +59,7 @@ Nothing merges to a shared branch until these are done. Each is small; the
 grouping is by "an attacker or a disabled user gets something they must not".
 
 ### P0-1 🔴 Per-org socket directory — `multi-org`
+**DONE — verified in code 2026-07-27:** `socketPath` (manager.go) builds `<root>/run/<slug>/<slug>.sock`, per-org dir 0700 under a 0711 parent; hashed fallback same shape.
 The one **critical**. `spawn_linux.go:115` chowns the *shared* socket dir to each
 tenant's uid, so the last tenant to spawn owns the directory holding every other
 org's socket and can unlink-and-rebind one to intercept its traffic.
@@ -67,6 +74,7 @@ org's socket and can unlink-and-rebind one to intercept its traffic.
   dir is still root-owned. Must fail against current `HEAD`.
 
 ### P0-2 🟠 `davauth` checks `users.disabled` — `tinycld` (core)
+**DONE — verified in code 2026-07-27:** `davauth.Authenticate` rejects disabled users; `davauth_test.go` + `ratelimit_test.go` exist.
 Highest leverage in the review: one function closes CardDAV + CalDAV + WebDAV.
 `davauth.Authenticate` (`davauth.go:26-52`) validates the password and nothing
 else, so a suspended account keeps DAV access with email + password.
@@ -79,6 +87,7 @@ else, so a suspended account keeps DAV access with email + password.
   `/drive`.
 
 ### P0-3 🟠 WebDAV authorizes creates — `tinycld` (core)
+**DONE — verified in code 2026-07-27:** `filesystem.go` save-evaluate-rollback (`RunInTransaction` + `CanAccessRecord` against `CreateRule`) on PUT-new and MKCOL.
 `PUT`-of-new-file and `MKCOL` evaluate **no rule**, so `createRule` — the only
 place the disabled and guest clauses live for creates — is never read.
 
@@ -96,6 +105,7 @@ place the disabled and guest clauses live for creates — is never read.
   and MKCOL are both refused live.
 
 ### P0-4 🟠 Restore drive's guest-create clause — `drive`
+**DONE — verified in code 2026-07-27:** migration `1782100000_restore_guest_clause_and_settle_commentor.js`.
 `1782000000_exclude_disabled_from_drive.js:27` restated `createRule` and dropped
 the `@request.auth.role != "guest"` clause that `1781300000` added as an explicit
 security fix. Every fresh DB reopens the hole.
@@ -109,6 +119,7 @@ security fix. Every fresh DB reopens the hole.
   **shipped migration** rather than a test constant (see P3-1).
 
 ### P0-5 🟠 Settle `commentor` in one place — `drive` + `tinycld` (core)
+**DONE — verified in code 2026-07-27:** same migration settles the rules per D1 (commentor reads + comments, never edits); `driveshare.RoleCommentor` ranks readable.
 **D1 resolved: a commentor may read and comment, never edit.** Both halves of
 the divergence are wrong, so both change. Do them in one PR pair — fixing only
 one side leaves the contradiction, just pointing the other way.
@@ -139,6 +150,7 @@ one side leaves the contradiction, just pointing the other way.
   today's suite has **zero** commentor cases.
 
 ### P0-6 🟠 Admin disable rotates the token key — `tinycld` (core)
+**DONE — verified in code 2026-07-27:** `users_guard.go` calls `RefreshTokenKey()` on the admin disabled-flip path; self-disable path unchanged (`account_delete.go`).
 Self-disable rotates (`account_delete.go:151`); the admin path and the
 `adminEditableUserFields["disabled"]` record-update path do not, so an admin
 suspending a compromised account leaves every session live until JWT expiry.
@@ -156,26 +168,26 @@ suspending a compromised account leaves every session live until JWT expiry.
 
 Same class as Phase 0, lower reachability. Land immediately after.
 
-- [ ] **P1-1 🟡 Disabled clause on text + calc comments** — `text`, `calc`.
+- [x] **P1-1 🟡 Disabled clause on text + calc comments** **DONE — verified 2026-07-27:** migration `1782200000_comments_disabled_and_creator.js` in both repos. — `text`, `calc`.
   Neither `text_comments` nor `calc_comments` carries
   `@request.auth.disabled != true`, so a disabled user with surviving share rows
   can list, view **and create** comments via REST; the Go gate never runs for
   `/api/collections/*_comments`. New migration in each repo.
   **Done when:** deny-tests for all three verbs, each with a positive control.
-- [ ] **P1-2 🟡 `created_by` disjunct on those same rules** — `text`, `calc`.
+- [x] **P1-2 🟡 `created_by` disjunct on those same rules** **DONE — verified 2026-07-27:** same `1782200000` migration. — `text`, `calc`.
   Both omit the disjunct drive_items and `driveshare` honour, so an item creator
   with no share row can open and edit the doc but sees zero comments and cannot
   post one. Fold into P1-1's migration. Fix calc's comment claiming it mirrors
   drive_items while omitting it.
-- [ ] **P1-3 🟡 Disabled clause on `drive_item_versions` + `drive_share_links`** —
+- [x] **P1-3 🟡 Disabled clause on `drive_item_versions` + `drive_share_links`** **DONE — verified 2026-07-27:** covered by `1782100000` (versions + share_links rules restated with the disabled clause and creator disjunct). —
   `drive`. Versions carry restorable **file content** and their viewRule gates
   blob access; both were missed by `1782000000`. Versions rules also lack
   `created_by` and use the `role ?!= "viewer"` idiom (fix with P0-5).
-- [ ] **P1-4 🟡 Calendar's disabled gap** — `calendar`. No calendar rule anywhere
+- [x] **P1-4 🟡 Calendar's disabled gap** **DONE — verified 2026-07-27:** `tenant_rules_authz_test.go` asserts `@request.auth.disabled != true` on all three collections' five verbs, reading the shipped migrations. — `calendar`. No calendar rule anywhere
   carries the clause, and it owns *shared* content via memberships. P0-2 covers
   the CalDAV path; this covers REST. New migration adding the clause to
   calendars, events, and members.
-- [ ] **P1-5 🟠 Move calendar's member-authz gates into rules** — `calendar`.
+- [x] **P1-5 🟠 Move calendar's member-authz gates into rules** — `calendar`.
   **DONE 2026-07-27** (migration `1830000004` + a bootstrap pb-hook). But see
   `docs/FINDING-tenant-composition-gap.md`: this fix treats a symptom. The root
   cause was that `serve-org` bound none of CORE's guards either, so every
@@ -240,7 +252,7 @@ Same class as Phase 0, lower reachability. Land immediately after.
   engine with no hooks bound** (mirroring how a tenant runs), each failing
   against `HEAD`; whatever cannot be expressed is documented in the migration and
   in §6.
-- [ ] **P1-6 🟡 WebDAV write-verb existence masking** — `tinycld` (core).
+- [x] **P1-6 🟡 WebDAV write-verb existence masking** **DONE — verified 2026-07-27:** write verbs mask (`filesystem.go`: an entry the viewer may not read is invisible, not forbidden, on the write paths too). — `tinycld` (core).
   `RemoveAll`/`Rename` return 403 and `Mkdir`/`Rename` return `ErrExist` for
   invisible records, so DELETE/MOVE/MKCOL probes confirm another user's paths
   exist while reads correctly 404. Mask with `canRead`-then-`ErrNotExist` like
@@ -251,11 +263,11 @@ Same class as Phase 0, lower reachability. Land immediately after.
   Self-consistent today (owner-scoped collection) but a future contacts rule
   change silently would not apply. Add rule evaluation on both create and update,
   reusing P0-3's transaction helper.
-- [ ] **P1-8 ⚪ Store path traversal** — `multi-org`. Package names from a
+- [x] **P1-8 ⚪ Store path traversal** **DONE — verified 2026-07-27:** `store.validRef` rejects non-npm-shaped names/versions and `.`/`..` segments; `VersionDir` validates before pathing. — `multi-org`. Package names from a
   lockfile or publish body reach `filepath.Join` unvalidated
   (`lockfile.go:48` → `store.go:21`), so `"../../.."` escapes the store root.
   Superuser-only, hence low, but it is two lines: apply a `validSlug`-style regex.
-- [ ] **P1-9 ⚪ DAV auth hardening** — `tinycld` (core). Timing-distinguishable
+- [x] **P1-9 ⚪ DAV auth hardening** **DONE — verified 2026-07-27:** `davauth` rate-limits (`TooManyFailures`, refused before bcrypt) and burns a `dummyHash` compare on unknown users so they are not timing-distinguishable. — `tinycld` (core). Timing-distinguishable
   username enumeration (miss short-circuits before bcrypt) and **no rate limiting
   on any DAV path**, which makes online guessing viable. Compare against a dummy
   hash on the miss path; add a rate limit. Also: CardDAV re-runs bcrypt per
@@ -269,7 +281,7 @@ Same class as Phase 0, lower reachability. Land immediately after.
 User-visible breakage. No security exposure, so it follows Phase 1 — but each of
 these is live right now.
 
-- [ ] **P2-1 🟠 `/drive` route collision** — `tinycld` + `drive`. Hard navigation
+- [x] **P2-1 🟠 `/drive` route collision** **DONE — verified 2026-07-27:** drive's WebDAV moved to the reserved `/dav/drive` prefix (manifest + Go Source) and `isDavPath` no longer claims `/drive`. — `tinycld` + `drive`. Hard navigation
   (reload, pasted link) to `/drive`, `/drive/recent`, `/drive/<path>` reaches the
   Basic-Auth WebDAV mount and yields a browser auth popup; the SPA is
   unreachable. Literal routes beat the SPA catch-all. **Migration-created** —
@@ -280,7 +292,7 @@ these is live right now.
   can claim it.
   **Done when:** an e2e does a **hard reload** on `/drive` and lands in the app —
   today's specs navigate by SPA click and cannot catch this.
-- [ ] **P2-2 🟠 Bell notifications are dead app-wide** — `tinycld` (core).
+- [x] **P2-2 🟠 Bell notifications are dead app-wide** **DONE — verified 2026-07-27:** `NotifyContextSync` gates on `userId` only; its comment records this exact bug. — `tinycld` (core).
   `NotifyContextSync.tsx:13-20` gates on an `orgId` that `useOrgInfo()` now
   always returns as `''`, so the context is never set, every dispatch no-ops,
   **and each one fires `captureException('notify.bell.no_context')`** — Sentry
@@ -288,13 +300,16 @@ these is live right now.
   from `NotifyContext` and gate on `userId` alone. Rewrite `bell.test.ts:22`,
   which currently calls `setNotifyContext` directly and so certifies the bug.
   **Done when:** a test drives the real mount path, not a hand-set context.
-- [ ] **P2-3 🟠 Share links never redirect signed-in members** — `tinycld` (core)
+- [x] **P2-3 🟠 Share links never redirect signed-in members** **DONE — verified 2026-07-27:** `org_slug` deleted from `anon-identity.ts`; drive's `share-routing.ts` owns the member redirect without it. — `tinycld` (core)
   + `drive`. `ShareSession.orgSlug` is typed `string` but the server stopped
   sending `org_slug`, so the redirect gate is always falsy and members fall
   through to the public preview; the target is a dead `/a/` route anyway. Core:
   delete `orgSlug` from `ShareSession`/`SessionResponse` (its only consumer
   ignores it). Drive: gate on `item_id`, redirect to `/drive?file=…`.
-- [ ] **P2-4 🟠 Tenant `AppURL` is never set** — `multi-org`. Every org's
+- [ ] **P2-4 🟠 Tenant `AppURL` is never set** — `multi-org`. **More urgent
+  since 2026-07-27:** feature-Go linking means tenants now run mail's Go and
+  core's invite/password-reset mailers, so these emails can actually SEND once
+  an org has mail creds — carrying `http://localhost:8090` links. Every org's
   verification, password-reset and email-change links point at
   `http://localhost:8090`. Materialize the org's public URL from
   `MT_BASE_DOMAIN` + slug into `.runtime/`, and have `serve-org` set
@@ -333,13 +348,13 @@ these is live right now.
   `Event.Defaults`, persisting `visibility=""` that a later validated save
   rejects as a 500. Stop swallowing (`subscription.go:183,193,200` are all
   `_ = app.SaveNoValidate(…)`), scope the index per calendar, apply Defaults.
-- [ ] **P2-9 🟡 Audit-log Members filter** — `tinycld`. Filters
+- [x] **P2-9 🟡 Audit-log Members filter** **DONE — verified 2026-07-27:** `audit-log.tsx` filters `resource_type='users'`, matching the writer. — `tinycld`. Filters
   `resource_type = 'user_org'`; the writer stamps `"users"`. One-word fix.
 - [ ] **P2-10 🟡 Accept-invite shows "Welcome to "** — `tinycld`. Client expects
   `orgName`/`orgSlug` the handler no longer sends. Either send a deployment name
   or drop the interpolation. Tighten the e2e, which passes on a loose
   `/Welcome to/i`.
-- [ ] **P2-11 🟡 Takeout counts dropped records as imported** — `takeout`. The
+- [x] **P2-11 🟡 Takeout counts dropped records as imported** **DONE — verified 2026-07-27:** skip paths compensate with `{skipped: 1, imported: -1}` (`batch-inserter.ts`). — `takeout`. The
   two early-return skip paths don't compensate the `imported: 1`, so a failed
   parent calendar reports all its events as imported. Also: the `DocumentPicker`
   promise has no `.catch`, and dedup lookups treat any rejection as "not found"
@@ -368,7 +383,11 @@ these is live right now.
 silently until this lands. Work it immediately after Phase 2 — or in parallel by
 a second person, since it barely touches the same lines.
 
-- [ ] **P3-1 🟡 RLS suites must read the shipped migrations.** Seven suites
+- [ ] **P3-1 🟡 RLS suites must read the shipped migrations.**
+  **PARTIAL (verified 2026-07-27):** `core/rlstest` exists and calendar's
+  suites use it (`tenant_rules_authz_test.go` is the model); drive's
+  `guest_rls_test.go` and text/calc `comments_rls_test.go` still re-declare
+  their rule strings as constants. Seven suites
   assert rule strings re-declared as constants in the test file: drive
   `guest_rls_test.go` + `disabled_rls_test.go`, text/calc
   `comments_rls_test.go`, calendar `guest_rls_test.go` +
@@ -414,7 +433,7 @@ a second person, since it barely touches the same lines.
   package passes the whole suite. Current field names were hand-verified correct,
   so this is a guard gap, not live drift. Extend the field-name assertion to
   every mirrored collection.
-- [ ] **P3-6 🟡 `package-scripts` tests never run** — `tinycld`. 12 tests
+- [x] **P3-6 🟡 `package-scripts` tests never run** **DONE — verified 2026-07-27:** workspace `vitest.config.ts` globs `package-scripts/tests/**/*.test.{ts,tsx}`. — `tinycld`. 12 tests
   orphaned from every runner: the workspace-root vitest globs point at paths that
   no longer exist, so a root run collects 1 file and reports green. They pass
   when forced. Fix the globs and the stale `CORE_DIR` alias.
@@ -432,6 +451,11 @@ a second person, since it barely touches the same lines.
   vacuous; takeout's spec uses `page.goto` for in-app nav plus inline 10s–120s
   timeouts and a `[style*="width: 360"]` selector.
 - [ ] **P3-9 🟡 `TestConfinement_*` do not skip — they do not exist** —
+  **PARTIAL (verified 2026-07-27):** on Linux without root there is now a real
+  `t.Skip` (`confinement_linux_test.go:31`), and HANDOFF §4 documents the
+  darwin vacuous-pass honestly — but on darwin the tests are still not
+  compiled at all, so the remaining ask is a darwin-visible skip stub (or
+  P5-1's CI, which supersedes it). —
   `multi-org`. `//go:build linux` means `-run TestConfinement` prints "no tests
   to run" and exits 0 on darwin. Add a darwin stub file that **`t.Skip`s
   explicitly**, so the output tells the truth. (The real fix is Phase 5.)
@@ -487,7 +511,7 @@ Nothing here is a merge blocker. Grouped so one person can take a cluster.
   graceful shutdown never reaches grandchildren.
 
 *Isolation depth* — `multi-org`
-- [ ] **P4-9 🟡 `chownTree` never chmods**, so one org's `pb_data` stays
+- [x] **P4-9 🟡 `chownTree` never chmods** **DONE — verified 2026-07-27:** `chownTree` chmods 0600 files / 0700 dirs during the walk (`spawn_linux.go`)., so one org's `pb_data` stays
   mode-readable by other tenant uids — the `ATTACH DATABASE` read the boundary
   claims to close. Chmod dirs `0700` and files `0600` as you chown.
 - [ ] **P4-10 🟠 Namespaces are set unconditionally**, so on a **non-root Linux

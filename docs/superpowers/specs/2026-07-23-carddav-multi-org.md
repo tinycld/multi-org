@@ -14,7 +14,7 @@ The single-tenant pilot serves CardDAV from the core `carddav` capability,
 driven by the `contacts` package's `carddav` manifest block, over the one app DB.
 That path does not run in a multi-org **tenant**: tenants are **stock
 PocketBase** (`apis.BuildServeMux`) with only JS/TS hooks + migrations — no
-feature Go, so `coreserver.Register` (which mounts `/carddav`) never executes for
+feature package, so `coreserver.Register` (which mounts `/carddav`) never executes for
 a tenant.
 
 **Model decided:** *per-org, org-from-hostname.* `acme.tinycld.org/carddav`

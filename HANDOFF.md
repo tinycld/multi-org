@@ -1,12 +1,22 @@
 # Handoff — Multi-Org PocketBase Router
 
-**Updated:** 2026-07-25
+**Updated:** 2026-07-26
 **Goal:** one router hosts many organizations — each org its own **OS process**,
 SQLite DB, client bundle, and server-side JS, sharing versioned code on disk but
 isolated at the kernel boundary.
 
 This is a working brief, not a changelog. Full narrative history is in the git
 log of this file and of the four repos.
+
+> **A full pre-merge review ran on 2026-07-26** across the router, core (Go +
+> TS), the app shell and all seven features. Every build/vet/test/lint gate is
+> **green in every repo** — and the review still found a critical socket-hijack
+> hole, four HIGH security findings and a live-broken feature, none of which any
+> suite catches. **Read §7 before merging.** The pattern worth internalizing:
+> the green suite is not evidence, because in nearly every case the test that
+> should have failed was asserting its own fixture.
+> The remediation is planned in **`REMEDIATION-PLAN.md`** (64 items, 7 phases;
+> phases 0–3 gate the merge).
 
 ---
 
@@ -35,10 +45,26 @@ duplication. `driveshare` is the newest: the one definition of "may this user
 read / write / delete this drive_item", shared by drive, text and calc, and the
 Go mirror of the `drive_items` collection rules.
 
-Under isolation this splits cleanly: **feature Go stays out of tenants**, but
-*core* libraries can link into `serve-org` (it is the trusted core process for
-that org). CardDAV and WebDAV do exactly this — driven by declarative config the
-router materializes, never by feature code with full `$app` reach.
+**The rule that decides where code goes is about PORTS, not about Go.**
+
+> **A service that must BIND A PORT moves into core, so the multi-org router
+> can open the port.** Everything else is a normal engineering choice:
+> performance-sensitive work stays in Go, and TS/JS hooks are the customization
+> seam on top.
+
+A tenant serves on a unix socket the router hands it (`serve-org --socket`),
+and the router owns the listening sockets for every org. A feature that wanted
+its own listener would need a port the router did not open and cannot route —
+which is why CardDAV, CalDAV and WebDAV became core libraries fed by
+declarative config the router materializes. It is not that their Go was
+untrusted; it is that they listen.
+
+Nothing about this makes feature Go *forbidden* in a tenant. `serve-org` links
+no feature package **today** — its `main` has no `packages/*` import and the
+generator emits `package_extensions.go` into the app server only — so any
+enforcement that lives solely in a feature's request hooks is absent from a
+tenant right now. That is a fact about the current build wiring to design
+against (see §7 / calendar), not a principle forbidding it.
 
 **All seven features are migrated: `contacts` (simplest template), `mail`
 (richest), `drive` (the protocol lift + the Go→TS hook seam), `text` + `calc`
@@ -89,13 +115,16 @@ Original brief: `docs/superpowers/specs/FOLLOWUP-os-process-isolation.md`
 
 | Repo | Branch | Notes |
 |---|---|---|
-| `~/code/tinycld/pocketbase` | `feat/multitenant-fork` | **Must stay checked out here** — the router's `replace ../pocketbase` needs both seams + sobek |
-| `~/code/tinycld/multi-org` | `multi-org` | The router. No remote. |
+| `~/code/tinycld/pocketbase` | `feat/multitenant-fork` | The fork's own checkout. **The router no longer builds it** — `go.mod:11` replaces to `../tinycld/third_party/pocketbase` (a vendored copy, commit `a37c8ac`; Go sources byte-identical, `ui/` stripped). Keep this checkout for fork development and upstreaming; edits here reach the router only once vendored. |
+| `~/code/tinycld/multi-org` | `multi-org` | The router. `origin` = `github.com/tinycld/multi-org`, pushed. |
 | `~/code/tinycld/tinycld` | `multi-org` | App shell + `@tinycld/core` (nested at `tinycld/core`) |
 | `~/code/tinycld/{contacts,mail,drive,text,calc,calendar,google-takeout-import}` | `multi-org` | Migrated features (all seven) |
 
-Nothing is pushed. `multi-org/` and `pocketbase/` are gitignored by the parent
-and are **not** pnpm members.
+**All nine repos have remotes under `github.com/tinycld/`, and `multi-org` is
+pushed** (`origin/multi-org`, 0 ahead / 0 behind as of 2026-07-26) — an earlier
+revision of this file said "no remote, nothing is pushed", which is no longer
+true and had been read as blocking Linux CI. `multi-org/` and `pocketbase/` are
+gitignored by the parent and are **not** pnpm members.
 
 **Workspace is core + all seven features** (contacts, mail, drive, text, calc,
 calendar, google-takeout-import). Only `share-stub`/`shortcut-stub` remain parked
@@ -351,7 +380,9 @@ go test ./internal/controlplane/ -run TestIntegration_MultiOrgCardDAV -v
 go test ./internal/orgmanager/ -run TestTenant -v
 
 # The confinement tests — the ones that actually prove the boundary — are
-# Linux+root only and SKIP everywhere else. Cross-compile at minimum:
+# `//go:build linux`, so on darwin they are NOT COMPILED: `-run TestConfinement`
+# prints "no tests to run" and exits 0. That is a vacuous pass, not a skip.
+# Cross-compile at minimum:
 GOOS=linux go build ./... && GOOS=linux go test -c -o /dev/null ./internal/orgmanager/
 sudo go test ./internal/orgmanager/ -run TestConfinement -v   # on a Linux host
 
@@ -453,7 +484,10 @@ matches:
 **Blocking / security**
 - **Linux CI for `TestConfinement_*`** (§1). Per-process isolation has shipped,
   but the tests that prove it need Linux + root and never run today. Until they
-  do, the boundary is verified by construction only. This is now the top item.
+  do, the boundary is verified by construction only. **§7 found the construction
+  itself is wrong** (the shared socket dir is chowned to each tenant — §7.1), so
+  fix that first; and note two of these tests are vacuous even on Linux (§7.4),
+  so standing up CI without repairing them buys less than it appears.
 - **Provision-time migrations still run in the control-plane process**
   (`bootstrapTenantOnce`). Move to a one-shot isolated `serve-org` invocation.
 - **Resource limits.** `MT_CGROUP_ROOT` creates a per-tenant cgroup but writes no
@@ -508,7 +542,9 @@ matches:
   control plane, which shares the router's process. Tenants use stock
   `apis.Serve` with `ServeEvent.Listener` (upstream, no fork needed).
 - Push the 7 `chore/bump-pocketbase-v0.39.8` branches, or fold into a release.
-- Give `multi-org` a remote if it should be shared/CI'd.
+- ~~Give `multi-org` a remote if it should be shared/CI'd.~~ **DONE** — `origin`
+  is `github.com/tinycld/multi-org` and the branch is pushed. Linux CI (§7,
+  P5-1) is unblocked.
 
 **Cleanup (non-blocking)**
 
@@ -625,14 +661,15 @@ Admin re-enable restores all of it.
 - **Mail delivery to a disabled user's mailbox** is unaddressed — bounce,
   silently accept, or hold? The account can't sign in, but SMTP doesn't consult
   `disabled`.
-- **Other packages' collection rules.** Audited, and the gap is small: drive was
-  the one that mattered (it owns shared content). `contacts.listRule` is
-  `owner = @request.auth.id` and mail's message rules are `user ?= @request.auth.id`,
-  so a disabled user reaches only their OWN rows there, never anyone else's.
-  The single genuinely-open rule is `mail_mailbox_aliases.listRule`
-  (`@request.auth.id != ""`, migration 1713000014) — alias metadata rather than
-  message content, so low severity, but it should get the same
-  `@request.auth.disabled != true` clause for consistency.
+- **Other packages' collection rules.** ⚠️ **This audit was incomplete — see
+  §7.** It correctly found `contacts.listRule` and mail's message rules to be
+  own-rows-only, and correctly flagged `mail_mailbox_aliases.listRule`. But it
+  missed: **text and calc comments** (both list/view/**create**, on *shared*
+  content — §7.4), **calendar entirely** (no rule anywhere carries the clause,
+  and it owns shared content via memberships — §7.2), **drive_item_versions and
+  drive_share_links** (§7.4), and, most importantly, that **DAV Basic-Auth never
+  consults `disabled` at all** (§7.2), which is a third authentication path
+  outside the "two gates" model this section describes.
 
 - **`core/server/userorg/`** is still named for the junction it no longer uses.
 
@@ -652,7 +689,552 @@ Admin re-enable restores all of it.
 
 ---
 
-## 7. Design docs
+## 7. Final review (2026-07-26)
+
+A pre-merge review of the router, core (Go + TS), the app shell, and all seven
+features. Nine parallel reviewers each ran their scope's real gates and read
+against the **shipped** migrations rather than the tests' idea of them.
+
+**Every gate is green in every repo** (§7.7). That is the headline finding, not
+a reassurance: a critical socket-hijack hole, four HIGH security findings and
+several live-broken features all sit under a fully green suite. In nearly every
+case the test that should have caught it **asserts a constant the test file
+itself declares** — the self-validating-fixture trap §3.6 already names for
+mail's `guest_rls_test.go`, now found in drive, text, calc, calendar, core and
+the router. Drive's finding #1 below is the proof: a rule regressed, and the
+RLS suite stayed green because it mirrors the pre-drift rule.
+
+Severity is by **impact if merged as-is**. `[V]` = reviewer read/ran and
+confirmed; `[S]` = strong code-reading inference, not executed. Items already in
+§6 are not repeated unless this pass found them **inaccurate or worse**.
+
+> **→ `REMEDIATION-PLAN.md`** turns everything below into 64 checkable items
+> across 7 phases, with the three product decisions that block coding called out
+> up front. Phases 0–3 are the merge gate. This section is the evidence; that
+> file is the work.
+
+### 7.1 🔴 Critical — do not merge before fixing
+
+- **[V] Any tenant can hijack every other tenant's socket and receive its
+  traffic.** `orgmanager/spawn_linux.go:115` chowns `filepath.Dir(req.SocketPath)`
+  to the spawning tenant's uid — but that directory is **shared by all orgs**
+  (`<root>/run`, or the hashed `/tmp/mt-<hash>` fallback; `manager.go:349,366`).
+  After tenant B spawns, uid(B) owns the 0700 dir holding `acme.sock`, so it can
+  `unlink` it and bind its own listener; the root router then proxies acme's
+  traffic — `Authorization` headers and session tokens included — into tenant B.
+  Nothing hides the dir: only `PackagesDir` is bind-mounted. *(Independently
+  re-verified while writing this doc.)* **Fix:** per-org socket directory
+  (`<root>/run/<slug>/`), chown only that.
+  → This is the isolation model's core claim. It fails on the very host type
+  §1's boundary argument is about.
+
+### 7.2 🟠 High — security
+
+- **[V] WebDAV `PUT`-of-a-new-file and `MKCOL` evaluate no rule at all.**
+  `core/webdav/filesystem.go:263-345`, `file.go:186-205`. `ruleFor()` has only
+  List/View/Update/Delete arms; `persistWrite` authorizes only when
+  `f.existing != nil`; `Mkdir` goes straight to `NewRecord` + `Save`. This is the
+  same "`CanAccessRecord` cannot authorize a CREATE" problem §3.7 records for
+  CalDAV — **CalDAV solved it** with save-in-transaction-evaluate-rollback
+  (`caldav/backend.go:345-367`); WebDAV was never updated, so it resolves the
+  problem by skipping the check. Consequence: **a disabled user can still create
+  folders and upload files over WebDAV**, because the disabled clause on create
+  lives only in the `createRule` this path never reads. Reads/updates/deletes
+  *are* gated, which is exactly why §6's live verification passed.
+  **Test blind spot:** both fixtures in `filesystem_test.go:143-176` set a
+  permissive `CreateRule`, and the comment claims the tests would go red — true
+  for four of five rules.
+- **[V] DAV Basic-Auth never checks `users.disabled` — a third auth path nobody
+  audited.** `core/davauth/davauth.go:26-52` resolves the user and calls
+  `ValidatePassword`, nothing more. `disabled_guard.go` binds PB's *token*
+  hooks, which a Basic-Auth request never traverses, and token-key rotation is
+  irrelevant to it. So a suspended account keeps **CardDAV** (no PB rules at
+  all — only owner scoping) and **CalDAV** (calendar ships no disabled clause)
+  access with email + password. §6's "two gates, both required" is therefore
+  incomplete: there is a third door, and `davauth` **has no test file at all**.
+  Two reviewers found this independently. **Fix here covers all three DAV
+  protocols at once** — the highest-leverage single fix in this review.
+- **[V] Drive's disabled-clause migration silently reopened the guest-create
+  hole.** `drive/pb-migrations/1782000000_exclude_disabled_from_drive.js:27`
+  *restates* `drive_items.createRule` as
+  `@request.auth.id != "" && @request.auth.disabled != true`, dropping the
+  `@request.auth.role != "guest"` clause that `1781300000` had installed as an
+  explicit security fix. Every fresh DB reopens it; OTP guests hold real auth
+  tokens and there is no Go backstop. Its own comment cites the wrong
+  predecessor ("appended to 1716200001"). The RLS suite stayed green because its
+  constants mirror the pre-drift rule — **the live proof of the fixture trap.**
+- **[V] The `commentor` role diverges between the two halves of the "one
+  definition", in opposite directions.** Added by `1781100000`, written for real
+  by the OTP flow (`endpoints_share_otp_test.go:488`).
+  - *PB rules over-grant:* `canEdit` uses `role ?!= "viewer"`, so a commentor can
+    rename/replace a shared item via REST `PATCH` and WebDAV PUT-overwrite/MOVE
+    — contradicting `1781100000`'s own contract ("can read and comment … cannot
+    edit it"). Privilege escalation.
+  - *Go under-grants:* `driveshare.rank()` has no `commentor`, returns 0, so
+    `ResolveRoleForItem` → `ErrNoAccess` denies a commentor **even read** on
+    every driveshare-gated path (download tokens, text/calc render + realtime
+    admission). The pre-lift predicate admitted them, so commit `5307491`'s
+    message ("aligns the Go with the collection rules") is false for this role —
+    the lift **regressed** commentor read.
+  - Net user-visible absurdity: **a signed-in commentor has strictly less access
+    than an anonymous visitor on the same share link** (`authorizeAnonShare`
+    accepts `sharelink.RoleCommentor`). Zero commentor test cases anywhere.
+
+### 7.3 🟠 High — correctness / live-broken features
+
+- **[V] An org is permanently 502'd after Evict-then-traffic (the Deploy path).**
+  `orgmanager/instance.go:159` unconditionally `os.Remove(i.sockPath)` after
+  drain(10s)+kill(5s). `socketPath(slug)` is deterministic, so a `Get` inside
+  that window spawns a replacement that clears the stale file and binds the
+  *same* path — and up to 15s later the old teardown deletes the **new** child's
+  socket. Every dial then ENOENTs → 502, while the supervisor still considers the
+  instance healthy, so nothing respawns it until the 30-minute idle sweep. No
+  test covers traffic after an Evict. *(Independently re-verified.)*
+- **[V] In-app bell notifications are dead app-wide.**
+  `core/components/NotifyContextSync.tsx:13-20` gates on
+  `if (!userId || !orgId) return`, but `useOrgInfo()` now returns `orgId: ''`
+  unconditionally — so the context is never set, `bellChannel.dispatch` no-ops,
+  **and it fires `captureException('notify.bell.no_context')` on every dispatch**
+  (Sentry noise on a dead path). Takeout import completion/failure never produces
+  a notification row. The unit suite certifies the bug: `bell.test.ts:22` calls
+  `setNotifyContext` directly, bypassing the dead sync. This makes §6's
+  "`useOrgInfo()` returns `org: null`" **worse than described** — it is not just
+  missing branding, it silently killed a feature. Fix: drop `orgId` from
+  `NotifyContext`, gate on `userId`.
+- **[V] Share links never redirect signed-in members into the workspace.**
+  `core/lib/anon-identity.ts:42,72` types `ShareSession.orgSlug` as `string`, but
+  the server stopped sending `org_slug` (`drive/server/endpoints_share_session.go:60-71`,
+  `endpoints_public_share.go:156-168` — their comments say "there is no slug").
+  `drive/…/public-screens/share/[token].tsx:65-72` gates the member redirect on
+  `data?.org_slug`, always falsy, so members fall through to the public preview;
+  the redirect target is a dead `/a/` route anyway. Fix core (delete the field —
+  its only consumer ignores it) and drive (gate on `item_id` → `/drive?file=…`).
+- **[V] Every org's auth emails carry dead links.** Nothing sets a tenant's
+  `Settings().Meta.AppURL` (`grep AppURL` in the router → zero hits), so PB's
+  default `http://localhost:8090` interpolates into `{APP_URL}` for
+  verification, password-reset and email-change templates. The router knows
+  `MT_BASE_DOMAIN` and the slug but materializes only carddav/caldav/webdav/quota.
+- **[V] Hard navigation to `/drive` hits the WebDAV mount, not the app.** The
+  de-slugged SPA routes (`app/(app)/drive/…`) now collide with
+  `webDAVSource.Prefix = "/drive"`, whose literal `Router.Any("/drive")` +
+  `Any("/drive/{path...}")` beat the SPA catch-all. `davauth` accepts only Basic,
+  so a reload or a pasted link yields 401 + a native Basic-Auth popup. The dev
+  proxy collides independently (`scripts/dev.ts:555`; its comment at :545 still
+  claims `/a` ownership). **Migration-created** — `/a/<org>/drive` never
+  collided. Invisible to e2e because every spec navigates by SPA click.
+- **[S] Non-root Linux hosts can't spawn any tenant at all.**
+  `spawn_linux.go:101` sets `CLONE_NEWNS|CLONE_NEWPID` unconditionally; both need
+  `CAP_SYS_ADMIN`. The uid/chown block *is* gated on `UIDBase > 0`, the namespace
+  block is not — so `NewSpawner`'s "Tenants are NOT confined" warning promises a
+  degraded-but-working mode that instead fails every spawn with
+  `operation not permitted` → every org 503s.
+- **[V] mail's "Add domain" writes a field that does not exist, and the type
+  system endorses it.** `settings/provider.tsx:552` inserts `org: orgId` into
+  `mail_domains` — no migration defines that field (all 24 checked; generated
+  `pbSchema.ts:210-224` agrees), and `orgId` is always `''`. It compiles because
+  the package-local mirror `types.ts:29` declares `org: string`, which also feeds
+  `MailSchema`, so `org` looks filterable on every `mail_domains` query — the
+  §3.2 compiler-blind class, now in a *mirrored client schema*. Go test fixtures
+  carry the same phantom field (`imap_fetcher_test.go:148-149`,
+  `aliases_test.go:40,205`), so a future `org`-filtered query would pass in tests
+  and return zero rows live. Dead scaffolding to remove with it:
+  `provider.tsx:38,50,86,124,530`.
+- **[V] Commit `4d52992` (username-derived mailbox addresses) is unguarded and
+  half-applied.** `deriveMailboxAddress` (`server/lifecycle.go:123-148`) — the
+  sole producer of primary mailbox addresses — has **no unit test at all**, and
+  its edge cases are live: the numeric-suffix loop caps at `i<=99` and returns
+  `""`, which `handleUserCreated:32-36` turns into "log a warning and create no
+  mailbox" (the 100th `bob` silently gets no mail); a unicode username sanitizes
+  to `""` and does the same. Meanwhile `seed.ts:1663-1670,1729` still derives the
+  address from the **email** local-part — the TS mirror of the exact bug the
+  commit fixed in Go — so seeded dev/e2e users get a different address than the
+  server would provision. Help contradicts the change too
+  (`help/mailboxes.md:10` still says "derived from your account email").
+- **[S] calendar's member-authz enforcement lives in Go that a tenant never
+  runs.** `calendar_members` `createRule` is `@request.auth.id != ""` and
+  `updateRule` admits `user = @request.auth.id`; the real gates (owner-only
+  create, self-promote/repoint guard, last-owner guard) are request hooks in
+  `server/register.go:257-362` — **feature Go, which `serve-org` does not link
+  today**. A
+  tenant serves stock PB REST with those rules, so any authenticated tenant user
+  could `POST calendar_members {calendar: <any>, user: self, role: "owner"}` and
+  take any calendar, including over the tenant's CalDAV. Single-tenant is safe
+  (hooks run; proven by `calendar_members_authz_test.go`). The relaxation was
+  forced by a real PB back-relation bug, but this is exactly the
+  **"never put an enforcement boundary in Go"** rule §3.5 exists to prevent, and
+  the tenant consequence is nowhere flagged.
+
+### 7.4 🟡 Medium
+
+*Isolation / router*
+- **[V] `chownTree` never chmods, so one org's `pb_data` stays mode-readable by
+  other tenant uids** (`spawn_linux.go:110`). Org dirs are 0755
+  (`provisioning.go:65`), PB creates `pb_data` 0755 and SQLite files 0644; the
+  only `Chmod` in the repo is the socket. That is the `ATTACH DATABASE` read the
+  boundary claims to close. End-to-end exploit `[S]` (depends on WAL `-shm`
+  access); the missing mode restriction is unambiguous.
+- **[V] A single failed spawn counts as two crashes** (`manager.go:243` +
+  `:455`), so backoff starts at 2s instead of the documented 1s, and a child the
+  host itself killed is logged at Error as "exited unexpectedly".
+- **[V] The child gets a 10s drain budget it can never use** — the parent
+  SIGKILLs 5s after SIGTERM (`manager.go:300` vs `:42-46`).
+- **[V] `Deploy` re-materializes the *running* tenant's `pb_public`/`pb_hooks`
+  before evicting it** (`provisioning.go:134`; `Materialize` does RemoveAll +
+  recreate), so the live tenant 404s on static assets during that window and the
+  whole drain. Evict-first, or materialize to a temp dir and rename.
+- **[V] A `webdav` manifest block with no `prefix` mounts a site-wide catch-all
+  or panics** (`cmd/serve-org/main.go:186-191`). CalDAV has
+  `defaultCalDAVPrefix` and two tests for exactly this reason; `WebDAVSources`
+  copies the prefix verbatim with no default or validation.
+- **[V] The proxy drops the client IP twice over.** `SetXForwarded()` in Rewrite
+  mode discards the inbound XFF chain and forces `X-Forwarded-Proto: http`
+  (`instance.go:78`) — wrong under the documented default `MT_TLS_MODE=proxy`;
+  and over a unix socket `RemoteAddr` is empty with no `TrustedProxy` header
+  materialized, so PB's per-IP rate limiting collapses to one bucket
+  (`instance.go:58-70`).
+- **[V] `evalManifest` runs untrusted package JS with no interrupt or timeout**
+  (`controlplane/manifest.go:70-85`): `while(true){}` in a `manifest.ts` hangs
+  the `POST /api/store/packages` goroutine unrecoverably. Superuser-gated. The
+  comment's "pure object literal" is an assumption about input, not an enforced
+  property.
+
+*Authorization / data*
+- **[V] Neither comments collection carries the disabled clause.**
+  `text/pb-migrations/1720000000:~78-84` and `calc/…/1719000000:93-100` — a
+  disabled user with surviving share rows can still list, view **and create**
+  comments via REST; the Go gate never runs for `/api/collections/*_comments`.
+  §6's audit concluded the only open rule was `mail_mailbox_aliases`; it missed
+  both, and comment bodies are content, not metadata.
+- **[V] Same two migrations omit the `created_by` disjunct** that drive_items and
+  `driveshare` honor, so an item creator with no share row can open and edit the
+  doc but sees zero comments and cannot post one. calc's migration comment claims
+  "Mirror drive_items access" while omitting it.
+- **[V] drive's disabled clause reached only three collections.**
+  `drive_item_versions` (restorable **file content**; its viewRule gates blob
+  access) and `drive_share_links` have none, and the versions rules also lack
+  `created_by` and use `role ?!= "viewer"` (commentor can write versions — the
+  same class as §7.2). Masked today only by token rotation, i.e. the single-gate
+  reliance `1782000000`'s own comment forbids.
+- **[V] WebDAV existence-masking is read-side only** (`filesystem.go:364,395,324,399`):
+  `RemoveAll`/`Rename` return 403 and `Mkdir`/`Rename` return `ErrExist` for
+  records the caller cannot see, so DELETE/MOVE/MKCOL probes confirm another
+  user's paths exist while `Stat`/read carefully answer 404.
+- **[V] `carddav.PutAddressObject` evaluates no PB rule on any path**
+  (`backend.go:152-196`) — self-consistent for an owner-scoped collection today,
+  but a future contacts rule change (say, the disabled clause) would silently not
+  apply to CardDAV.
+- **[S] calendar subscription sync swallows every error and can silently empty a
+  second subscription** (`subscription.go:183,193,200`): `_ = app.SaveNoValidate(…)`
+  throughout, while migration `1715100000`'s unique `ical_uid` index is **global**
+  though the contract (`source.go:95`) is per-calendar — two calendars on one feed
+  means the second's inserts are discarded and the sync still reports success. The
+  create path also skips `Event.Defaults`, persisting `visibility=""` that a later
+  validated save rejects as a 500.
+- **[S] Setting a `subscription_url` on a populated calendar deletes all its
+  events** (`subscription.go:197-202`) — sync deletes every event whose `ical_uid`
+  isn't in the feed, and UI-created events all have generated UIDs. No
+  confirmation, no error.
+- **[S] calendar's member list/delete rules are self-only**
+  (`1715000000:265-271`), so the "Shared with" UI cannot list or remove other
+  members. Faithful translation of main's semantics, not a de-org regression —
+  but the e2e conspicuously only ever asserts the owner's own row.
+- **[V] The audit-log "Members" filter can never match** — it filters
+  `resource_type = 'user_org'` (`app/(app)/settings/audit-log.tsx:29`) while the
+  writer stamps `"users"` (`users_guard.go:82`).
+- **[V] Accept-invite renders "Welcome to " with an empty name** — the client
+  still expects `orgName`/`orgSlug` the Go handler no longer sends
+  (`invite.go:278-280`). e2e passes on a loose `/Welcome to/i`.
+- **[V] Admin-initiated disable never rotates the token key**
+  (`account_delete.go:159-188`, `users_guard.go:41-47`), so an admin suspending a
+  compromised account leaves every existing session live until JWT expiry —
+  while *self*-disable is immediate. §6 documents the trade-off for self-disable
+  only.
+- **[V] Takeout counts dropped records as imported.**
+  `batch-inserter.ts:185,348` — the `if (!calendarId) return` / `if (!mailboxId)
+  return` skip paths don't compensate the `imported: 1` that `insertRecords:72`
+  adds, so a failed parent calendar silently reports all its events as imported.
+- **[V] The demo reset leaks `realtime_doc_updates` forever**
+  (`scripts/reset-demo.ts:62-76`): the row has no FK (text `room_id`), nothing
+  cascades, and per-room truncation never fires for a deleted room.
+- **[V] A failed mail search is indistinguishable from an empty inbox — on both
+  sides.** `endpoints_search.go:298-301,388-392` turns a SQL error into
+  `HTTP 200 {"items":[],"total":0}` after a `Warn`; `useMailSearch.ts:125` sets a
+  local `error` that **no consumer reads** and never captures. This is precisely
+  the mechanism that let §3.2's `ts.user_org` bug present as a silent
+  `{"total":0}`. The field itself is now correct (`ts.user`), but the swallow
+  that hid it is untouched, and no test covers `buildFolderJoin`'s SQL against a
+  real schema — so the same class of bug would hide again identically.
+- **[V] mail's five-query JS-stitched join.** `settings/mailboxes.tsx:37-143`
+  opens five unfiltered whole-collection live queries and hand-joins them across
+  four `Map`s, though every relation is already declared in
+  `collections.ts:21-36`. Same shape in `hooks/useMailboxes.ts:25-38` and
+  `useSendableIdentities.ts:14-26`. Against CLAUDE.md's "one query with `.join()`,
+  don't stitch with JS `Map`s".
+- **[V] mail swallows several user-visible failures.** `EmailBody.tsx:41`
+  (`.catch(() => setHtml(''))` — a failed body fetch renders as an empty email);
+  `useSaveDraft.ts:52-54` (no `captureException`, unlike its `useSendEmail`
+  sibling); `useAttachments.ts:53-62` (toasts, never captures);
+  `useMailBulkActions.ts` (no `onError` at all, so a bulk action failing across
+  N threads is entirely silent).
+- **[V] IMAP multi-term BODY search silently ORs.** `imap_session.go:312-321` —
+  both arms of the "intersect for subsequent terms" if/else are byte-identical,
+  so `SEARCH BODY "a" BODY "b"` returns messages matching *either*, against the
+  comment's promise of AND.
+
+*Tests that cannot fail* — each `[V]`, and each one guards something this review
+found broken or would need to catch:
+- `webdav/filesystem_test.go:143-176` — permissive `CreateRule` in both fixtures
+  (masks §7.2's create hole).
+- drive `guest_rls_test.go` / `disabled_rls_test.go`, text/calc
+  `comments_rls_test.go:273-291`, calendar `guest_rls_test.go:37` +
+  `calendar_members_authz_test.go:38`, core `coreserver/guest_rls_test.go:33-37`,
+  core `caldav/backend_test.go:53-58` — all assert rule strings **re-declared as
+  constants in the test file**, never the shipped migration. All currently match
+  byte-for-byte (each was diffed), so these are drift tripwires that don't trip —
+  and drive's already didn't.
+  **mail is the exception and the model to copy:** its `guest_rls_test.go`
+  constants are byte-identical to the shipped migrations *and* every deny-test
+  has a paired positive control, so neutering the guard turns the deny-tests red
+  while the controls stay green. That is §3.6 applied correctly. Port that shape
+  to the other six.
+- router `tenant_e2e_test.go:201` (`TestTenant_DoesNotInheritHostSecrets`) — the
+  hook reads `process.env`, which the fork's `scrubProcess` empties on every
+  sandboxed VM; swapping `cmd.Env` for `os.Environ()` would leave it green. The
+  real check is the never-run `TestConfinement_ChildEnvironmentHoldsNoHostSecrets`.
+- router `confinement_linux_test.go:152-175` (`…PackageStoreIsReadOnly`) — writes
+  to `/tmp`, not the package store, and `$os` is withheld by the sandbox anyway,
+  so deleting `confinePackages` entirely wouldn't turn it red.
+- router `manifest_test.go:203,469,488` — `reflect.DeepEqual` round-trips built
+  from the same mirrors, so a field missing from **all three** definitions
+  compares equal (zero == zero) and the tenant silently loses the config.
+- router `carddav_integration_test.go:125,134` — the cross-org "leak" assertion
+  cannot fail (separate DBs, separate processes, Bob only ever inserted into one).
+- router `integration_test.go:193` — asserts only `err != nil`, so a filename
+  typo keeps it green with `Sandboxed` removed.
+- **mail `endpoints_inbound_test.go:129,189,200-209` — the sharpest instance in
+  the review.** The shared inbound fixture declares
+  `mail_mailbox_members.user_org` and `mail_thread_state.user_org`; production
+  reads `member.GetString("user")` and writes `Set("user", userID)`, and the
+  shipped migration names both fields `user`. So the tests build a schema that
+  does not exist, and `TestHandleInbound_KnownRecipientStoresMessage` /
+  `_IdempotentRetry` **pass while thread state is written keyed to `""`** — i.e.
+  they would stay green through a total failure to deliver mail to the
+  recipient. The reviewer ran both verbosely to confirm. The fixture is shared by
+  `imap_fetcher_test.go` and `smtp_inbound_server_test.go`. This is §3.7's
+  takeout lesson verbatim: *a package that mirrors a schema needs a test that
+  asserts the field NAME, or its suite certifies the bug.*
+- **mail's folder counts: 13 tests guard a function the app no longer calls.**
+  `computeMailboxFolderCounts.test.ts` + `unifiedInbox.test.ts:67-120` cover a
+  helper that survives only as a re-export; the real counts come from the
+  `mail_folder_counts` view (`useMailboxFolderCounts.ts:23-52`), which has **zero
+  coverage** — not its column names, not `eq(counts.user, userId)`, not the
+  realtime bridge. The sidebar could break entirely with every test green.
+  Structural cause: **no vitest file in mail mounts a hook**, so no live-query
+  shape in the package is tested at all. Also `mailListHelpers.test.ts:132-168` —
+  three `as any` stubs carry 5 of 8 fields, so a field rename stays green, and
+  the cast is load-bearing.
+- takeout — the mirrored-schema field-name guard covers **one** of nine-plus
+  foreign collections; every other write is `pb`-mocked. (Current field names
+  were hand-verified against the owning repos' migrations: no live drift.)
+- `package-scripts/tests/*` (3 files, 12 tests) — **orphaned from every runner**;
+  the workspace-root vitest globs point at paths that no longer exist, so a root
+  run collects 1 file and reports green. They pass when forced.
+- **`TestConfinement_*` do not skip on darwin — they don't exist.** The file is
+  `//go:build linux`, so `-run TestConfinement` prints "no tests to run" and
+  exits 0. README:164 and §4 both describe a `t.Skip` that never executes.
+
+### 7.5 ⚪ Low / cleanup
+
+- **Docs that now mislead.** `~/code/tinycld/CLAUDE.md` and
+  `tinycld/CONTRIBUTING.md` still teach the multi-org contract: the `user_org`
+  junction, `/a/<orgSlug>` routes, `getRoleForOrg`, and `OrgScope` as
+  `{orgId, userOrgId, orgSlug}` (shipped: `{userId}`). CLAUDE.md:115 cites
+  `OrganizationsTab.tsx` as the reference joined-query example — it is now a
+  static stub with no query. `docs/packages.md` has the same drift.
+- **This file.** §2/§5.4 say the fork "must stay checked out" at
+  `~/code/tinycld/pocketbase` for the `replace ../pocketbase` — `go.mod:11`
+  actually resolves `../tinycld/third_party/pocketbase` (commit `a37c8ac`); the
+  router no longer builds that checkout at all. §5.6 claims the two esbuild call
+  sites are "kept in sync by a golden test" — **no such test exists** (both sides
+  assert properties independently, no shared fixture). They *are* in sync today
+  (same loader/target/sourcemap, both pin esbuild v0.28.1). §4's confinement-skip
+  claim is wrong per above.
+- **Router README:** the diagram claims each tenant gets a "netns" — there is no
+  network namespace anywhere (`CLONE_NEWNET` appears nowhere); reserved
+  subdomains are listed as open but are fixed at `provisioning.go:41`;
+  `davconfig`/`serve-org` are still described as CardDAV-only.
+- **User-facing help still teaches multi-org.** `core/help/organizations.md` is
+  entirely about the deleted org switcher and `/a/<slug>` paths, and names roles
+  ("admin / clerical / workforce") that match neither the shipped
+  `owner/admin/member/guest` nor anything else in the tree; it is linked from
+  `getting-started.md:24`. `core/help/super-admins.md:11-13` advertises org
+  management; `help/account-settings.md` has **no coverage of the new
+  disable/delete flows**, so by the project's own standard the account-lifecycle
+  feature isn't done. contacts' `help/carddav.md:26` documents a per-org book at
+  `/carddav/u/ab/<orgSlug>/` (actual: `/carddav/u/ab/default/`). mail's
+  `help/provider-setup.md:90,94-102` documents provider config stored at
+  `(app='mail', org=<orgId>)` plus an entire "Per-org fallback" section — all
+  deleted storage, contradicted by `register.go:59-61` ("the provider is
+  deployment-wide") — and `:78` promises "one worker per org" against a single
+  deployment-wide fetcher.
+- **Silent-failure residue.** `use-share-visitor-role.tsx:92-95` — the filter fix
+  landed, but the bare `catch { return null }` that *hid* the original bug is
+  still there, so any error still resolves to "member". drive
+  `ShareDialog.tsx:181` swallows a failed share-save and closes the dialog as if
+  it succeeded. takeout's `DocumentPicker` promise has no `.catch`, and its dedup
+  lookups treat any rejection as "not found" (a transient error creates
+  duplicates).
+- **Dead / lying code.** contacts `scripts/test-server-api.ts` is unrunnable
+  (expands the deleted `user_org_via_user.org`, wrong CardDAV path) and its
+  `fail()` discards every label, so it emits nothing but an exit code. Router:
+  `orgs.custom_domains` is written and never read; `ContentHash`/`manifest` still
+  have no writers (confirms §6); package names from a lockfile reach a filesystem
+  path unvalidated, so `"../../.."` escapes the store root (superuser-only).
+  `davconfig/webdav.go:13-19` still describes tenant WebDAV as unauthenticated-
+  broad — §6 marks that **closed**, so the comment now invites a redundant "fix".
+  Comment rot referencing the deleted junction persists in ~12 core/text/calc/
+  drive sites; text and calc both cite a "public share-link render endpoint" that
+  is registered nowhere. mail's `mergeSharedFolderStates.ts` has zero production
+  importers but keeps a 3-test suite, and `useThreadListItems.ts:136-383` calls
+  plain `users.id` values `userOrgIdsForFilter` with a comment about
+  "the relevant user_orgs" — that file is the one a reader opens to understand
+  thread scoping, which is exactly how §3.2's class survives.
+- **Residual N+1s in mail** (`imap_session.go:92-112` — two queries per mailbox
+  membership in `Login`; `:355-370`; `lifecycle.go:90-99` — a membership query
+  per personal mailbox, up to 1000, on every user deletion). The *per-org*
+  fan-out §3.3 removed is confirmed gone; these are the per-mailbox remainder and
+  are bounded in practice.
+- **e2e discipline.** contacts' positive assertions are still bare
+  `getByText('Alice')` (the deny-side ones are correctly testID-scoped) — the
+  collision class §3.6 predicts "as more packages return"; calc and calendar have
+  the same shape. mail is the worst instance: `mail-inbox.spec.ts:136-146`
+  asserts five advanced-search labels are absent from the **entire page**
+  (`getByText('Size', {exact:true})).toHaveCount(0)`), so drive rendering a
+  "Size" column fails a test about mail's search dropdown;
+  `mail-shared-mailbox-admin.spec.ts:87` matches `/already|unique|in use|exists/i`
+  anywhere in the DOM, and `mail-labels.spec.ts:14` walks a hardcoded
+  `ancestor::*[5]`. `helpers.ts:143` hard-`goto`s `/settings/members` against the
+  discipline the same file documents; `invite-flow.spec.ts:140` asserts
+  `url()).toContain('/')`, which is vacuous. takeout's spec uses `page.goto` for
+  in-app nav plus inline 10s–120s timeouts.
+- **Duplication worth lifting.** `webdav/tshooks_register.go` and
+  `caldav/tshooks_register.go` are ~130 near-identical lines (`normalizeHandlerSource`
+  and `isKnownHookName` byte-identical) — and have **already drifted**: caldav
+  rejects unknown hook names *before* compiling, webdav after, so a typo
+  partially registers. text/calc `authorizeAnonShare` is byte-identical; the
+  router builds the tenant binary from two duplicated test helpers.
+- **§6 corrections.** The "`userOrgId` wired to server contracts (~45 sites)"
+  item is **stale and better than described**: the contracts are already user-id
+  based (`/api/invite-link/${userId}`, no `?user_org_id=` anywhere), leaving ~8
+  pure naming-residue sites — a mechanical rename, no API moves. And
+  `bootstrapTenantOnce` may be **removable rather than relocatable**:
+  `apis.Serve` already runs `RunAllMigrations()` unconditionally inside the
+  confined tenant (`apis/serve.go:155`), so the first spawn applies the same
+  migrations in isolation; dropping it closes the item without building a
+  one-shot subprocess path.
+- **Cosmetic.** Two drive migrations share the `1782000000` prefix (ordering
+  rests on lexicographic filename sort). `biome.json` excludes still target
+  `app/a/[orgSlug]/…`. `time.NewTicker(MaxIdle/2)` panics for `MaxIdle == 1ns`.
+  The socket is chmod'd 0600 only *after* `net.Listen` creates it at 0755.
+  ~15 `biome-ignore` comments in text/calc against the "never" rule (all carry
+  rationales). CardDAV re-runs bcrypt per backend call; DAV auth is timing-
+  distinguishable and unrated-limited.
+
+### 7.6 Verified-good — don't re-audit these
+
+Recorded so a later pass doesn't spend the effort again:
+
+- **mail's image-proxy SSRF guard is the strongest in the tree**
+  (`endpoints_image_proxy.go:34-94`): token-gated, scheme allowlist, pre-flight
+  private-host check, redirect re-validation capped at 3 hops, and a
+  `safeDialContext` that **pins the dialed IP** to one that passed validation —
+  DNS rebinding closed — plus a 10MB `io.LimitReader`. calendar's ICS fetcher
+  has the same pinned-dial shape with regression tests.
+- **mail's webhook authz fix is present and guarded** (5 tests covering
+  owner/admin 200 vs member/guest/no-role 403-without-secret); inbound and bounce
+  compare secrets with `subtle.ConstantTimeCompare` and resolve an unknown secret
+  to `NoopProvider`. FTS input is sanitized and every dbx param is bound.
+- **text's embed IDOR fix is carried and neuter-sensitive**: drive_items
+  allowlist + per-record `driveshare.CheckRead` + empty-auth fail-closed +
+  traversal rejection, with four denial tests each carrying a bytes-bearing decoy
+  plus a positive control.
+- **calendar's CalDAV lift is in good shape**: `Defaults` covers the only two
+  required-no-default fields (verified against the migration), the `OnError`
+  decorator wraps the *interface* with a compile-time assertion so a new protocol
+  method breaks the build, creates use save-evaluate-rollback, every denial is a
+  `webdav.NewHTTPError(404, …)` with `errors.Is` intact, and the five wire-format
+  tests genuinely round-trip real iCalendar bytes in both directions.
+- **`core.App` widening (§3.4) is complete in mail** — `*pocketbase.PocketBase`
+  survives only at `register.go:29`, the one spot §3.4 says to keep.
+- **The `ts_hooks` seam is correct**: `RegisterExtras` runs before
+  `jsvm.MustRegister` (§5.10), the fast path is one atomic load, both
+  `filterList` implementations *intersect* rather than trust the handler's
+  return, and every TS hook point is narrowing-only — a hook can hide but never
+  reveal.
+- **Core's org-era sweep is genuinely clean**: zero live `user_org` / `orgs` /
+  `org_provisioning` references in `core/server`, every filter string resolves
+  against the shipped migrations, and `userorg`'s contents are all still live
+  despite the vestigial package name.
+
+**One false positive, recorded so it isn't re-raised:** the `author_user_org`
+field in `drive/pb-migrations/1781200000` is *not* a surviving lying field —
+`1781400000_drop_drive_preview_comments.js` drops the whole collection
+unconditionally (verified; its down-migration deliberately throws). Reading the
+app shell's assembled migration set makes dropped collections look live.
+
+### 7.7 Verification — every gate, green
+
+| Scope | Result |
+|---|---|
+| `multi-org` | `go build` / `vet` / `test ./... -count=1` **PASS**; `-race` **PASS**; `GOOS=linux` build + `test -c` **PASS** |
+| `core/server` | build / vet / `test ./...` **PASS** (21 pkgs; `davauth` has no test file) |
+| app shell `server/` | build / vet / test **PASS**; `pnpm run typecheck` **PASS** |
+| `tinycld` (core TS) | `pnpm run checks` **PASS** (10 biome warnings, all in calc/text; 1 schema-version info); core vitest **477 tests PASS** |
+| contacts | Go **PASS** (no test files); `tinycld-pkg check` **PASS** (20) |
+| takeout | `tinycld-pkg check` **PASS** (23 — the suite is 23 now, not §3.7's 22) |
+| mail | Go **PASS** (+`-count=1`); `tinycld-pkg check` **PASS** (127 files, 138 tests) |
+| drive | Go **PASS**; `tinycld-pkg check` **PASS** (97) |
+| text | Go **PASS**; `tinycld-pkg check` **PASS** (920) |
+| calc | Go **PASS**; `tinycld-pkg check` **PASS** (1378) |
+| calendar | Go **PASS**; `tinycld-pkg check` **PASS** |
+
+e2e and dev servers were deliberately **not** run (parallel reviewers would
+collide on ports — §5.3); every e2e finding above is from reading the specs.
+
+### 7.8 What to do first
+
+1. **The socket-dir chown** (§7.1) — one-line class of fix, breaks the whole
+   isolation claim until done.
+2. **`davauth` disabled check** (§7.2) — one place, closes CardDAV + CalDAV +
+   WebDAV at once.
+3. **WebDAV create authorization** (§7.2) — port CalDAV's
+   save-evaluate-rollback; then delete the permissive `CreateRule` from the
+   test fixtures so the gap can't reopen.
+4. **Restore the guest clause** in drive's `1782000000` (§7.2) and settle
+   `commentor` in **one** place — decide whether it may edit, then make the rule
+   and `driveshare.rank()` agree.
+5. **The evict/respawn socket race** (§7.3) — data-plane outage on the Deploy
+   path.
+6. **The dead/broken features** (§7.3): bell notifications, the share-link
+   member redirect, tenant `AppURL`, the `/drive` route collision, and mail's
+   phantom `org` write. Each is small and each is currently shipping broken.
+7. **Finish `4d52992`** (§7.3): test `deriveMailboxAddress` (including the
+   `i<=99` exhaustion and unicode-username paths that silently produce no
+   mailbox), fix `seed.ts` to derive from username, correct the help topic.
+8. **Then the fixture traps** (§7.4). Every one of them is a test that will not
+   tell you when the fix above regresses. Re-point them at the shipped
+   migrations rather than re-declaring the strings, and copy **mail's
+   `guest_rls_test.go` shape** (paired positive controls) — it is the only suite
+   in the tree that would actually go red.
+
+**A note on sequencing.** Items 1–5 are security or data-plane; 6–7 are
+user-visible breakage. But item 8 is what keeps the rest fixed: six of the eight
+findings above were *already* covered by a test that passed. Fixing the code
+without re-pointing the fixture leaves the next regression equally invisible.
+
+---
+
+## 8. Design docs
 
 - **Specs/plans** (this repo, `docs/superpowers/`): TypeScript hooks
   (`2026-07-23-typescript-hooks*`), tenant sandbox

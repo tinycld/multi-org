@@ -511,12 +511,15 @@ matches:
 ## 6. Open work
 
 **Blocking / security**
-- **Linux CI for `TestConfinement_*`** (§1). Per-process isolation has shipped,
-  but the tests that prove it need Linux + root and never run today. Until they
-  do, the boundary is verified by construction only. **§7 found the construction
-  itself is wrong** (the shared socket dir is chowned to each tenant — §7.1), so
-  fix that first; and note two of these tests are vacuous even on Linux (§7.4),
-  so standing up CI without repairing them buys less than it appears.
+- **Linux CI for `TestConfinement_*`** (§1, REMEDIATION P5-1). Per-process
+  isolation has shipped, but the tests that prove it need Linux + root and
+  never run today. Until they do, the boundary is verified by construction
+  only. ~~§7 found the construction itself is wrong (the shared socket dir)~~
+  **fixed** — P0-1's per-org socket dirs shipped (verified 2026-07-27), so CI
+  is the remaining gap and now the top item. Two of these tests are still
+  vacuous even on Linux (§7.4 / P3-4), so repair them as part of standing CI
+  up — and CI is also the only way to re-run confinement with feature Go
+  linked (SCOPE-tenant-feature-go D4).
 - **Provision-time migrations still run in the control-plane process**
   (`bootstrapTenantOnce`). Move to a one-shot isolated `serve-org` invocation.
 - **Resource limits.** `MT_CGROUP_ROOT` creates a per-tenant cgroup but writes no
@@ -1237,6 +1240,28 @@ e2e and dev servers were deliberately **not** run (parallel reviewers would
 collide on ports — §5.3); every e2e finding above is from reading the specs.
 
 ### 7.8 What to do first
+
+> **Superseded 2026-07-27.** Items 1–4 below shipped (verified against code —
+> see REMEDIATION-PLAN.md's reconciliation notes; that file is the canonical
+> tracker). The current order, from the verified-open set:
+>
+> 1. **P1-7** — `carddav.PutAddressObject` evaluates no PB rule; the last DAV
+>    protocol not reading the schema's authorization.
+> 2. **P2-4** — tenant `AppURL`. More urgent since feature-Go linking: tenants
+>    now run the invite/reset mailers, so real emails carry
+>    `http://localhost:8090` links. Reuse the `.runtime/packages.json`
+>    materialize pattern.
+> 3. **The verified-open mail batch** — P2-5 (phantom `org` write), P2-7
+>    (search-failure swallow), P2-13 (IMAP AND/OR), P2-6 (finish `4d52992`),
+>    with **P3-2** (the inbound fixture's phantom `user_org` schema) fixed
+>    first so the batch has a guard that can fail.
+> 4. **P5-1** — Linux CI running `TestConfinement_*` as root (see §6 top).
+> 5. Then P3-1's remainder (drive/text/calc RLS suites still assert their own
+>    constants) and Phase 4's router robustness, sharpest first: the
+>    post-Evict socket race (P4-1) and Deploy's materialize-before-evict
+>    (P4-4).
+
+The original list, kept for the review record:
 
 1. **The socket-dir chown** (§7.1) — one-line class of fix, breaks the whole
    isolation claim until done.

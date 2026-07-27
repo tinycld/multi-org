@@ -22,6 +22,15 @@ log of this file and of the four repos.
 
 ## 1. Where things stand
 
+> **⚠ OPEN CRITICAL — read `docs/FINDING-tenant-composition-gap.md` first.**
+> A tenant is NOT the same server as single-org. `serve-org` hand-rolls a
+> subset of `coreserver.Register` (jsvm + quota only), so every tenant is
+> missing the users field guard, the disabled-user guard, notify, realtime,
+> userorg, schema hooks and the DAV CORS bypass. Proven consequence: with no
+> field guard bound, `users.updateRule` alone lets a plain member PATCH their
+> own role to `owner`. This is the root cause of the calendar takeover (P1-5),
+> and it is unfixed.
+
 **The router works, and tenants now run in their own OS processes.** A booted
 `serve-multi` (proxy mode) bootstraps a superuser from env, provisions an org via
 `POST /api/orgs`, **spawns a `serve-org` child** for that tenant, and reverse-

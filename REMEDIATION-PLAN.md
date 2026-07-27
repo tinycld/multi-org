@@ -176,6 +176,11 @@ Same class as Phase 0, lower reachability. Land immediately after.
   the CalDAV path; this covers REST. New migration adding the clause to
   calendars, events, and members.
 - [ ] **P1-5 🟠 Move calendar's member-authz gates into rules** — `calendar`.
+  **DONE 2026-07-27** (migration `1830000004` + a bootstrap pb-hook). But see
+  `docs/FINDING-tenant-composition-gap.md`: this fix treats a symptom. The root
+  cause is that `serve-org` binds none of core's guards either, so every
+  Go-held guard has the same exposure. That is unfixed and larger than this
+  item.
   **D2 resolved: calendar IS in scope for tenant hosting, so the gates must
   become rules.** A tenant links no feature package, so today a tenant user could
   `POST calendar_members {calendar: <any>, user: self, role: "owner"}` and take

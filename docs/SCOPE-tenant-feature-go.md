@@ -6,6 +6,12 @@ class of findings shaped "enforcement lives in Go a tenant never runs".
 
 ---
 
+> **Read `FINDING-tenant-composition-gap.md` first.** This document scopes
+> linking FEATURE Go into tenants. That is not the first problem: CORE's own
+> guards are missing from tenants too, which no feature-linking decision
+> addresses. The framing below is still valid on its own terms, but it is the
+> second question, not the first.
+
 ## The problem, stated precisely
 
 `multi-org/cmd/serve-org` links no feature package. Measured, not assumed:

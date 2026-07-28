@@ -1,6 +1,6 @@
 # Handoff — Multi-Org PocketBase Router
 
-**Updated:** 2026-07-26
+**Updated:** 2026-07-28
 **Goal:** one router hosts many organizations — each org its own **OS process**,
 SQLite DB, client bundle, and server-side JS, sharing versioned code on disk but
 isolated at the kernel boundary.

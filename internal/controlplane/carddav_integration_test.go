@@ -133,6 +133,20 @@ func TestIntegration_MultiOrgCardDAV(t *testing.T) {
 	if strings.Contains(globexVCF, "Alice") {
 		t.Errorf("globex CardDAV leaked acme's Alice:\n%s", globexVCF)
 	}
+
+	// The two content assertions above cannot fail on their own: Bob is only
+	// ever inserted into globex's separate DB served by a separate process, so
+	// "acme doesn't contain Bob" is true by construction. The falsifiable
+	// boundary probe is the principal, not the payload: an org's user must not
+	// authenticate against ANOTHER org's tenant. This goes red if the tenants
+	// ever share a DB (both users would exist in both) or if the router routes
+	// one slug to the other's socket (the foreign user would suddenly resolve).
+	if code := carddavStatus(t, mgr, "globex", "alice@acme.test"); code != http.StatusUnauthorized {
+		t.Errorf("acme's user authenticated against globex's tenant: got %d, want 401", code)
+	}
+	if code := carddavStatus(t, mgr, "acme", "bob@globex.test"); code != http.StatusUnauthorized {
+		t.Errorf("globex's user authenticated against acme's tenant: got %d, want 401", code)
+	}
 }
 
 // setupCardDAVOrgs boots a control plane, publishes the contacts package, and
@@ -241,6 +255,22 @@ func seedOrg(t *testing.T, p *Provisioner, root, slug, email, first, orgName str
 // endpoint through the proxy and returns the multistatus body.
 func carddavReport(t *testing.T, mgr *orgmanager.OrgManager, slug, email string) string {
 	t.Helper()
+	rec := doCarddavReport(t, mgr, slug, email)
+	if rec.Code != http.StatusMultiStatus && rec.Code != http.StatusOK {
+		t.Fatalf("%s CardDAV REPORT = %d, body:\n%s", slug, rec.Code, rec.Body.String())
+	}
+	return rec.Body.String()
+}
+
+// carddavStatus issues the same REPORT but returns the status code instead of
+// requiring success — for the cross-org auth-denial probes.
+func carddavStatus(t *testing.T, mgr *orgmanager.OrgManager, slug, email string) int {
+	t.Helper()
+	return doCarddavReport(t, mgr, slug, email).Code
+}
+
+func doCarddavReport(t *testing.T, mgr *orgmanager.OrgManager, slug, email string) *httptest.ResponseRecorder {
+	t.Helper()
 	inst, err := mgr.Get(context.Background(), slug)
 	if err != nil {
 		t.Fatalf("Get(%s): %v", slug, err)
@@ -257,11 +287,7 @@ func carddavReport(t *testing.T, mgr *orgmanager.OrgManager, slug, email string)
 
 	rec := httptest.NewRecorder()
 	inst.Mux().ServeHTTP(rec, req)
-
-	if rec.Code != http.StatusMultiStatus && rec.Code != http.StatusOK {
-		t.Fatalf("%s CardDAV REPORT = %d, body:\n%s", slug, rec.Code, rec.Body.String())
-	}
-	return rec.Body.String()
+	return rec
 }
 
 func basicAuth(user, pass string) string {

@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/pocketbase/pocketbase"
@@ -190,8 +191,16 @@ func TestIntegration_MaliciousMigrationCannotExec(t *testing.T) {
 	}
 
 	p := NewProvisioner(cp.App, root, s, func(string) {})
-	if _, err := p.CreateOrg("evilorg", "Evil", map[string]string{"@tinycld/evil": "1.0.0"}); err == nil {
+	_, err = p.CreateOrg("evilorg", "Evil", map[string]string{"@tinycld/evil": "1.0.0"})
+	if err == nil {
 		t.Fatal("expected provisioning to fail for a migration touching $os under sandbox")
+	}
+	// A bare err != nil would stay green with Sandboxed removed if provisioning
+	// failed for any unrelated reason (a fixture path typo, a publish error).
+	// The failure must be the sandbox refusing the binding: $os is simply not
+	// defined in a sandboxed VM, so the load throws a ReferenceError naming it.
+	if !strings.Contains(err.Error(), "$os") {
+		t.Fatalf("provisioning failed, but not because the sandbox withheld $os: %v", err)
 	}
 }
 

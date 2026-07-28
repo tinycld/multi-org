@@ -296,6 +296,12 @@ func TestTenant_HostileHookFailsOnlyThatOrg(t *testing.T) {
 }
 
 // The host must not hand its secrets to a tenant.
+//
+// NOTE: this is defence-in-depth evidence, not the guard. The fork's sandbox
+// empties process.env in every VM, so this stays green even if the spawner
+// leaked os.Environ() into the child. The falsifiable guards are
+// TestBuildCmd_EnvIsAllowlistOnly (spawn_exec_test.go) on the constructed env,
+// and TestConfinement_ChildEnvironmentHoldsNoHostSecrets at the OS level.
 func TestTenant_DoesNotInheritHostSecrets(t *testing.T) {
 	t.Setenv("MT_SUPERUSER_PASSWORD", "super-secret-value")
 

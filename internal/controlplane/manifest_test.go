@@ -11,6 +11,42 @@ import (
 	"tinycld.org/multi-org/internal/lockfile"
 )
 
+// assertFullyPopulated walks v's exported fields recursively and fails for any
+// zero-valued one. Func-typed fields are skipped: Go callbacks cannot cross a
+// process boundary by design, so they are deliberately not wire-carried.
+//
+// This is what makes the DeepEqual round-trips below capable of failing: a
+// field that is zero on BOTH sides of encode/decode compares equal, so a field
+// added to core's Source but forgotten in the wire mirror would round-trip
+// "equal" while a tenant silently loses the config. Forcing the fixture to
+// populate every field means a new core field first fails here (update the
+// fixture manifest to set it), after which a missing wire mapping fails the
+// DeepEqual.
+func assertFullyPopulated(t *testing.T, v any) {
+	t.Helper()
+	walkPopulated(t, reflect.ValueOf(v), reflect.TypeOf(v).Name())
+}
+
+func walkPopulated(t *testing.T, v reflect.Value, path string) {
+	t.Helper()
+	switch v.Kind() {
+	case reflect.Func:
+		return
+	case reflect.Struct:
+		for i := 0; i < v.NumField(); i++ {
+			f := v.Type().Field(i)
+			if !f.IsExported() {
+				continue
+			}
+			walkPopulated(t, v.Field(i), path+"."+f.Name)
+		}
+	default:
+		if v.IsZero() {
+			t.Errorf("%s is zero — populate it in the fixture manifest so the round-trip can prove the wire carries it", path)
+		}
+	}
+}
+
 const contactsManifestTS = `
 const manifest = {
     name: 'Contacts',
@@ -215,6 +251,10 @@ func TestWebDAVSources_RoundTripThroughWire(t *testing.T) {
 		t.Fatalf("WebDAVSources: %v", err)
 	}
 
+	// Without this, a field missing from BOTH the wire mirror and the mapping
+	// compares zero == zero below and the drop is invisible.
+	assertFullyPopulated(t, sources[0])
+
 	decoded := davconfig.DecodeWebDAV(davconfig.EncodeWebDAV(sources))
 	if len(decoded) != 1 {
 		t.Fatalf("round trip produced %d sources, want 1", len(decoded))
@@ -248,6 +288,12 @@ func TestQuotaSources_ReadsManifestJSON(t *testing.T) {
 		if s.Slug != "drive" || s.SizeField != "size" || s.OwnerField != "created_by" {
 			t.Errorf("source wrong: %+v", s)
 		}
+	}
+
+	// Both fixture sources are fully populated, so a wire-mapping drop cannot
+	// hide behind zero == zero in the DeepEqual below.
+	for _, s := range sources {
+		assertFullyPopulated(t, s)
 	}
 
 	decoded := davconfig.DecodeQuota(davconfig.EncodeQuota(sources))
@@ -474,6 +520,11 @@ func TestCalDAVSources_RoundTripThroughWire(t *testing.T) {
 		t.Fatalf("CalDAVSources: %v", err)
 	}
 
+	// Without this, a field missing from BOTH the wire mirror and the mapping
+	// compares zero == zero below and the drop is invisible. (OnError is a Go
+	// func and deliberately not carried; the walker skips func fields.)
+	assertFullyPopulated(t, sources[0])
+
 	decoded := davconfig.DecodeCalDAV(davconfig.EncodeCalDAV(sources))
 	if len(decoded) != 1 {
 		t.Fatalf("round trip produced %d sources, want 1", len(decoded))
@@ -500,8 +551,32 @@ func TestCalDAVSources_SurvivesJSONFile(t *testing.T) {
 	if err := json.Unmarshal(body, &wire); err != nil {
 		t.Fatalf("unmarshal: %v", err)
 	}
+	assertFullyPopulated(t, sources[0])
 	decoded := davconfig.DecodeCalDAV(wire)
 	if !reflect.DeepEqual(sources[0], decoded[0]) {
 		t.Fatalf("JSON round trip changed the Source:\n before %+v\n after  %+v", sources[0], decoded[0])
+	}
+}
+
+// The CardDAV mirror (davconfig.Source) had no round-trip coverage at all —
+// the same silent-drop class the WebDAV and CalDAV round-trips guard.
+func TestCardDAVSources_RoundTripThroughWire(t *testing.T) {
+	dir := writeManifestPkg(t, contactsManifestTS)
+
+	sources, err := CardDAVSources([]lockfile.ResolvedPackage{{Name: "contacts", Dir: dir}})
+	if err != nil {
+		t.Fatalf("CardDAVSources: %v", err)
+	}
+	if len(sources) != 1 {
+		t.Fatalf("got %d sources, want 1", len(sources))
+	}
+	assertFullyPopulated(t, sources[0])
+
+	decoded := davconfig.Decode(davconfig.Encode(sources))
+	if len(decoded) != 1 {
+		t.Fatalf("round trip produced %d sources, want 1", len(decoded))
+	}
+	if !reflect.DeepEqual(sources[0], decoded[0]) {
+		t.Fatalf("round trip changed the Source:\n before %+v\n after  %+v", sources[0], decoded[0])
 	}
 }

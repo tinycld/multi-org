@@ -29,7 +29,7 @@ jobs:
       run:
         working-directory: multi-org
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           path: multi-org
 
@@ -43,7 +43,7 @@ jobs:
               "https://x-access-token:${GH_TOKEN}@github.com/tinycld/${repo}.git" "${repo}"
           done
 
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v6
         with:
           go-version-file: multi-org/go.mod
           cache-dependency-path: multi-org/go.sum

@@ -72,6 +72,7 @@ func main() {
 		caldavConfig = flag.String("caldav-config", "", "path to the org's materialized caldav.json")
 		quotaConfig  = flag.String("quota-config", "", "path to the org's materialized quota.json")
 		pkgsConfig   = flag.String("packages-config", "", "path to the org's materialized packages.json (resolved slugs)")
+		appConfig    = flag.String("app-config", "", "path to the org's materialized app.json (public URL)")
 		davConfig    = flag.String("carddav-config", "", "path to the CardDAV source JSON")
 		drain        = flag.Duration("drain", 10*time.Second, "graceful shutdown budget")
 		confinePkg   = flag.String("confine-packages", "", "remount this dir read-only in our mount namespace")
@@ -90,13 +91,13 @@ func main() {
 		ready = os.NewFile(uintptr(*readyFD), "ready")
 	}
 
-	if err := run(*orgDir, *socketPath, *slug, *hooksPool, *davConfig, *caldavConfig, *webdavConfig, *quotaConfig, *pkgsConfig, *confinePkg, *drain, ready); err != nil {
+	if err := run(*orgDir, *socketPath, *slug, *hooksPool, *davConfig, *caldavConfig, *webdavConfig, *quotaConfig, *pkgsConfig, *appConfig, *confinePkg, *drain, ready); err != nil {
 		reportNotReady(ready, err)
 		log.Fatalf("serve-org: %v", err)
 	}
 }
 
-func run(orgDir, socketPath, slug string, hooksPool int, davConfigPath, caldavConfigPath, webdavConfigPath, quotaConfigPath, pkgsConfigPath, confinePkg string,
+func run(orgDir, socketPath, slug string, hooksPool int, davConfigPath, caldavConfigPath, webdavConfigPath, quotaConfigPath, pkgsConfigPath, appConfigPath, confinePkg string,
 	drain time.Duration, ready *os.File) error {
 
 	// Confinement steps that must happen inside our own mount namespace. Go
@@ -131,6 +132,11 @@ func run(orgDir, socketPath, slug string, hooksPool int, davConfigPath, caldavCo
 	pkgSlugs, err := loadPackageSlugs(pkgsConfigPath)
 	if err != nil {
 		return fmt.Errorf("load packages config: %w", err)
+	}
+
+	appURL, err := loadAppURL(appConfigPath)
+	if err != nil {
+		return fmt.Errorf("load app config: %w", err)
 	}
 
 	app := pocketbase.NewWithConfig(pocketbase.Config{
@@ -176,6 +182,18 @@ func run(orgDir, socketPath, slug string, hooksPool int, davConfigPath, caldavCo
 		return fmt.Errorf("bootstrap: %w", err)
 	}
 	defer app.ResetBootstrapState()
+
+	// Adopt the org's public URL as Meta.AppURL — the value PB interpolates
+	// into {APP_URL} for verification / password-reset / email-change links.
+	// Persisted rather than patched in memory so a settings reload (e.g. a
+	// tenant superuser saving unrelated settings) cannot revert it to PB's
+	// default http://localhost:8090.
+	if appURL != "" && app.Settings().Meta.AppURL != appURL {
+		app.Settings().Meta.AppURL = appURL
+		if err := app.Save(app.Settings()); err != nil {
+			return fmt.Errorf("set app url: %w", err)
+		}
+	}
 
 	listener, err := net.Listen("unix", socketPath)
 	if err != nil {
@@ -289,6 +307,29 @@ func loadPackageSlugs(path string) ([]string, error) {
 		return nil, err
 	}
 	return cfg.Slugs, nil
+}
+
+// loadAppURL reads .runtime/app.json (written by the router from
+// MT_BASE_DOMAIN + slug). An empty path or a missing file means the host
+// manages no public URL here — leave the tenant's stored settings alone.
+func loadAppURL(path string) (string, error) {
+	if path == "" {
+		return "", nil
+	}
+	body, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return "", nil
+		}
+		return "", err
+	}
+	var cfg struct {
+		AppURL string `json:"appURL"`
+	}
+	if err := json.Unmarshal(body, &cfg); err != nil {
+		return "", err
+	}
+	return cfg.AppURL, nil
 }
 
 func loadWebDAVSources(path string) ([]webdav.Source, error) {

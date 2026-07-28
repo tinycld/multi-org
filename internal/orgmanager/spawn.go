@@ -45,6 +45,11 @@ type SpawnRequest struct {
 	// against its pinned menu (internal/tenantpkgs). Empty when the host wires
 	// no PackageSlugs hook (the child then registers no feature Go).
 	PackagesConfig string
+	// AppConfig is the path to the org's materialized app.json, carrying the
+	// public URL the tenant adopts as Settings().Meta.AppURL at boot. Empty
+	// when the host wires no OrgURL hook (the tenant then keeps its stored
+	// settings).
+	AppConfig string
 
 	HooksPool int
 	Drain     time.Duration

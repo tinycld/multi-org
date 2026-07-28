@@ -94,9 +94,32 @@ func newRealManager(t *testing.T, hookSource string) *OrgManager {
 		LookupOrg: stubLookup(map[string]OrgRecord{
 			"acme": {Slug: "acme", Status: "active", Lockfile: []byte(`{"@tinycld/core":"1.0.0"}`)},
 		}),
+		OrgURL: func(slug string) string { return "https://" + slug + ".tenants.example.test" },
 	})
 	t.Cleanup(mgr.Shutdown)
 	return mgr
+}
+
+// Every org's auth emails interpolate {APP_URL} from Settings().Meta.AppURL.
+// The router materializes the org's public URL into .runtime/app.json; the
+// tenant must adopt it at boot, or every verification / password-reset /
+// email-change link carries PocketBase's default http://localhost:8090.
+func TestTenant_AdoptsMaterializedAppURL(t *testing.T) {
+	mgr := newRealManager(t, `routerAdd('GET','/appurl',(e)=>e.json(200,{url:$app.settings().meta.appURL}))`)
+
+	inst, err := mgr.Get(context.Background(), "acme")
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+
+	rec := httptest.NewRecorder()
+	inst.Mux().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/appurl", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("/appurl = %d body=%s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), `"url":"https://acme.tenants.example.test"`) {
+		t.Fatalf("tenant settings did not adopt the materialized org URL: %s", rec.Body.String())
+	}
 }
 
 func TestTenant_ServesOverUnixSocket(t *testing.T) {

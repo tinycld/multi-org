@@ -107,6 +107,16 @@ type Config struct {
 	// Host-side for the same reason as the DAV sources: the host already
 	// holds the resolved list, and the child must not walk the store.
 	PackageSlugs func(resolved []lockfile.ResolvedPackage) ([]string, error)
+
+	// OrgURL returns an org's public URL (scheme + host, no trailing slash),
+	// e.g. "https://acme.tinycld.org". Materialized to .runtime/app.json and
+	// adopted by the tenant as Settings().Meta.AppURL at boot — the value
+	// PocketBase interpolates into {APP_URL} for verification, password-reset
+	// and email-change links. The host resolves it because only the host knows
+	// MT_BASE_DOMAIN and the TLS mode; without it every tenant's auth emails
+	// carry PB's default http://localhost:8090. Nil ⇒ nothing materialized and
+	// the tenant's stored settings are left untouched.
+	OrgURL func(slug string) string
 }
 
 // crashState tracks a slug's consecutive unexpected exits. It lives on the
@@ -247,12 +257,18 @@ func (m *OrgManager) load(ctx context.Context, slug string) (*OrgInstance, error
 		return nil, fmt.Errorf("packages config %s: %w", slug, err)
 	}
 
+	appConfig, err := m.writeAppConfig(orgDir, slug)
+	if err != nil {
+		return nil, fmt.Errorf("app config %s: %w", slug, err)
+	}
+
 	inst, err := m.spawn(ctx, slug, orgDir, runtimeConfigs{
 		cardDAV:  davConfig,
 		calDAV:   caldavConfig,
 		webDAV:   webdavConfig,
 		quota:    quotaConfig,
 		packages: packagesConfig,
+		app:      appConfig,
 	})
 	if err != nil {
 		m.noteCrash(slug)
@@ -282,6 +298,7 @@ type runtimeConfigs struct {
 	webDAV   string
 	quota    string
 	packages string
+	app      string
 }
 
 // spawn starts the tenant process and waits for it to report readiness.
@@ -313,6 +330,7 @@ func (m *OrgManager) spawn(ctx context.Context, slug, orgDir string, cfgs runtim
 		WebDAVConfig:   cfgs.webDAV,
 		QuotaConfig:    cfgs.quota,
 		PackagesConfig: cfgs.packages,
+		AppConfig:      cfgs.app,
 		HooksPool:      m.cfg.HooksPool,
 		Drain:          drainTimeout,
 		ReadyFile:      readyW,
@@ -647,6 +665,36 @@ func (m *OrgManager) writePackagesConfig(orgDir string, resolved []lockfile.Reso
 // packagesConfigFile is the wire shape of .runtime/packages.json.
 type packagesConfigFile struct {
 	Slugs []string `json:"slugs"`
+}
+
+// writeAppConfig materializes the org's public URL where the tenant can read
+// it. The tenant adopts it as Settings().Meta.AppURL at boot — the value PB
+// interpolates into {APP_URL} in every auth email — because the child knows
+// neither MT_BASE_DOMAIN nor the TLS mode.
+func (m *OrgManager) writeAppConfig(orgDir, slug string) (string, error) {
+	if m.cfg.OrgURL == nil {
+		return "", nil
+	}
+
+	runtimeDir := filepath.Join(orgDir, ".runtime")
+	if err := os.MkdirAll(runtimeDir, 0o755); err != nil {
+		return "", err
+	}
+	path := filepath.Join(runtimeDir, "app.json")
+
+	body, err := json.Marshal(appConfigFile{AppURL: m.cfg.OrgURL(slug)})
+	if err != nil {
+		return "", err
+	}
+	if err := os.WriteFile(path, body, 0o644); err != nil {
+		return "", err
+	}
+	return path, nil
+}
+
+// appConfigFile is the wire shape of .runtime/app.json.
+type appConfigFile struct {
+	AppURL string `json:"appURL"`
 }
 
 // writeWebDAVConfig is writeCardDAVConfig's counterpart for WebDAV trees. Same

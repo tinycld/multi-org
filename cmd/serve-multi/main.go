@@ -74,6 +74,10 @@ func run() error {
 		CalDAVSources:  controlplane.CalDAVSources,
 		QuotaSources:   controlplane.QuotaSources,
 		PackageSlugs:   controlplane.PackageSlugs,
+		// Public scheme is https in every TLS mode: file/autocert terminate
+		// here, and proxy mode's documented deployment is behind an external
+		// TLS proxy on 443.
+		OrgURL: func(slug string) string { return "https://" + slug + "." + baseDomain },
 	})
 	defer mgr.Shutdown()
 

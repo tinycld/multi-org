@@ -65,6 +65,9 @@ func buildCmd(ctx context.Context, req SpawnRequest, log *slog.Logger) *exec.Cmd
 	if req.PackagesConfig != "" {
 		args = append(args, "--packages-config", req.PackagesConfig)
 	}
+	if req.AppConfig != "" {
+		args = append(args, "--app-config", req.AppConfig)
+	}
 	if req.ConfinePackages {
 		args = append(args, "--confine-packages", req.PackagesDir)
 	}

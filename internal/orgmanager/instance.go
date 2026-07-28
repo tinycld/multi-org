@@ -23,6 +23,12 @@ import (
 type OrgInstance struct {
 	slug     string
 	sockPath string
+	// sockIno is the inode of the socket file the child bound, recorded once
+	// the child reports ready. socketPath(slug) is deterministic, so an
+	// evicted instance's teardown can race a replacement that has re-bound
+	// the same path; the inode is how teardown tells its own socket file from
+	// the replacement's. 0 = never recorded (fail safe: don't remove).
+	sockIno uint64
 
 	proc    Process
 	proxy   *httputil.ReverseProxy
@@ -156,8 +162,37 @@ func (i *OrgInstance) shutdown(drain, kill time.Duration) {
 			<-i.dead // the supervisor's Wait always returns once the child is killed
 		}
 
+		// Remove only a socket this instance still owns. An Evict-then-Get
+		// respawns the org on the same deterministic path while this teardown
+		// is still draining; removing unconditionally here would delete the
+		// REPLACEMENT's socket — every dial then ENOENTs into 502 while the
+		// supervisor still believes the new instance healthy, so nothing
+		// respawns it until the idle sweep.
+		if !i.ownsSocket() {
+			i.log.Debug("skipping socket removal; path no longer this instance's",
+				"slug", i.slug)
+			return
+		}
 		if err := os.Remove(i.sockPath); err != nil && !os.IsNotExist(err) {
 			i.log.Warn("could not remove tenant socket", "slug", i.slug, "error", err)
 		}
 	})
+}
+
+// ownsSocket reports whether the file currently at sockPath is the one this
+// instance's child bound. A replacement child re-binding the path creates a
+// new file with a new inode, which is what distinguishes "our stale socket"
+// from "the replacement's live one". The stat-then-remove window is not
+// atomic, but it shrinks the race from the whole drain+kill budget (15s) to
+// microseconds — and a replacement cannot finish a spawn in that window.
+func (i *OrgInstance) ownsSocket() bool {
+	if i.sockIno == 0 {
+		return false
+	}
+	st, err := os.Stat(i.sockPath)
+	if err != nil {
+		return false
+	}
+	sys, ok := st.Sys().(*syscall.Stat_t)
+	return ok && sys.Ino == i.sockIno
 }

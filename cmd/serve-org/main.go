@@ -199,6 +199,15 @@ func run(orgDir, socketPath, slug string, hooksPool int, davConfigPath, caldavCo
 	if err != nil {
 		return fmt.Errorf("listen on %s: %w", socketPath, err)
 	}
+	// The ROUTER owns the socket file's lifecycle, not us. On Evict-then-Get a
+	// replacement binds this same deterministic path while we are still
+	// draining, and Go's default unlink-on-close would delete the
+	// REPLACEMENT's socket when our listener finally closes — permanently
+	// 502ing the org. The router clears stale files before each bind and
+	// guards its own teardown removal by inode.
+	if ul, ok := listener.(*net.UnixListener); ok {
+		ul.SetUnlinkOnClose(false)
+	}
 	// Only the router connects to this socket; the tenant uid owns it.
 	if err := os.Chmod(socketPath, 0o600); err != nil {
 		return fmt.Errorf("chmod socket: %w", err)

@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"syscall"
 	"time"
 
 	"golang.org/x/sync/singleflight"
@@ -366,6 +367,15 @@ func (m *OrgManager) spawn(ctx context.Context, slug, orgDir string, cfgs runtim
 		<-inst.dead
 		_ = os.Remove(sockPath)
 		return nil, err
+	}
+
+	// Record which socket file the child bound, so a later teardown can tell
+	// its own socket from a replacement's that re-bound the same path (see
+	// OrgInstance.ownsSocket).
+	if st, err := os.Stat(sockPath); err == nil {
+		if sys, ok := st.Sys().(*syscall.Stat_t); ok {
+			inst.sockIno = sys.Ino
+		}
 	}
 
 	m.clearCrash(slug)

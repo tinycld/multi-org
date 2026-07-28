@@ -1,6 +1,8 @@
 # Handoff — Multi-Org PocketBase Router
 
-**Updated:** 2026-07-28
+**Updated:** 2026-07-28 (Phase 5 complete — P5-2 cgroup limits, P5-3
+provisioning isolation, P5-4 extended live smoke all landed; only Phase 6
+docs/cleanup remains)
 **Goal:** one router hosts many organizations — each org its own **OS process**,
 SQLite DB, client bundle, and server-side JS, sharing versioned code on disk but
 isolated at the kernel boundary.
@@ -521,16 +523,13 @@ matches:
 
 ## 6. Open work
 
-**Blocking / security**
-- **Linux CI for `TestConfinement_*`** (§1, REMEDIATION P5-1). Per-process
-  isolation has shipped, but the tests that prove it need Linux + root and
-  never run today. Until they do, the boundary is verified by construction
-  only. ~~§7 found the construction itself is wrong (the shared socket dir)~~
-  **fixed** — P0-1's per-org socket dirs shipped (verified 2026-07-27), so CI
-  is the remaining gap and now the top item. Two of these tests are still
-  vacuous even on Linux (§7.4 / P3-4), so repair them as part of standing CI
-  up — and CI is also the only way to re-run confinement with feature Go
-  linked (SCOPE-tenant-feature-go D4).
+**Blocking / security — ALL CLOSED (Phase 5 complete 2026-07-28)**
+- ~~**Linux CI for `TestConfinement_*`**~~ **CLOSED (P5-1, 2026-07-27)** — the
+  `confinement` workflow runs the full suite plus `TestConfinement_*` as root
+  on every push/PR (first green run 30318853658; see §1 caveat 1). The P3-4
+  vacuous tests were repaired as part of standing it up. **Note:** the new
+  `TestConfinement_CgroupLimitsApplied` (P5-2) rides the same workflow —
+  verify its first run after the next push.
 - ~~**Provision-time migrations still run in the control-plane process**
   (`bootstrapTenantOnce`).~~ **CLOSED (2026-07-28, P5-3)** — deleted;
   provisioning verifies by booting the tenant through the org manager, so
@@ -1333,9 +1332,13 @@ collide on ports — §5.3); every e2e finding above is from reading the specs.
 > the router cluster (P4-2, P4-3, P4-5, P4-6, P4-7, P4-8, P4-11 — the last
 > also closed P6-3's README items) and the mail cluster (P4-12 joined live
 > queries, P4-13 batched N+1s); see REMEDIATION-PLAN.md for per-item
-> evidence. Remaining: P5-2…P5-4, and Phase 6 docs — where P6-1
-> (CLAUDE.md/CONTRIBUTING still teach the deleted org contract) ranks above
-> its severity.
+> evidence. ~~Remaining: P5-2…P5-4~~ **PHASE 5 IS COMPLETE (2026-07-28)** —
+> P5-2 (cgroup limits, env-configured, kernel-readback confinement test),
+> P5-3 (`bootstrapTenantOnce` deleted; provisioning verifies via the first
+> confined spawn, failure through the readiness pipe), and P5-4 (extended
+> live smoke, all green — see REMEDIATION-PLAN for the full transcript).
+> Remaining: Phase 6 docs — where P6-1 (CLAUDE.md/CONTRIBUTING still teach
+> the deleted org contract) ranks above its severity.
 
 The original list, kept for the review record:
 

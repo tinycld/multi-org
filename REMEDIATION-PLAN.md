@@ -651,9 +651,35 @@ boundary that is known-broken just encodes the break.
   fails `CreateOrg` fast and flips status to `active`. Try deleting it and
   reporting migration failure through the readiness handshake before building a
   one-shot subprocess path.
-- [ ] **P5-4 Live smoke per §4**, extended with what this review found: a
+- [x] **P5-4 Live smoke per §4**, extended with what this review found: a
   disabled user against all three DAV protocols, a WebDAV **create** (not just an
   update), a hard reload of `/drive`, and a commentor on a shared doc.
+  **DONE 2026-07-28 — performed against a fresh boot of the assembled app
+  (`/tmp/tinycld-server serve`, shipped migrations + hooks), all green:**
+  - *Schema:* 45 collections, zero `orgs`/`user_org`/`org_provisioning`;
+    `users.role` + `users.disabled` present.
+  - *RLS live:* guest `drive_items` create denied (400), member create 200.
+  - *Disabled user (P0-2/P0-6):* CardDAV **and** CalDAV **and** WebDAV PROPFIND
+    all 401 via Basic (owner controls 207 on the same paths); WebDAV PUT-create
+    401; password login 403; **pre-disable token 401 after ADMIN disable**
+    (key rotation confirmed on the admin path); re-enable restores fresh login.
+  - *WebDAV create (P0-3):* member PUT-new 201 → GET 200 round-trip, MKCOL
+    201; guest PUT-create refused; `OPTIONS` answers `Dav: 1, 2`; another
+    user's unshared path reads **404, not 403**.
+  - *Commentor (P0-5/D1):* commentor share → read 200, `PATCH` rename denied
+    (masked 404), `text_comments` create 200; unshared user's comment create
+    denied (400).
+  - */drive collision (P2-1):* `GET /drive` no longer reaches the DAV mount
+    (no 401/`WWW-Authenticate`; this bare boot has no SPA bundle so it 404s —
+    the full reload-lands-in-app property is the P2-1 e2e); `/dav/drive`
+    correctly challenges Basic.
+  - *CalDAV wire (§3.7):* **minimal VEVENT** (no TRANSP/CLASS) PUT 201 with
+    `busy_status=busy`/`visibility=default` persisted from `Event.Defaults`;
+    `RRULE:FREQ=WEEKLY;BYDAY=TU,TH;COUNT=10` **round-trips byte-identical**
+    (no `VALUE=TEXT` mangling, no dropped rule); cross-user event GET 404.
+  - *Mail scoped read (§3.2 class):* `/api/mail/search?q=…&folder=inbox` 200
+    against the shipped schema — post-P2-7 a bad column would 500 loudly, so
+    the silent-zero failure mode is structurally closed.
 
 ---
 

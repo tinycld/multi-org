@@ -28,6 +28,16 @@ type SpawnRequest struct {
 	SocketPath string
 	BinaryPath string
 
+	// IMAPSocketPath / SMTPSocketPath / MXSocketPath are the per-org unix
+	// sockets the tenant binds its mail listeners on (beside SocketPath, same
+	// dir — the spawner chowns exactly one dir per org). Empty when the org's
+	// resolved package set has no mail: the tenant then starts no mail
+	// listeners at all. The mail router dials these after demuxing a public
+	// :993/:465 connection by SNI or routing a :25 transaction by RCPT TO.
+	IMAPSocketPath string
+	SMTPSocketPath string
+	MXSocketPath   string
+
 	// CardDAVConfig is the path to the JSON source list the child registers
 	// CardDAV routes from, or "" when the org's packages contribute none.
 	CardDAVConfig string

@@ -43,6 +43,19 @@ func controlPlaneMigrations() core.MigrationsList {
 			return nil
 		},
 	})
+	// A separate migration (not folded into the init one) so control planes
+	// provisioned before it gain the collection on their next boot.
+	list.Add(&core.Migration{
+		File: "1900000001_org_mail_domains.go",
+		Up:   createOrgMailDomains,
+		Down: func(txApp core.App) error {
+			c, err := txApp.FindCollectionByNameOrId("org_mail_domains")
+			if err != nil {
+				return nil // already gone
+			}
+			return txApp.Delete(c)
+		},
+	})
 	return list
 }
 
@@ -73,6 +86,32 @@ func createOrgs(app core.App) (*core.Collection, error) {
 		return nil, err
 	}
 	return c, nil
+}
+
+// createOrgMailDomains is the MX routing registry: which org owns a mail
+// domain. The router's :25 frontend routes every RCPT TO through it, so
+//   - `domain` is unique ACROSS orgs — otherwise a hostile org could claim a
+//     sibling's domain and receive its mail;
+//   - the stored value must be a canonical lowercase FQDN (the pattern
+//     rejects uppercase rather than normalizing, so every write path stores
+//     exactly what the relay's case-folded lookup compares against);
+//   - all rules stay nil (superuser-only): the operator assigns domains, the
+//     same trust altitude as the storage ceiling on orgs.
+func createOrgMailDomains(app core.App) error {
+	orgs, err := app.FindCollectionByNameOrId("orgs")
+	if err != nil {
+		return err
+	}
+	c := core.NewBaseCollection("org_mail_domains")
+	c.Fields.Add(&core.RelationField{Name: "org", CollectionId: orgs.Id, MaxSelect: 1, Required: true, CascadeDelete: true})
+	c.Fields.Add(&core.TextField{
+		Name:     "domain",
+		Required: true,
+		Pattern:  `^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$`,
+	})
+	c.Fields.Add(&core.AutodateField{Name: "created", OnCreate: true})
+	c.AddIndex("idx_org_mail_domains_domain", true, "domain", "")
+	return app.Save(c)
 }
 
 func createPackages(app core.App) error {

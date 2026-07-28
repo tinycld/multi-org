@@ -33,17 +33,29 @@ import (
 	text "tinycld.org/packages/text"
 )
 
+// Options carry per-spawn wiring a feature's tenant entry needs beyond the
+// app itself. Zero value = no extras (every feature registers its plain
+// RegisterTenant composition).
+type Options struct {
+	// Mail carries the router-managed mail listeners for this org (see
+	// mail.TenantListeners). Zero value ⇒ mail registers its shared set with
+	// no protocol listeners, exactly as before the mail router existed.
+	Mail mail.TenantListeners
+}
+
 // registrars is the pinned menu: manifest slug → the feature's tenant entry.
 // Adding a row means (1) a `replace tinycld.org/packages/<slug>` in go.mod,
 // (2) the feature exports RegisterTenant, and (3) rebuilding + redeploying
 // the tenant binary. google-takeout-import ships no server Go.
-var registrars = map[string]func(*pocketbase.PocketBase){
-	"calc":     calc.RegisterTenant,
-	"calendar": calendar.RegisterTenant,
-	"contacts": contacts.RegisterTenant,
-	"drive":    drive.RegisterTenant,
-	"mail":     mail.RegisterTenant,
-	"text":     text.RegisterTenant,
+var registrars = map[string]func(*pocketbase.PocketBase, Options){
+	"calc":     func(app *pocketbase.PocketBase, _ Options) { calc.RegisterTenant(app) },
+	"calendar": func(app *pocketbase.PocketBase, _ Options) { calendar.RegisterTenant(app) },
+	"contacts": func(app *pocketbase.PocketBase, _ Options) { contacts.RegisterTenant(app) },
+	"drive":    func(app *pocketbase.PocketBase, _ Options) { drive.RegisterTenant(app) },
+	"mail": func(app *pocketbase.PocketBase, o Options) {
+		mail.RegisterTenantWithListeners(app, o.Mail)
+	},
+	"text": func(app *pocketbase.PocketBase, _ Options) { text.RegisterTenant(app) },
 }
 
 // Register runs the tenant entry of every enabled slug that is on the pinned
@@ -51,7 +63,7 @@ var registrars = map[string]func(*pocketbase.PocketBase){
 // registered and the enabled slugs it has no Go for (TS-only or third-party
 // packages — not an error, but worth a boot log line so a menu omission is
 // visible instead of silent).
-func Register(app *pocketbase.PocketBase, enabled []string) (registered, unknown []string) {
+func Register(app *pocketbase.PocketBase, enabled []string, opts Options) (registered, unknown []string) {
 	slugs := append([]string(nil), enabled...)
 	sort.Strings(slugs)
 	for _, slug := range slugs {
@@ -60,7 +72,7 @@ func Register(app *pocketbase.PocketBase, enabled []string) (registered, unknown
 			unknown = append(unknown, slug)
 			continue
 		}
-		reg(app)
+		reg(app, opts)
 		registered = append(registered, slug)
 	}
 	return registered, unknown

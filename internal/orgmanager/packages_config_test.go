@@ -20,7 +20,11 @@ func TestWritePackagesConfigWritesResolvedSlugs(t *testing.T) {
 		},
 	}}
 
-	path, err := m.writePackagesConfig(orgDir, nil)
+	slugs, err := m.resolvedSlugs(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	path, err := m.writePackagesConfig(orgDir, slugs, true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -50,7 +54,7 @@ func TestWritePackagesConfigWritesEmptySet(t *testing.T) {
 		PackageSlugs: func(_ []lockfile.ResolvedPackage) ([]string, error) { return nil, nil },
 	}}
 
-	path, err := m.writePackagesConfig(orgDir, nil)
+	path, err := m.writePackagesConfig(orgDir, nil, true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -62,7 +66,7 @@ func TestWritePackagesConfigWritesEmptySet(t *testing.T) {
 // No hook wired → no file, empty flag: the child then registers no feature Go.
 func TestWritePackagesConfigSkippedWithoutHook(t *testing.T) {
 	m := &OrgManager{cfg: Config{}}
-	path, err := m.writePackagesConfig(t.TempDir(), nil)
+	path, err := m.writePackagesConfig(t.TempDir(), nil, false)
 	if err != nil {
 		t.Fatal(err)
 	}

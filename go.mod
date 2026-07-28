@@ -40,6 +40,7 @@ require (
 
 require (
 	github.com/Masterminds/semver/v3 v3.5.0
+	github.com/emersion/go-smtp v0.24.0
 	github.com/getsentry/sentry-go v0.44.1
 	tinycld.org/packages/calc v0.0.0-00010101000000-000000000000
 	tinycld.org/packages/calendar v0.0.0-00010101000000-000000000000
@@ -73,7 +74,6 @@ require (
 	github.com/emersion/go-imap/v2 v2.0.0-beta.8 // indirect
 	github.com/emersion/go-message v0.18.2 // indirect
 	github.com/emersion/go-sasl v0.0.0-20241020182733-b788ff22d5a6 // indirect
-	github.com/emersion/go-smtp v0.24.0 // indirect
 	github.com/emersion/go-vcard v0.0.0-20260618161152-d854b7e0e2d3 // indirect
 	github.com/emersion/go-webdav v0.7.0 // indirect
 	github.com/fatih/color v1.19.0 // indirect

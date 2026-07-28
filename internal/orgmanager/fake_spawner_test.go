@@ -35,6 +35,16 @@ type fakeSpawner struct {
 	mu      sync.Mutex
 	spawned int
 	procs   []*fakeProcess
+	reqs    []SpawnRequest
+}
+
+func (f *fakeSpawner) lastReq() SpawnRequest {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if len(f.reqs) == 0 {
+		return SpawnRequest{}
+	}
+	return f.reqs[len(f.reqs)-1]
 }
 
 func (f *fakeSpawner) spawnCount() int {
@@ -55,6 +65,7 @@ func (f *fakeSpawner) lastProc() *fakeProcess {
 func (f *fakeSpawner) Spawn(ctx context.Context, req SpawnRequest, log *slog.Logger) (Process, error) {
 	f.mu.Lock()
 	f.spawned++
+	f.reqs = append(f.reqs, req)
 	f.mu.Unlock()
 
 	proc := &fakeProcess{

@@ -87,6 +87,15 @@ func buildCmd(req SpawnRequest, log *slog.Logger) *exec.Cmd {
 	if req.AppConfig != "" {
 		args = append(args, "--app-config", req.AppConfig)
 	}
+	if req.IMAPSocketPath != "" {
+		args = append(args, "--imap-socket", req.IMAPSocketPath)
+	}
+	if req.SMTPSocketPath != "" {
+		args = append(args, "--smtp-socket", req.SMTPSocketPath)
+	}
+	if req.MXSocketPath != "" {
+		args = append(args, "--mx-socket", req.MXSocketPath)
+	}
 	if req.ConfinePackages {
 		args = append(args, "--confine-packages", req.PackagesDir)
 	}

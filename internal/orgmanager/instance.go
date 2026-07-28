@@ -30,11 +30,23 @@ type OrgInstance struct {
 	// the replacement's. 0 = never recorded (fail safe: don't remove).
 	sockIno uint64
 
+	// mailSocks are the tenant's mail listener sockets (empty paths when the
+	// org's package set has no mail); mailSockRefs carries the same paths with
+	// the inodes recorded at readiness, for the same teardown ownership check
+	// as sockIno.
+	mailSocks    MailSockets
+	mailSockRefs []sockRef
+
 	proc    Process
 	proxy   *httputil.ReverseProxy
 	handler http.Handler // proxy wrapped in the in-flight tracking middleware
 
 	lastUsed atomic.Int64 // unix nanos; seeded at load, updated per proxied request
+
+	// activeConns counts long-lived non-HTTP connections (mail relays) open
+	// against this tenant, so the idle sweeper doesn't evict the org under
+	// them. See TrackConn.
+	activeConns atomic.Int64
 
 	// inflight counts requests currently being proxied so shutdown can drain
 	// them before signalling the child.
@@ -69,6 +81,41 @@ func (i *OrgInstance) Mux() http.Handler { return i.handler }
 func (i *OrgInstance) Slug() string      { return i.slug }
 
 func (i *OrgInstance) touch(now int64) { i.lastUsed.Store(now) }
+
+// sockRef pairs a socket path with the inode recorded when the child bound it.
+type sockRef struct {
+	path string
+	ino  uint64
+}
+
+// MailSockets are the per-org unix sockets a tenant serves mail on. An empty
+// path means the tenant runs no such listener (the org's package set has no
+// mail) — the mail router then refuses the connection rather than dialing.
+type MailSockets struct {
+	IMAP string
+	SMTP string
+	MX   string
+}
+
+// MailSockets returns the tenant's mail listener socket paths.
+func (i *OrgInstance) MailSockets() MailSockets { return i.mailSocks }
+
+// TrackConn registers a long-lived non-HTTP connection (an IMAP session, an
+// SMTP relay) against this instance so the idle sweeper won't evict the org
+// under it, and returns the release func. Unlike proxied HTTP these sessions
+// don't refresh lastUsed per request, so counting them is the only idle
+// signal. The release func is idempotent.
+func (i *OrgInstance) TrackConn() func() {
+	i.activeConns.Add(1)
+	i.touch(time.Now().UnixNano())
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			i.activeConns.Add(-1)
+			i.touch(time.Now().UnixNano())
+		})
+	}
+}
 
 // ForwardedConfig tells the per-tenant proxy how to build the X-Forwarded-*
 // headers it hands a tenant. The contract with the tenant is positional: the
@@ -244,19 +291,27 @@ func (i *OrgInstance) shutdown(drain, kill time.Duration) {
 			<-i.dead // the supervisor's Wait always returns once the child is killed
 		}
 
-		// Remove only a socket this instance still owns. An Evict-then-Get
-		// respawns the org on the same deterministic path while this teardown
+		// Remove only sockets this instance still owns. An Evict-then-Get
+		// respawns the org on the same deterministic paths while this teardown
 		// is still draining; removing unconditionally here would delete the
-		// REPLACEMENT's socket — every dial then ENOENTs into 502 while the
+		// REPLACEMENT's sockets — every dial then ENOENTs into 502 while the
 		// supervisor still believes the new instance healthy, so nothing
 		// respawns it until the idle sweep.
-		if !i.ownsSocket() {
+		if i.ownsSocket() {
+			if err := os.Remove(i.sockPath); err != nil && !os.IsNotExist(err) {
+				i.log.Warn("could not remove tenant socket", "slug", i.slug, "error", err)
+			}
+		} else {
 			i.log.Debug("skipping socket removal; path no longer this instance's",
 				"slug", i.slug)
-			return
 		}
-		if err := os.Remove(i.sockPath); err != nil && !os.IsNotExist(err) {
-			i.log.Warn("could not remove tenant socket", "slug", i.slug, "error", err)
+		for _, ref := range i.mailSockRefs {
+			if !socketOwned(ref.path, ref.ino) {
+				continue
+			}
+			if err := os.Remove(ref.path); err != nil && !os.IsNotExist(err) {
+				i.log.Warn("could not remove tenant mail socket", "slug", i.slug, "path", ref.path, "error", err)
+			}
 		}
 	})
 }
@@ -268,13 +323,19 @@ func (i *OrgInstance) shutdown(drain, kill time.Duration) {
 // atomic, but it shrinks the race from the whole drain+kill budget (15s) to
 // microseconds — and a replacement cannot finish a spawn in that window.
 func (i *OrgInstance) ownsSocket() bool {
-	if i.sockIno == 0 {
+	return socketOwned(i.sockPath, i.sockIno)
+}
+
+// socketOwned is ownsSocket generalized over any recorded socket. ino 0 means
+// "never recorded" and fails safe: don't remove.
+func socketOwned(path string, ino uint64) bool {
+	if ino == 0 {
 		return false
 	}
-	st, err := os.Stat(i.sockPath)
+	st, err := os.Stat(path)
 	if err != nil {
 		return false
 	}
 	sys, ok := st.Sys().(*syscall.Stat_t)
-	return ok && sys.Ino == i.sockIno
+	return ok && sys.Ino == ino
 }

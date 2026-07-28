@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"slices"
 	"sync"
 	"syscall"
 	"time"
@@ -278,7 +279,12 @@ func (m *OrgManager) load(ctx context.Context, slug string) (*OrgInstance, error
 		return nil, fmt.Errorf("quota config %s: %w", slug, err)
 	}
 
-	packagesConfig, err := m.writePackagesConfig(orgDir, resolved)
+	slugs, err := m.resolvedSlugs(resolved)
+	if err != nil {
+		return nil, fmt.Errorf("resolve package slugs %s: %w", slug, err)
+	}
+
+	packagesConfig, err := m.writePackagesConfig(orgDir, slugs, m.cfg.PackageSlugs != nil)
 	if err != nil {
 		return nil, fmt.Errorf("packages config %s: %w", slug, err)
 	}
@@ -295,7 +301,7 @@ func (m *OrgManager) load(ctx context.Context, slug string) (*OrgInstance, error
 		quota:    quotaConfig,
 		packages: packagesConfig,
 		app:      appConfig,
-	})
+	}, slices.Contains(slugs, "mail"))
 	if err != nil {
 		m.noteCrash(slug)
 		return nil, err
@@ -330,15 +336,18 @@ type runtimeConfigs struct {
 }
 
 // spawn starts the tenant process and waits for it to report readiness.
-func (m *OrgManager) spawn(ctx context.Context, slug, orgDir string, cfgs runtimeConfigs) (*OrgInstance, error) {
-	sockPath, err := m.socketPath(slug)
+func (m *OrgManager) spawn(ctx context.Context, slug, orgDir string, cfgs runtimeConfigs, withMail bool) (*OrgInstance, error) {
+	socks, err := m.socketPaths(slug, withMail)
 	if err != nil {
 		return nil, err
 	}
-	// A predecessor killed with SIGKILL leaves its socket file behind, and a
-	// stale socket dials ambiguously. Clear it before the child binds.
-	if err := os.Remove(sockPath); err != nil && !os.IsNotExist(err) {
-		return nil, fmt.Errorf("%w: clear stale socket for %s: %v", orgerr.ErrOrgUnavailable, slug, err)
+	sockPath := socks.http
+	// A predecessor killed with SIGKILL leaves its socket files behind, and a
+	// stale socket dials ambiguously. Clear them before the child binds.
+	for _, p := range socks.all() {
+		if err := os.Remove(p); err != nil && !os.IsNotExist(err) {
+			return nil, fmt.Errorf("%w: clear stale socket for %s: %v", orgerr.ErrOrgUnavailable, slug, err)
+		}
 	}
 
 	readyR, readyW, err := os.Pipe()
@@ -352,6 +361,9 @@ func (m *OrgManager) spawn(ctx context.Context, slug, orgDir string, cfgs runtim
 		Slug:           slug,
 		OrgDir:         orgDir,
 		SocketPath:     sockPath,
+		IMAPSocketPath: socks.imap,
+		SMTPSocketPath: socks.smtp,
+		MXSocketPath:   socks.mx,
 		BinaryPath:     m.cfg.TenantBinary,
 		CardDAVConfig:  cfgs.cardDAV,
 		CalDAVConfig:   cfgs.calDAV,
@@ -374,6 +386,7 @@ func (m *OrgManager) spawn(ctx context.Context, slug, orgDir string, cfgs runtim
 	inst := &OrgInstance{
 		slug:      slug,
 		sockPath:  sockPath,
+		mailSocks: MailSockets{IMAP: socks.imap, SMTP: socks.smtp, MX: socks.mx},
 		proc:      proc,
 		proxy:     newProxy(sockPath, m.cfg.Forwarded, log),
 		closed:    make(chan struct{}),
@@ -403,17 +416,33 @@ func (m *OrgManager) spawn(ctx context.Context, slug, orgDir string, cfgs runtim
 		return nil, err
 	}
 
-	// Record which socket file the child bound, so a later teardown can tell
-	// its own socket from a replacement's that re-bound the same path (see
-	// OrgInstance.ownsSocket).
-	if st, err := os.Stat(sockPath); err == nil {
-		if sys, ok := st.Sys().(*syscall.Stat_t); ok {
-			inst.sockIno = sys.Ino
+	// Record which socket files the child bound, so a later teardown can tell
+	// its own sockets from a replacement's that re-bound the same paths (see
+	// OrgInstance.ownsSocket). Mail sockets bind before readiness (the mail
+	// listeners start during the tenant's OnServe chain), so their inodes are
+	// observable here too.
+	inst.sockIno = socketInode(sockPath)
+	for _, p := range []string{socks.imap, socks.smtp, socks.mx} {
+		if p != "" {
+			inst.mailSockRefs = append(inst.mailSockRefs, sockRef{path: p, ino: socketInode(p)})
 		}
 	}
 
 	m.clearCrash(slug)
 	return inst, nil
+}
+
+// socketInode returns the inode of the file at path, or 0 when unobservable —
+// the fail-safe value: teardown skips removal for a socket it cannot identify.
+func socketInode(path string) uint64 {
+	st, err := os.Stat(path)
+	if err != nil {
+		return 0
+	}
+	if sys, ok := st.Sys().(*syscall.Stat_t); ok {
+		return sys.Ino
+	}
+	return 0
 }
 
 // maxSocketPath is the practical ceiling for a unix socket path. The kernel's
@@ -422,48 +451,101 @@ func (m *OrgManager) spawn(ctx context.Context, slug, orgDir string, cfgs runtim
 // NUL and keeps one limit across platforms.
 const maxSocketPath = 100
 
-// socketPath resolves an org's socket, falling back to a short path under the
-// system temp dir when MT_ROOT is deep enough to overrun the kernel's limit.
+// Basenames of the per-org mail sockets. Fixed short names: they share the
+// org's socket directory (and its sun_path budget) with the HTTP socket.
+const (
+	imapSockName = "imap.sock"
+	smtpSockName = "smtp.sock"
+	mxSockName   = "mx.sock"
+)
+
+// orgSockets are the unix sockets one org's tenant serves on. http is always
+// set; the mail sockets are set only for an org whose resolved package set
+// includes mail.
+type orgSockets struct {
+	http string
+	imap string
+	smtp string
+	mx   string
+}
+
+// all returns the non-empty socket paths.
+func (s orgSockets) all() []string {
+	out := []string{s.http}
+	for _, p := range []string{s.imap, s.smtp, s.mx} {
+		if p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+// socketPaths resolves an org's socket directory and every socket in it,
+// falling back to a short path under the system temp dir when MT_ROOT is deep
+// enough to overrun the kernel's limit.
 //
-// Each socket lives in its own per-org directory. The Linux spawner chowns
-// that directory — and only that directory — to the tenant's uid; a shared
-// socket directory would end up owned by whichever tenant spawned last, and
-// owning the directory is owning every org's socket: unlink a sibling's and
-// bind your own in its place to intercept that org's traffic. The parent is
-// traversal-only (0711): tenants pass through it to reach their own dir but
-// cannot list it or unlink each other's.
-func (m *OrgManager) socketPath(slug string) (string, error) {
-	runDir := filepath.Join(m.cfg.Root, "run")
-	primary := filepath.Join(runDir, slug, slug+".sock")
-	if len(primary) <= maxSocketPath {
-		if err := os.MkdirAll(runDir, 0o711); err != nil {
-			return "", fmt.Errorf("%w: create run dir for %s: %v", orgerr.ErrOrgUnavailable, slug, err)
+// All of an org's sockets live in ONE per-org directory. The Linux spawner
+// chowns that directory — and only that directory — to the tenant's uid; a
+// shared socket directory would end up owned by whichever tenant spawned
+// last, and owning the directory is owning every org's socket: unlink a
+// sibling's and bind your own in its place to intercept that org's traffic.
+// The parent is traversal-only (0711): tenants pass through it to reach their
+// own dir but cannot list it or unlink each other's. The primary-vs-fallback
+// decision is therefore made once per org, on the longest basename needed —
+// splitting an org's sockets across directories would leave some in a dir the
+// spawner never chowned.
+func (m *OrgManager) socketPaths(slug string, withMail bool) (orgSockets, error) {
+	longestBase := func(httpBase string) string {
+		longest := httpBase
+		if withMail {
+			for _, n := range []string{imapSockName, smtpSockName, mxSockName} {
+				if len(n) > len(longest) {
+					longest = n
+				}
+			}
 		}
-		if err := os.MkdirAll(filepath.Dir(primary), 0o700); err != nil {
-			return "", fmt.Errorf("%w: create socket dir for %s: %v", orgerr.ErrOrgUnavailable, slug, err)
+		return longest
+	}
+	build := func(dir, httpBase string) orgSockets {
+		s := orgSockets{http: filepath.Join(dir, httpBase)}
+		if withMail {
+			s.imap = filepath.Join(dir, imapSockName)
+			s.smtp = filepath.Join(dir, smtpSockName)
+			s.mx = filepath.Join(dir, mxSockName)
 		}
-		return primary, nil
+		return s
 	}
 
-	// The socket is a rendezvous point, not state: it is recreated on every
-	// spawn and removed on teardown, so relocating it costs nothing. The
-	// fallback exists because the primary overran sun_path, so it spends its
-	// budget carefully: the slug appears only as the per-org directory name
-	// and the socket itself keeps a fixed short basename.
+	runDir := filepath.Join(m.cfg.Root, "run")
+	primaryDir := filepath.Join(runDir, slug)
+	if len(filepath.Join(primaryDir, longestBase(slug+".sock"))) <= maxSocketPath {
+		if err := os.MkdirAll(runDir, 0o711); err != nil {
+			return orgSockets{}, fmt.Errorf("%w: create run dir for %s: %v", orgerr.ErrOrgUnavailable, slug, err)
+		}
+		if err := os.MkdirAll(primaryDir, 0o700); err != nil {
+			return orgSockets{}, fmt.Errorf("%w: create socket dir for %s: %v", orgerr.ErrOrgUnavailable, slug, err)
+		}
+		return build(primaryDir, slug+".sock"), nil
+	}
+
+	// The sockets are rendezvous points, not state: they are recreated on
+	// every spawn and removed on teardown, so relocating them costs nothing.
+	// The fallback exists because the primary overran sun_path, so it spends
+	// its budget carefully: the slug appears only as the per-org directory
+	// name and the sockets keep fixed short basenames.
 	digest := sha256.Sum256([]byte(m.cfg.Root))
 	fallbackParent := filepath.Join(os.TempDir(), fmt.Sprintf("mt-%x", digest[:6]))
 	fallbackDir := filepath.Join(fallbackParent, slug)
-	fallback := filepath.Join(fallbackDir, "s.sock")
-	if len(fallback) > maxSocketPath {
-		return "", fmt.Errorf("%w: socket path for %s exceeds %d bytes", orgerr.ErrOrgUnavailable, slug, maxSocketPath)
+	if len(filepath.Join(fallbackDir, longestBase("s.sock"))) > maxSocketPath {
+		return orgSockets{}, fmt.Errorf("%w: socket path for %s exceeds %d bytes", orgerr.ErrOrgUnavailable, slug, maxSocketPath)
 	}
 	if err := os.MkdirAll(fallbackParent, 0o711); err != nil {
-		return "", fmt.Errorf("%w: create socket parent dir for %s: %v", orgerr.ErrOrgUnavailable, slug, err)
+		return orgSockets{}, fmt.Errorf("%w: create socket parent dir for %s: %v", orgerr.ErrOrgUnavailable, slug, err)
 	}
 	if err := os.MkdirAll(fallbackDir, 0o700); err != nil {
-		return "", fmt.Errorf("%w: create socket dir for %s: %v", orgerr.ErrOrgUnavailable, slug, err)
+		return orgSockets{}, fmt.Errorf("%w: create socket dir for %s: %v", orgerr.ErrOrgUnavailable, slug, err)
 	}
-	return fallback, nil
+	return build(fallbackDir, "s.sock"), nil
 }
 
 // readyMsg is the single line a tenant writes to its readiness pipe.
@@ -561,6 +643,9 @@ func (m *OrgManager) supervise(inst *OrgInstance) {
 
 	m.noteCrash(inst.slug)
 	_ = os.Remove(inst.sockPath)
+	for _, ref := range inst.mailSockRefs {
+		_ = os.Remove(ref.path)
+	}
 	m.cfg.Logger.Error("tenant process exited unexpectedly",
 		"slug", inst.slug, "pid", inst.proc.Pid(), "error", inst.exitErr)
 }
@@ -688,17 +773,25 @@ type quotaConfigFile struct {
 	Sources           []davconfig.QuotaSource `json:"sources"`
 }
 
+// resolvedSlugs resolves the org's package slugs through the configured hook.
+// Nil hook ⇒ nil slugs (the host manages no package set; the child registers
+// no feature Go and gets no mail sockets).
+func (m *OrgManager) resolvedSlugs(resolved []lockfile.ResolvedPackage) ([]string, error) {
+	if m.cfg.PackageSlugs == nil {
+		return nil, nil
+	}
+	return m.cfg.PackageSlugs(resolved)
+}
+
 // writePackagesConfig materializes the org's resolved package slugs where the
 // tenant can read them. Like quota.json it is ALWAYS written when the hook is
 // wired — an empty slug list must be indistinguishable from "no packages
-// installed" (register no feature Go), never from "config missing".
-func (m *OrgManager) writePackagesConfig(orgDir string, resolved []lockfile.ResolvedPackage) (string, error) {
-	if m.cfg.PackageSlugs == nil {
+// installed" (register no feature Go), never from "config missing". `wired`
+// carries whether the PackageSlugs hook exists at all (the caller resolves
+// the slugs once, for this file AND the mail-socket decision).
+func (m *OrgManager) writePackagesConfig(orgDir string, slugs []string, wired bool) (string, error) {
+	if !wired {
 		return "", nil
-	}
-	slugs, err := m.cfg.PackageSlugs(resolved)
-	if err != nil {
-		return "", err
 	}
 
 	runtimeDir := filepath.Join(orgDir, ".runtime")
@@ -896,20 +989,28 @@ func (m *OrgManager) sweep() {
 		select {
 		case <-m.stop:
 			return
-		case now := <-ticker.C:
-			cutoff := now.Add(-m.cfg.MaxIdle).UnixNano()
-			m.mu.RLock()
-			var stale []string
-			for slug, inst := range m.orgs {
-				lu := inst.lastUsed.Load()
-				if lu != 0 && lu < cutoff {
-					stale = append(stale, slug)
-				}
-			}
-			m.mu.RUnlock()
-			for _, slug := range stale {
-				m.Evict(slug)
-			}
+		case <-ticker.C:
+			m.sweepOnce()
 		}
+	}
+}
+
+// sweepOnce evicts every instance idle longer than MaxIdle. An instance with
+// tracked connections open (long-lived IMAP/SMTP relays — see TrackConn) is
+// never idle: evicting it would kill the tenant mid-session, and unlike HTTP
+// those sessions don't refresh lastUsed per request.
+func (m *OrgManager) sweepOnce() {
+	cutoff := time.Now().Add(-m.cfg.MaxIdle).UnixNano()
+	m.mu.RLock()
+	var stale []string
+	for slug, inst := range m.orgs {
+		lu := inst.lastUsed.Load()
+		if lu != 0 && lu < cutoff && inst.activeConns.Load() == 0 {
+			stale = append(stale, slug)
+		}
+	}
+	m.mu.RUnlock()
+	for _, slug := range stale {
+		m.Evict(slug)
 	}
 }

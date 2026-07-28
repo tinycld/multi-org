@@ -17,7 +17,9 @@ import (
 	"github.com/pocketbase/pocketbase/apis"
 	"github.com/pocketbase/pocketbase/core"
 
+	"tinycld.org/core/mailproto"
 	"tinycld.org/multi-org/internal/controlplane"
+	"tinycld.org/multi-org/internal/mailrouter"
 	"tinycld.org/multi-org/internal/orgmanager"
 	"tinycld.org/multi-org/internal/server"
 	"tinycld.org/multi-org/internal/store"
@@ -89,6 +91,15 @@ func run() error {
 	})
 	defer mgr.Shutdown()
 
+	// The mail ports (:993/:465/:25), opt-in via MT_MAIL_PORTS_ENABLED. Same
+	// lifetime rules as the manager: started before serving, shut down by
+	// defer so tenants' relayed connections aren't orphaned past run().
+	mailShutdown, err := startMailPorts(baseDomain, cp, mgr)
+	if err != nil {
+		return fmt.Errorf("mail ports: %w", err)
+	}
+	defer mailShutdown()
+
 	// Provision-time verification boots the new org through the manager: the
 	// first spawn applies the org's migrations inside the CONFINED tenant
 	// process (the control plane never runs tenant JS), and a failure comes
@@ -127,6 +138,69 @@ func run() error {
 		return fmt.Errorf("serve: %w", err)
 	}
 	return nil
+}
+
+// startMailPorts boots the mail router (IMAPS/SMTPS SNI demux + the :25 MX
+// frontend) when MT_MAIL_PORTS_ENABLED=true. The router must terminate mail
+// TLS itself — tenants never hold the wildcard key — so a TLS source is
+// REQUIRED here: MT_MAIL_TLS_CERT/MT_MAIL_TLS_KEY, falling back to
+// MT_TLS_CERT/MT_TLS_KEY (the file-mode HTTPS pair). Enabled-but-unservable
+// is a hard boot error, not a warning: a deployment that asked for mail ports
+// and came up healthy on HTTP with mail silently absent is the classic
+// misconfiguration mailproto's own startup guards exist for.
+//
+// Addresses default to :993/:465/:25; MT_IMAPS_ADDR/MT_SMTPS_ADDR/MT_MX_ADDR
+// override, and the literal value "off" disables that one listener (e.g. an
+// operator using a provider webhook for inbound keeps MX off).
+func startMailPorts(baseDomain string, cp *controlplane.ControlPlane, mgr *orgmanager.OrgManager) (func(), error) {
+	if os.Getenv("MT_MAIL_PORTS_ENABLED") != "true" {
+		return func() {}, nil
+	}
+
+	tlsCfg, err := mailproto.ResolveTLSConfig("MT_MAIL_TLS_CERT", "MT_MAIL_TLS_KEY", "MT_TLS_CERT", "MT_TLS_KEY", nil)
+	if err != nil {
+		return nil, err
+	}
+	if tlsCfg == nil {
+		return nil, fmt.Errorf("MT_MAIL_PORTS_ENABLED=true but no TLS source: "+
+			"set MT_MAIL_TLS_CERT/MT_MAIL_TLS_KEY (or the MT_TLS_CERT/MT_TLS_KEY pair) "+
+			"to a *.%s cert, or unset MT_MAIL_PORTS_ENABLED", baseDomain)
+	}
+
+	addr := func(env, def string) string {
+		switch v := os.Getenv(env); v {
+		case "":
+			return def
+		case "off":
+			return ""
+		default:
+			return v
+		}
+	}
+
+	r := mailrouter.New(mailrouter.Config{
+		BaseDomain: baseDomain,
+		GetOrg: func(ctx context.Context, slug string) (mailrouter.Tenant, error) {
+			inst, err := mgr.Get(ctx, slug)
+			if err != nil {
+				return nil, err
+			}
+			return inst, nil
+		},
+		LookupDomain: controlplane.MailDomainLookup(cp.App),
+		TLS:          tlsCfg,
+		Logger:       slog.Default(),
+		IMAPSAddr:    addr("MT_IMAPS_ADDR", ":993"),
+		SMTPSAddr:    addr("MT_SMTPS_ADDR", ":465"),
+		MXAddr:       addr("MT_MX_ADDR", ":25"),
+		MXHostname:   os.Getenv("MT_MX_HOSTNAME"),
+	})
+	if err := r.Start(); err != nil {
+		return nil, err
+	}
+	log.Printf("mail ports listening (imaps=%v smtps=%v mx=%v)",
+		r.IMAPSListenerAddr(), r.SMTPSListenerAddr(), r.MXListenerAddr())
+	return r.Shutdown, nil
 }
 
 // defaultTenantBinary resolves serve-org next to this executable.

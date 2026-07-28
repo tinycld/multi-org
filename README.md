@@ -84,6 +84,10 @@ deployed pair stays together without configuration.
 | `MT_TENANT_MEMORY_MAX` | — | **Linux.** Per-tenant `memory.max`: bytes with optional `K`/`M`/`G`/`T` suffix (e.g. `512M`), or `max`. Unset ⇒ unlimited. |
 | `MT_TENANT_PIDS_MAX` | — | **Linux.** Per-tenant `pids.max`: positive integer (e.g. `256`), or `max`. Unset ⇒ unlimited. |
 | `MT_TENANT_CPU_MAX` | — | **Linux.** Per-tenant CPU as cores, a positive decimal (e.g. `1.5`), or `max`. Written as `cpu.max` quota against a 100ms period. Unset ⇒ unlimited. |
+| `MT_MAIL_PORTS_ENABLED` | — | `true` boots the mail router: IMAPS/SMTPS demuxed to orgs by TLS SNI (`<slug>.<base>`), the MX routed by RCPT TO via the `org_mail_domains` registry. Requires a TLS source — enabled-but-certless is a boot error. |
+| `MT_MAIL_TLS_CERT`, `MT_MAIL_TLS_KEY` | falls back to `MT_TLS_CERT`/`MT_TLS_KEY` | Wildcard cert the router terminates mail TLS with. Tenants never hold this key. |
+| `MT_IMAPS_ADDR`, `MT_SMTPS_ADDR`, `MT_MX_ADDR` | `:993`, `:465`, `:25` | Mail listener addresses; the literal value `off` disables that one listener. |
+| `MT_MX_HOSTNAME` | `MT_BASE_DOMAIN` | Identity the `:25` greeting announces and the HELO name toward tenants. |
 
 None of these reach a tenant process: children are spawned with an explicitly
 constructed environment (see the security section).

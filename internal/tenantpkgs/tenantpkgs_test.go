@@ -19,7 +19,7 @@ func TestRegisterGatesBySlug(t *testing.T) {
 
 	// nil enabled set → nothing registered, nothing unknown.
 	empty := pocketbase.NewWithConfig(pocketbase.Config{DefaultDataDir: t.TempDir()})
-	registered, unknown := Register(empty, nil)
+	registered, unknown := Register(empty, nil, Options{})
 	if len(registered) != 0 || len(unknown) != 0 {
 		t.Fatalf("Register(nil) = %v, %v; want none registered, none unknown", registered, unknown)
 	}
@@ -30,7 +30,7 @@ func TestRegisterGatesBySlug(t *testing.T) {
 	// An enabled menu slug registers its Go; a slug with no Go on the menu
 	// (TS-only or third-party package) is reported, not an error.
 	app := pocketbase.NewWithConfig(pocketbase.Config{DefaultDataDir: t.TempDir()})
-	registered, unknown = Register(app, []string{"acme-custom", "contacts"})
+	registered, unknown = Register(app, []string{"acme-custom", "contacts"}, Options{})
 	if !reflect.DeepEqual(registered, []string{"contacts"}) {
 		t.Fatalf("registered = %v, want [contacts]", registered)
 	}

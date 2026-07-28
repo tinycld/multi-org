@@ -56,11 +56,13 @@ import (
 	"tinycld.org/core/caldav"
 	"tinycld.org/core/carddav"
 	"tinycld.org/core/coreserver"
+	"tinycld.org/core/mailproto"
 	"tinycld.org/core/quota"
 	"tinycld.org/core/webdav"
 	"tinycld.org/multi-org/internal/davconfig"
 	"tinycld.org/multi-org/internal/orgcookie"
 	"tinycld.org/multi-org/internal/tenantpkgs"
+	mail "tinycld.org/packages/mail"
 )
 
 func main() {
@@ -76,6 +78,9 @@ func main() {
 		pkgsConfig   = flag.String("packages-config", "", "path to the org's materialized packages.json (resolved slugs)")
 		appConfig    = flag.String("app-config", "", "path to the org's materialized app.json (public URL + proxy trust)")
 		davConfig    = flag.String("carddav-config", "", "path to the CardDAV source JSON")
+		imapSocket   = flag.String("imap-socket", "", "unix socket to serve IMAP on (router-managed; empty = no IMAP)")
+		smtpSocket   = flag.String("smtp-socket", "", "unix socket to serve SMTP submission on (router-managed; empty = no submission)")
+		mxSocket     = flag.String("mx-socket", "", "unix socket to serve inbound MX SMTP on (router-managed; empty = no inbound)")
 		drain        = flag.Duration("drain", 10*time.Second, "graceful shutdown budget")
 		confinePkg   = flag.String("confine-packages", "", "remount this dir read-only in our mount namespace")
 	)
@@ -93,14 +98,22 @@ func main() {
 		ready = os.NewFile(uintptr(*readyFD), "ready")
 	}
 
-	if err := run(*orgDir, *socketPath, *slug, *hooksPool, *davConfig, *caldavConfig, *webdavConfig, *quotaConfig, *pkgsConfig, *appConfig, *confinePkg, *drain, ready); err != nil {
+	mailSocks := mailSocketPaths{imap: *imapSocket, smtp: *smtpSocket, mx: *mxSocket}
+	if err := run(*orgDir, *socketPath, *slug, *hooksPool, *davConfig, *caldavConfig, *webdavConfig, *quotaConfig, *pkgsConfig, *appConfig, *confinePkg, mailSocks, *drain, ready); err != nil {
 		reportNotReady(ready, err)
 		log.Fatalf("serve-org: %v", err)
 	}
 }
 
+// mailSocketPaths are the router-managed mail sockets this tenant binds and
+// serves mail on (empty = the org runs no such listener). Grouped so the
+// three same-typed paths can't be transposed at a call site.
+type mailSocketPaths struct {
+	imap, smtp, mx string
+}
+
 func run(orgDir, socketPath, slug string, hooksPool int, davConfigPath, caldavConfigPath, webdavConfigPath, quotaConfigPath, pkgsConfigPath, appConfigPath, confinePkg string,
-	drain time.Duration, ready *os.File) error {
+	mailSocks mailSocketPaths, drain time.Duration, ready *os.File) error {
 
 	// Confinement steps that must happen inside our own mount namespace. Go
 	// cannot run code between fork and exec, so the parent creates the
@@ -164,7 +177,13 @@ func run(orgDir, socketPath, slug string, hooksPool int, davConfigPath, caldavCo
 		// (TS-only or third-party package) but logged, so a menu omission is
 		// visible at boot instead of silently serving rules-only.
 		RegisterExtras: func(app *pocketbase.PocketBase) {
-			registered, unknown := tenantpkgs.Register(app, pkgSlugs)
+			registered, unknown := tenantpkgs.Register(app, pkgSlugs, tenantpkgs.Options{
+				// Router-managed mail sockets (empty when the org has no mail
+				// package or the router runs no mail ports). The ListenFuncs
+				// bind lazily, during mail's OnServe — before readiness is
+				// reported, so a bind failure still fails the boot loudly.
+				Mail: tenantMailListeners(mailSocks),
+			})
 			log.Printf("serve-org[%s]: feature Go registered=%v ts-only=%v", slug, registered, unknown)
 		},
 		QuotaSources:   davconfig.DecodeQuota(quotaCfg.Sources),
@@ -243,30 +262,9 @@ func run(orgDir, socketPath, slug string, hooksPool int, davConfigPath, caldavCo
 		}
 	}
 
-	// bind(2) creates the socket file honouring the umask, so mask it to 0600
-	// AT creation instead of chmodding after — the chmod below still runs as a
-	// belt, but without the umask there is a window where the socket sits at
-	// 0755. Process-wide, but nothing else in this process creates files
-	// between here and the restore. (On the primary layout the per-org socket
-	// dir is 0700 anyway; the fallback dir and defence-in-depth want this.)
-	oldUmask := syscall.Umask(0o177)
-	listener, err := net.Listen("unix", socketPath)
-	syscall.Umask(oldUmask)
+	listener, err := bindTenantSocket(socketPath)
 	if err != nil {
-		return fmt.Errorf("listen on %s: %w", socketPath, err)
-	}
-	// The ROUTER owns the socket file's lifecycle, not us. On Evict-then-Get a
-	// replacement binds this same deterministic path while we are still
-	// draining, and Go's default unlink-on-close would delete the
-	// REPLACEMENT's socket when our listener finally closes — permanently
-	// 502ing the org. The router clears stale files before each bind and
-	// guards its own teardown removal by inode.
-	if ul, ok := listener.(*net.UnixListener); ok {
-		ul.SetUnlinkOnClose(false)
-	}
-	// Only the router connects to this socket; the tenant uid owns it.
-	if err := os.Chmod(socketPath, 0o600); err != nil {
-		return fmt.Errorf("chmod socket: %w", err)
+		return err
 	}
 
 	// Captured from the ServeEvent so the signal handler can drain the real
@@ -324,6 +322,56 @@ func run(orgDir, socketPath, slug string, hooksPool int, davConfigPath, caldavCo
 		return err
 	}
 	return nil
+}
+
+// bindTenantSocket binds a unix socket the router handed us — the HTTP socket
+// and each mail socket share this contract:
+//
+//   - bind(2) creates the socket file honouring the umask, so mask it to 0600
+//     AT creation instead of chmodding after — the chmod below still runs as a
+//     belt, but without the umask there is a window where the socket sits at
+//     0755. Process-wide, but socket binds in this process are sequential.
+//     (On the primary layout the per-org socket dir is 0700 anyway; the
+//     fallback dir and defence-in-depth want this.)
+//   - The ROUTER owns the socket file's lifecycle, not us. On Evict-then-Get
+//     a replacement binds this same deterministic path while we are still
+//     draining, and Go's default unlink-on-close would delete the
+//     REPLACEMENT's socket when our listener finally closes — permanently
+//     breaking the org. The router clears stale files before each bind and
+//     guards its own teardown removal by inode.
+//   - Only the router connects to these sockets; the tenant uid owns them.
+func bindTenantSocket(path string) (net.Listener, error) {
+	oldUmask := syscall.Umask(0o177)
+	ln, err := net.Listen("unix", path)
+	syscall.Umask(oldUmask)
+	if err != nil {
+		return nil, fmt.Errorf("listen on %s: %w", path, err)
+	}
+	if ul, ok := ln.(*net.UnixListener); ok {
+		ul.SetUnlinkOnClose(false)
+	}
+	if err := os.Chmod(path, 0o600); err != nil {
+		ln.Close()
+		return nil, fmt.Errorf("chmod socket %s: %w", path, err)
+	}
+	return ln, nil
+}
+
+// tenantMailListeners adapts the router-managed mail socket paths into the
+// ListenFuncs mail's tenant entry serves on. Empty path ⇒ nil ListenFunc ⇒
+// that service is not started.
+func tenantMailListeners(socks mailSocketPaths) mail.TenantListeners {
+	mk := func(path string) mailproto.ListenFunc {
+		if path == "" {
+			return nil
+		}
+		return func(string) (net.Listener, error) { return bindTenantSocket(path) }
+	}
+	return mail.TenantListeners{
+		IMAP:       mk(socks.imap),
+		Submission: mk(socks.smtp),
+		InboundMX:  mk(socks.mx),
+	}
 }
 
 // quotaConfig is the shape of .runtime/quota.json, written by the router.

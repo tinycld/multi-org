@@ -5,9 +5,11 @@
 "still open" list was then worked the same day: org branding + the cross-org
 switcher shipped, peerVersions settled and enforced, the userorg package
 renamed, the DeleteAccountModal and disabled-mailbox decisions made, mailproto
-gained its injected-listener seam, and the upstream branches are pushed. What
-remains open in §6 is only the router-side IMAP/SMTP demux/handoff and the
-solver's target-manifest re-check follow-up.)
+gained its injected-listener seam, and the upstream branches are pushed.
+**Later the same day the router-side IMAP/SMTP demux/handoff shipped too**
+(`internal/mailrouter` + `org_mail_domains` + per-org mail sockets — see the
+protocol-servers entry in §6). What remains open in §6 is only the solver's
+target-manifest re-check follow-up.)
 **Goal:** one router hosts many organizations — each org its own **OS process**,
 SQLite DB, client bundle, and server-side JS, sharing versioned code on disk but
 isolated at the kernel boundary.
@@ -582,17 +584,62 @@ matches:
   CalDAV followed the **WebDAV** shape, not CardDAV's: a `Source` field map plus
   four opt-in TS hook points (`beforeWrite`, `beforeDelete`, `canRead`,
   `filterList` — no `beforeMove`, since CalDAV has no cross-calendar move).
-  IMAP/SMTP are the remaining case, and the mailproto half is now DONE
-  (2026-07-28): `mailproto.ListenFunc` (on `IMAPOptions`/`SMTPOptions`)
-  replaces every TCP bind with a host-supplied listener — TLS wrapping stays in
-  mailproto, and `mailproto/listen_test.go` pins that an injected listener is
-  served on with the configured address never bound. **What remains is
-  router-side**: demux an inbound connection to an org (TLS SNI for
-  IMAPS :993 / SMTPS :465; the MX :25 has no reliable SNI and must route on
-  RCPT TO domain), hand each tenant its listener (the `ExtraFiles` fd
-  precedent, spawn_exec.go), and thread a ListenFunc through
-  `coreserver.RegisterTenant` → mail's `RegisterTenant`. Until then the
-  listeners stay host-only (mail `register.go` documents the same state).
+  ~~IMAP/SMTP are the remaining case~~ **CLOSED (2026-07-28) — per-tenant
+  IMAP/SMTP ships end-to-end.** Two design decisions were made explicitly
+  (user-confirmed): **the router terminates mail TLS** — handing every tenant
+  the wildcard private key would put the key that authenticates every org
+  inside each tenant's address space, exactly what the isolation exists to
+  prevent — and **the MX ships in full** (registry + relay, not deferred).
+  The shape:
+  - `internal/mailrouter` owns the public ports. IMAPS :993 / SMTPS :465 are
+    demuxed by **TLS SNI** (clients configure `<slug>.<baseDomain>`): the
+    router handshakes with the wildcard cert, resolves the slug, brings the
+    org up via the same `mgr.Get` as HTTP, and **splices plaintext onto the
+    org's `imap.sock`/`smtp.sock`**. Refusals are byte-identical across
+    unknown/suspended/mail-less orgs (the HTTP 404-uniformity policy, in mail
+    dialect) — `TestTLSDemux_RefusalsAreUniform` pins it.
+  - The MX :25 routes on **RCPT TO domain** via the new control-plane
+    `org_mail_domains` registry (superuser-only; domain unique ACROSS orgs so
+    a hostile org cannot claim a sibling's domain; canonical-lowercase
+    enforced by field pattern; `controlplane.MailDomainLookup`). The frontend
+    is **store-and-forward**, not a splice — one SMTP transaction can name
+    recipients in several orgs — offering STARTTLS with the router's cert,
+    refusing unknown domains per-recipient at RCPT time (550), and replaying
+    the buffered message over each target org's `mx.sock`. 250 only after
+    EVERY org accepted; any failure is a transient 451, and retries dedup by
+    Message-ID in mail's inbound path (its idempotency test already pins
+    that).
+  - Tenants bind per-org `imap.sock`/`smtp.sock`/`mx.sock` **beside the HTTP
+    socket** (same one-dir-per-org rule — P0-1 — so the primary/fallback
+    sun_path decision is made once per org on the longest basename), passed
+    via `--imap-socket` etc., child-binds with the same
+    umask/unlink-on-close/inode-guard lifecycle as the HTTP socket. The
+    manager hands mail paths **iff the org's resolved set includes mail**.
+    `OrgInstance.TrackConn` keeps orgs with open mail connections out of the
+    idle sweep (IMAP IDLE would otherwise be evicted mid-session).
+  - Threading: serve-org → `tenantpkgs.Options.Mail` →
+    `mail.RegisterTenantWithListeners` → `mailproto`'s new **`ExternalTLS`**
+    mode (injected listener required, no cert resolution, auth allowed over
+    the plaintext hop, no STARTTLS). Core's `TenantOptions` was NOT touched —
+    the listeners ride the existing `RegisterExtras` closure. With listeners
+    injected the mail host/tenant compositions match **exactly**
+    (`TestTenantWithListenersCompositionMatchesHostExactly`).
+  - serve-multi: opt-in via `MT_MAIL_PORTS_ENABLED=true`; TLS from
+    `MT_MAIL_TLS_CERT/KEY` (falls back to `MT_TLS_CERT/KEY`), **required** —
+    enabled-but-certless is a hard boot error, not a silent HTTP-only boot.
+    `MT_IMAPS_ADDR`/`MT_SMTPS_ADDR`/`MT_MX_ADDR` override :993/:465/:25;
+    literal `off` disables one listener. `MT_MX_HOSTNAME` names the :25
+    greeting (default: base domain).
+  - Proven: mailrouter unit tests (SNI routing + bidirectional splice, uniform
+    refusal, MX fan-out/550/451, conn tracking) and the real-binary
+    `TestTenant_ServesIMAPOnRouterManagedSocket` (mail org serves the real
+    IMAP session in external-TLS posture on its socket; a no-mail org binds
+    none).
+  Known limits, recorded: the tenant sees the router (not the MTA/client) as
+  the TCP peer, so Received headers carry no client IP (no PROXY protocol on
+  the spliced/relayed hop yet); and in `MT_TLS_MODE=proxy` deployments the
+  mail ports still terminate TLS at the ROUTER, so the fronting LB must
+  pass :993/:465/:25 through as raw TCP.
 
 **Feature migration — DONE (2026-07-26).** All seven features are migrated; see
 §3.7 for what the last pass added.
@@ -1444,9 +1491,11 @@ collide on ports — §5.3); every e2e finding above is from reading the specs.
 > peerVersions settled and enforced (router + core apply gate), userorg →
 > offboard, DeleteAccountModal requires an explicit choice, disabled-mailbox
 > delivery decided (accept-and-store, test-pinned), mailproto gained the
-> injected-listener seam, and the upstream branches are pushed. Still open:
-> router-side IMAP/SMTP demux + listener handoff, the solver's
-> target-manifest re-check, and the five deliberate biome waivers.
+> injected-listener seam, and the upstream branches are pushed. **The
+> router-side IMAP/SMTP demux + listener handoff then shipped as well**
+> (mailrouter, org_mail_domains, per-org mail sockets — §6 protocol servers).
+> Still open: the solver's target-manifest re-check and the five deliberate
+> biome waivers.
 
 The original list, kept for the review record:
 

@@ -3,16 +3,12 @@ package controlplane
 import (
 	"context"
 	"encoding/base64"
-	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
-	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
-	"sync"
 	"testing"
 
 	"github.com/pocketbase/pocketbase"
@@ -21,6 +17,7 @@ import (
 
 	"tinycld.org/multi-org/internal/orgmanager"
 	"tinycld.org/multi-org/internal/store"
+	"tinycld.org/multi-org/internal/testsupport"
 )
 
 // contactsSchemaMigration creates the contacts collection a CardDAV-serving
@@ -66,37 +63,12 @@ const manifest = {
 export default manifest
 `
 
-var (
-	tenantBinOnce sync.Once
-	tenantBinPath string
-	tenantBinErr  error
-)
-
-// buildTenantBinary compiles cmd/serve-org once per test run. CardDAV now runs
-// inside the tenant process, so proving it works needs the real binary.
+// buildTenantBinary compiles cmd/serve-org once per test run (shared across
+// packages via testsupport). CardDAV now runs inside the tenant process, so
+// proving it works needs the real binary.
 func buildTenantBinary(t *testing.T) string {
 	t.Helper()
-	if testing.Short() {
-		t.Skip("skipping real-binary test in short mode")
-	}
-	tenantBinOnce.Do(func() {
-		dir, err := os.MkdirTemp("", "serve-org-bin")
-		if err != nil {
-			tenantBinErr = err
-			return
-		}
-		out := filepath.Join(dir, "serve-org")
-		cmd := exec.Command("go", "build", "-o", out, "tinycld.org/multi-org/cmd/serve-org")
-		if combined, err := cmd.CombinedOutput(); err != nil {
-			tenantBinErr = fmt.Errorf("build serve-org: %v\n%s", err, combined)
-			return
-		}
-		tenantBinPath = out
-	})
-	if tenantBinErr != nil {
-		t.Fatal(tenantBinErr)
-	}
-	return tenantBinPath
+	return testsupport.BuildTenantBinary(t)
 }
 
 func quietLogger() *slog.Logger { return slog.New(slog.NewTextHandler(io.Discard, nil)) }

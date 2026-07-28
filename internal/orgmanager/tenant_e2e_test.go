@@ -2,19 +2,16 @@ package orgmanager
 
 import (
 	"context"
-	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
-	"os/exec"
-	"path/filepath"
 	"strings"
-	"sync"
 	"syscall"
 	"testing"
 	"time"
 
 	"tinycld.org/multi-org/internal/store"
+	"tinycld.org/multi-org/internal/testsupport"
 )
 
 // These tests spawn the real serve-org binary. They are the only coverage of
@@ -24,49 +21,11 @@ import (
 // They cost a build plus a PocketBase boot per case, so they are skipped under
 // -short.
 
-var (
-	tenantBinOnce sync.Once
-	tenantBinPath string
-	tenantBinErr  error
-)
-
-// buildTenantBinary compiles cmd/serve-org once per test run.
+// buildTenantBinary compiles cmd/serve-org once per test run (shared across
+// packages via testsupport).
 func buildTenantBinary(t *testing.T) string {
 	t.Helper()
-	if testing.Short() {
-		t.Skip("skipping real-binary test in short mode")
-	}
-
-	tenantBinOnce.Do(func() {
-		dir, err := os.MkdirTemp("", "serve-org-bin")
-		if err != nil {
-			tenantBinErr = err
-			return
-		}
-		out := filepath.Join(dir, "serve-org")
-		cmd := exec.Command("go", "build", "-o", out, "tinycld.org/multi-org/cmd/serve-org")
-		if combined, err := cmd.CombinedOutput(); err != nil {
-			tenantBinErr = fmt.Errorf("build serve-org: %v\n%s", err, combined)
-			return
-		}
-		// MkdirTemp creates the dir 0700. The confinement tests exec this
-		// binary as a tenant uid, which needs traversal on the dir and read
-		// on the binary.
-		if err := os.Chmod(dir, 0o755); err != nil {
-			tenantBinErr = err
-			return
-		}
-		if err := os.Chmod(out, 0o755); err != nil {
-			tenantBinErr = err
-			return
-		}
-		tenantBinPath = out
-	})
-
-	if tenantBinErr != nil {
-		t.Fatal(tenantBinErr)
-	}
-	return tenantBinPath
+	return testsupport.BuildTenantBinary(t)
 }
 
 // newRealManager wires a manager over the real exec spawner and the real

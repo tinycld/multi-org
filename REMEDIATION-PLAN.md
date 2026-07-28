@@ -524,7 +524,7 @@ Nothing here is a merge blocker. Grouped so one person can take a cluster.
 - [x] **P4-9 🟡 `chownTree` never chmods** **DONE — verified 2026-07-27:** `chownTree` chmods 0600 files / 0700 dirs during the walk (`spawn_linux.go`)., so one org's `pb_data` stays
   mode-readable by other tenant uids — the `ATTACH DATABASE` read the boundary
   claims to close. Chmod dirs `0700` and files `0600` as you chown.
-- [ ] **P4-10 🟠 Namespaces are set unconditionally**, so on a **non-root Linux
+- [x] **P4-10 🟠 Namespaces are set unconditionally** **DONE 2026-07-27:** all privileged confinement (clone flags, uid window, store remount) gated on euid 0 (`ce29b38`). Surfaced live by the confinement workflow's first run — the controlplane integration tests spawn through the production spawner on the unprivileged runner and every spawn EPERM'd. `TestSpawner_NonRootSpawnsUnconfined` pins the degraded mode from CI's unprivileged step. — so on a **non-root Linux
   host every tenant spawn fails** (`operation not permitted` → every org 503s),
   despite `NewSpawner` warning that promises a degraded-but-working mode. Gate
   the clone flags the way the uid block already is.
@@ -549,7 +549,7 @@ Nothing here is a merge blocker. Grouped so one person can take a cluster.
 Do **not** start before P0-1 and P4-9/P4-10 land: standing up CI against a
 boundary that is known-broken just encodes the break.
 
-- [x] **P5-1 Linux CI running `TestConfinement_*` as root.** **AUTHORED 2026-07-27 — first run pending push:** `.github/workflows/confinement.yml` clones all 7 sibling repos (the go.mod replaces) on the `multi-org` branch, runs build/vet/full suite, then `sudo go test -run TestConfinement` (ubuntu runners are full VMs, so root has real CAP_SYS_ADMIN; private siblings need a `SIBLING_CHECKOUT_TOKEN` secret). The P3-4 confinement repairs (real store-file probe through the mount namespace, per-org socket-dir assertions) were verified already in the tree. Not green until pushed — verify the first run. **Unblocked** — the
+- [x] **P5-1 Linux CI running `TestConfinement_*` as root.** **DONE — GREEN 2026-07-27** (run 30318853658: all five `TestConfinement_*` pass as root; the first run failed and correctly surfaced P4-10, which is exactly the job this CI exists to do): `.github/workflows/confinement.yml` clones all 7 sibling repos (the go.mod replaces) on the `multi-org` branch, runs build/vet/full suite, then `sudo go test -run TestConfinement` (ubuntu runners are full VMs, so root has real CAP_SYS_ADMIN; private siblings need a `SIBLING_CHECKOUT_TOKEN` secret). The P3-4 confinement repairs (real store-file probe through the mount namespace, per-org socket-dir assertions) were verified already in the tree. Not green until pushed — verify the first run. **Unblocked** — the
   remote exists and everything is pushed (D3). The only real prerequisites are
   technical: two of these tests are vacuous even on Linux (P3-4), so repair them
   first or CI certifies less than it appears; and P0-1/P4-9/P4-10 must land or CI

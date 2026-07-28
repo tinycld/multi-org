@@ -124,10 +124,13 @@ at its real absolute path (a `chroot` to the org dir would break every
 defence in depth, and children are spawned with an **allowlist-constructed**
 environment so no `MT_*` secret can leak — by construction, not by filtering.
 
-**Three caveats, all live:**
-1. **`TestConfinement_*` require Linux + root and there is no CI**, so on a macOS
-   dev box the security property is asserted by construction only. Closing this
-   is the highest-value next step.
+**Three caveats — the first is CLOSED (2026-07-27):**
+1. ~~**`TestConfinement_*` require Linux + root and there is no CI**~~ **CLOSED**
+   — the `confinement` workflow (`.github/workflows/confinement.yml`) runs the
+   full suite plus `TestConfinement_*` as root on every push/PR; first green
+   run 30318853658, all five confinement tests executed and passed. Its first
+   run also caught P4-10 live (non-root spawns EPERM'd), now fixed. On darwin
+   `-run TestConfinement` prints an explicit SKIP stub.
 2. **macOS is not a boundary.** The darwin spawner is a plain subprocess and logs
    a warning saying so. Don't host untrusted tenants on it.
 3. **Provisioning is still in-process.** `bootstrapTenantOnce` runs untrusted

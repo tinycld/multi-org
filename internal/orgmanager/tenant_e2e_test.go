@@ -122,6 +122,35 @@ func TestTenant_AdoptsMaterializedAppURL(t *testing.T) {
 	}
 }
 
+// Over the unix socket a tenant's RemoteAddr is empty, so unless it trusts the
+// router's X-Forwarded-For header every request resolves to the same (empty)
+// client IP and per-IP rate limiting is one shared bucket. The router
+// materializes that trust into .runtime/app.json; the tenant must adopt it as
+// Settings().TrustedProxy. This drives the whole chain: proxy header
+// construction → materialization → adoption → PB's RealIP.
+func TestTenant_ResolvesClientIPThroughForwardedChain(t *testing.T) {
+	mgr := newRealManager(t, `routerAdd('GET','/ip',(e)=>e.json(200,{ip:e.realIP()}))`)
+
+	inst, err := mgr.Get(context.Background(), "acme")
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+
+	// Proxy mode: the LB's chain names the client; the router forwards it
+	// verbatim and the tenant takes the rightmost entry.
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/ip", nil)
+	req.RemoteAddr = "10.0.0.5:4711"
+	req.Header.Set("X-Forwarded-For", "198.51.100.4")
+	inst.Mux().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("/ip = %d body=%s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), `"ip":"198.51.100.4"`) {
+		t.Fatalf("tenant did not resolve the forwarded client IP: %s", rec.Body.String())
+	}
+}
+
 func TestTenant_ServesOverUnixSocket(t *testing.T) {
 	mgr := newRealManager(t, `routerAdd('GET','/ping',(e)=>e.json(200,{ok:true}))`)
 

@@ -22,9 +22,22 @@ type execProcess struct {
 	cmd *exec.Cmd
 }
 
-func (p *execProcess) Signal(sig os.Signal) error { return p.cmd.Process.Signal(sig) }
-func (p *execProcess) Wait() error                { return p.cmd.Wait() }
-func (p *execProcess) Pid() int                   { return p.cmd.Process.Pid }
+// Signal delivers to the child's whole process group, mirroring Kill: a
+// graceful SIGTERM that reached only the direct child would leave any
+// grandchildren running until the SIGKILL fallback swept the group anyway —
+// so the polite path covered less than the forceful one.
+func (p *execProcess) Signal(sig os.Signal) error {
+	if s, ok := sig.(syscall.Signal); ok {
+		if err := syscall.Kill(-p.cmd.Process.Pid, s); err == nil {
+			return nil
+		}
+		// Fall back to the bare process if the group is already gone.
+	}
+	return p.cmd.Process.Signal(sig)
+}
+
+func (p *execProcess) Wait() error { return p.cmd.Wait() }
+func (p *execProcess) Pid() int    { return p.cmd.Process.Pid }
 
 // Kill terminates the child's whole process group, not just the child. Without
 // Setpgid + a negative pid, a tenant that spawned anything would leave orphans.
@@ -41,7 +54,13 @@ func (p *execProcess) Kill() error {
 
 // buildCmd assembles the argv, environment, and fd wiring shared by every
 // platform. The Linux spawner layers confinement on top of what this returns.
-func buildCmd(ctx context.Context, req SpawnRequest, log *slog.Logger) *exec.Cmd {
+//
+// It deliberately takes NO context: the spawn context bounds the readiness
+// handshake, not the child's lifetime, and threading it here is exactly how
+// §5.9's bug happened — exec.CommandContext killed every tenant the moment
+// its spawn context was cancelled, i.e. immediately after it came up. The
+// manager owns the child's lifetime via Evict and the supervisor.
+func buildCmd(req SpawnRequest, log *slog.Logger) *exec.Cmd {
 	args := []string{
 		"--org-dir", req.OrgDir,
 		"--socket", req.SocketPath,
@@ -72,10 +91,6 @@ func buildCmd(ctx context.Context, req SpawnRequest, log *slog.Logger) *exec.Cmd
 		args = append(args, "--confine-packages", req.PackagesDir)
 	}
 
-	// NOT exec.CommandContext: ctx bounds the readiness handshake, not the
-	// child's lifetime. Tying the process to it would kill every tenant the
-	// moment its spawn context was cancelled — i.e. immediately after it came
-	// up. The manager owns the child's lifetime via Evict and the supervisor.
 	cmd := exec.Command(req.BinaryPath, args...)
 
 	// The environment is an allowlist built from nothing, NOT a filter over
@@ -122,7 +137,7 @@ func pipeToLog(r io.Reader, log *slog.Logger, slug string, level slog.Level) {
 type execSpawner struct{}
 
 func (execSpawner) Spawn(ctx context.Context, req SpawnRequest, log *slog.Logger) (Process, error) {
-	cmd := buildCmd(ctx, req, log)
+	cmd := buildCmd(req, log)
 	if err := cmd.Start(); err != nil {
 		return nil, fmt.Errorf("start tenant %s: %w", req.Slug, err)
 	}

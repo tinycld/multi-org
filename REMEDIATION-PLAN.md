@@ -578,37 +578,15 @@ Nothing here is a merge blocker. Grouped so one person can take a cluster.
   slug). **Done when:** a test evicts, immediately serves traffic, and asserts
   the org stays reachable. **Note:** P0-1 changes the socket layout — do P0-1
   first, then this.
-- [ ] **P4-2 🟡 One failed spawn counts as two crashes** (`manager.go:243` +
-  `:455`), so backoff starts at 2s not the documented 1s, and a child the host
-  itself killed logs at Error as "exited unexpectedly". Assert the *interval*,
-  which no test does today.
-- [ ] **P4-3 🟡 Drain budget the child can never use** — parent SIGKILLs 5s after
-  SIGTERM while handing the child `--drain 10s`. Make the parent's patience
-  exceed the child's budget.
+- [x] **P4-2 🟡 One failed spawn counts as two crashes** **DONE 2026-07-27:** the supervisor now waits for the instance's FATE (a new `published` channel, closed at map-publication) before accounting — the naive fix (mark closed before Kill) still double-counted, because a fast-dying child's supervisor passes its non-blocking check before the spawn failure path runs. Spawn failures close `closed`, so the load path records exactly one crash and the host-killed child is no longer logged at Error as "exited unexpectedly". `TestBackoff_FailedSpawnCountsOnce` asserts consecutive==1 AND the backoff interval ≤ backoffMin+jitter (red at HEAD: consecutive=2), plus log-content absence. Bonus: a child crashing between readiness and publication is now reaped from the map (previously it could linger dead until the idle sweep).
+- [x] **P4-3 🟡 Drain budget the child can never use** **DONE 2026-07-27:** `killTimeout = drainTimeout + 5s` — a child holding an open SSE stream legitimately uses ALL of its `--drain` (its `srv.Shutdown` returns only at ctx expiry), so every SSE-holding teardown ended in an avoidable SIGKILL. `TestTeardown_KillPatienceExceedsChildDrainBudget` pins the relationship between the two production constants (red at HEAD: 5s ≤ 10s); the ignores-SIGTERM kill test re-anchored on `inst.shutdown` with explicit budgets so the suite doesn't wait out the raised production window.
 - [x] **P4-4 🟡 `Deploy` re-materializes a running tenant** **DONE 2026-07-27:** `Materialize` now builds each of pb_hooks/pb_public/pb_migrations into a fresh generation dir (`<name>.genN`) and atomically renames a symlink over the live name (dirs can't be rename-replaced; symlinks can). The immediately-previous generation is kept until the next deploy so an in-flight path resolution never lands in a deleted tree; older ones are GC'd. Covers Deploy AND load-during-predecessor-drain. `TestMaterialize_LiveTreeNeverGoesDark` hammers 50 rebuilds under a concurrent reader — red against the in-place clear (sustained ENOENT streaks), green now (the residual is a one-syscall darwin EINVAL blip from rename-over-symlink, explicitly tolerated and documented). A brief old-hooks/new-assets mix during the drain remains — strictly better than the prior 404 window and unavoidable without per-instance tree pinning. — before evicting it, so
   the live tenant 404s on static assets during that window and the whole drain.
   Evict first, or materialize to a temp dir and rename.
-- [ ] **P4-5 🟡 WebDAV manifest prefix has no default or validation** — an empty
-  prefix mounts a site-wide catch-all or panics. CalDAV has
-  `defaultCalDAVPrefix` and two tests for exactly this; copy both. Reject
-  duplicate prefixes across packages (today: a boot panic). Fold in P2-1's
-  reserved-prefix decision.
-- [ ] **P4-6 🟡 The proxy drops the client IP twice.** `SetXForwarded()` in
-  Rewrite mode discards the inbound XFF chain and forces
-  `X-Forwarded-Proto: http` — wrong under the documented default
-  `MT_TLS_MODE=proxy`; and over a unix socket `RemoteAddr` is empty with no
-  `TrustedProxy` materialized, so PB's per-IP rate limiting collapses to a single
-  bucket. Carry the chain explicitly, set the scheme from the TLS mode, and
-  materialize `TrustedProxy`.
-- [ ] **P4-7 🟡 `evalManifest` has no interrupt** — `while(true){}` in a
-  `manifest.ts` hangs the publish handler unrecoverably. Set `vm.Interrupt` and a
-  deadline. The "pure object literal" comment is an assumption about input, not
-  an enforced property.
-- [ ] **P4-8 ⚪ `MaxIdle == 1ns` panics** the ticker; the socket is chmod'd 0600
-  only *after* `net.Listen` creates it at 0755 (set the umask first);
-  `buildCmd` takes an unused `ctx` that is an active trap for re-introducing
-  §5.9's bug; `Signal` targets the pid while `Kill` targets the group, so
-  graceful shutdown never reaches grandchildren.
+- [x] **P4-5 🟡 WebDAV manifest prefix has no default or validation** **DONE 2026-07-27:** empty webdav prefix defaults to `/dav/<slug>` (the reserved protocol namespace from P2-1 — core's `isDavPath` — so a defaulted mount can never shadow the SPA); `validateDAVPrefix` rejects malformed prefixes (no leading slash / bare root / trailing slash) and duplicates across packages, for BOTH WebDAV and CalDAV source resolution (a duplicate was a boot panic inside the tenant; now a load error naming both packages). Four new tests, all red at HEAD. Cross-protocol collisions remain out of scope (each protocol resolves independently) — documented on the helper.
+- [x] **P4-6 🟡 The proxy drops the client IP twice.** **DONE 2026-07-27:** contract made positional — the router guarantees the RIGHTMOST X-Forwarded-For entry it forwards is the best-known client IP, matching PB's default resolution (`UseLeftmostIP` false). `ForwardedConfig{Proto, PeerIsClient}` on `orgmanager.Config`, wired by serve-multi from MT_TLS_MODE: proxy mode forwards the LB's chain VERBATIM (appending the LB's own peer IP — what bare `SetXForwarded()` did — shadows the client it reported) and passes through the LB's X-Forwarded-Proto, defaulting to the configured `https`; file/autocert append the peer so a client-spoofed inbound chain lands LEFT of the genuine entry. TrustedProxy is materialized via `.runtime/app.json` (`trustedProxyHeaders`, now always written) and adopted persisted into `Settings().TrustedProxy` at tenant boot alongside AppURL. Three router-side header tests (red at HEAD) + real-binary `TestTenant_ResolvesClientIPThroughForwardedChain` driving proxy→materialize→adopt→`e.realIP()` (verified red by neutering the adoption: `{"ip":"invalid IP"}`).
+- [x] **P4-7 🟡 `evalManifest` has no interrupt** **DONE 2026-07-27:** `time.AfterFunc(manifestEvalTimeout=5s) → vm.Interrupt` around the manifest VM run. `TestEvalManifest_InterruptsRunawayScript` runs a `while(true){}` manifest (verified red by neutering the timer: never returns); the timeout is a var only so the test can shrink the spin window to 200ms.
+- [x] **P4-8 ⚪ Cosmetic cluster** **DONE 2026-07-27:** (a) sweep ticker interval floored at 1ms — `MaxIdle=1ns` panicked the sweeper goroutine, taking the process down (`TestSweep_TinyMaxIdleDoesNotPanic`, verified red by neutering); (b) serve-org sets umask 0177 around the socket `net.Listen` so the file is 0600 AT creation (chmod kept as belt); (c) `buildCmd` no longer takes the unused `ctx` — the signature itself now prevents re-introducing §5.9's CommandContext bug, comment moved to the doc; (d) `execProcess.Signal` delivers to the process group like `Kill`, so graceful SIGTERM reaches grandchildren instead of only the SIGKILL fallback sweeping them.
 
 *Isolation depth* — `multi-org`
 - [x] **P4-9 🟡 `chownTree` never chmods** **DONE — verified 2026-07-27:** `chownTree` chmods 0600 files / 0700 dirs during the walk (`spawn_linux.go`)., so one org's `pb_data` stays
@@ -618,9 +596,7 @@ Nothing here is a merge blocker. Grouped so one person can take a cluster.
   host every tenant spawn fails** (`operation not permitted` → every org 503s),
   despite `NewSpawner` warning that promises a degraded-but-working mode. Gate
   the clone flags the way the uid block already is.
-- [ ] **P4-11 ⚪ No network namespace** despite the README diagram claiming one.
-  Either add `CLONE_NEWNET` or correct the diagram (P6). Defence-in-depth: `$http`
-  is withheld by the sandbox today.
+- [x] **P4-11 ⚪ No network namespace** **DONE 2026-07-27 — resolved as "correct the docs", recorded as a deliberate decision:** tenants make legitimate outbound connections (calendar ICS subscription fetches, mail provider APIs, Sentry), so `CLONE_NEWNET` without veth/NAT plumbing would break shipped features for no boundary gain — `$http` is withheld by the sandbox and the DB/filesystem boundary doesn't depend on the network. README diagram fixed (mount+pid ns, no netns) and the decision documented in its security section; per-tenant egress policy, if ever wanted, is an operator firewall concern. The README pass also fixed the P6-3 items in the same file: per-org socket path, CardDAV-only descriptions of davconfig/serve-org, the already-fixed reserved-slugs bullet, the stale "no CI" section, and the fork replace path (now the vendored `../tinycld/third_party/pocketbase`). P6-3 is thereby closed too.
 
 *Feature performance* — `mail`
 - [ ] **P4-12 🟡 JS-stitched joins.** `settings/mailboxes.tsx:37-143` opens five
@@ -677,9 +653,7 @@ Low risk, high readability value. Safe to hand to a fresh pair of hands.
   (§2/§5.4), the confinement-skip claim (§4), §5.6's nonexistent golden test, and
   §6's incomplete disabled-user audit. Re-read after Phase 0–2 land and mark the
   §7 items done.
-- [ ] **P6-3 Router README** — the diagram claims a netns that does not exist;
-  reserved subdomains are listed as open but are fixed; `davconfig` and
-  `serve-org` are still described as CardDAV-only.
+- [x] **P6-3 Router README** **DONE 2026-07-27** (folded into P4-11's README pass — see that entry).
 - [ ] **P6-4 User-facing help still teaches multi-org.**
   `core/help/organizations.md` is entirely about the deleted org switcher and
   names roles ("admin / clerical / workforce") matching nothing shipped — and it

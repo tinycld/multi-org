@@ -2,8 +2,10 @@ package controlplane
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"tinycld.org/core/caldav"
 	"tinycld.org/core/carddav"
@@ -11,6 +13,28 @@ import (
 	"tinycld.org/core/webdav"
 	"tinycld.org/multi-org/internal/lockfile"
 )
+
+// validateDAVPrefix rejects a mount prefix that would misroute a tenant: a
+// malformed one (no leading slash, bare root, trailing slash) mounts somewhere
+// other than intended — an empty or "/" prefix is a site-wide Basic-Auth
+// catch-all in front of the SPA — and a duplicate is a boot PANIC inside the
+// tenant (the router registers the same route twice). Failing the load names
+// the offending packages instead.
+//
+// `seen` maps prefix → the slug that claimed it, per protocol: each protocol
+// resolves its sources independently, so cross-protocol collisions (a webdav
+// block claiming /caldav) are not caught here — keep protocol defaults inside
+// distinct reserved namespaces.
+func validateDAVPrefix(seen map[string]string, prefix, slug string) error {
+	if prefix == "" || prefix == "/" || !strings.HasPrefix(prefix, "/") || strings.HasSuffix(prefix, "/") {
+		return fmt.Errorf("package %s: invalid dav prefix %q (must start with '/', not end with one, and not be the bare root)", slug, prefix)
+	}
+	if other, dup := seen[prefix]; dup {
+		return fmt.Errorf("packages %s and %s both mount dav prefix %q", other, slug, prefix)
+	}
+	seen[prefix] = slug
+	return nil
+}
 
 // manifestCapabilities is the subset of a package manifest the host reads to wire
 // host-side protocol capabilities. Mirrors the tinycld manifest `carddav` block.
@@ -138,6 +162,7 @@ func CardDAVSources(resolved []lockfile.ResolvedPackage) ([]carddav.Source, erro
 // overwrite — history, not safety. See HANDOFF.
 func WebDAVSources(resolved []lockfile.ResolvedPackage) ([]webdav.Source, error) {
 	var sources []webdav.Source
+	seenPrefixes := map[string]string{}
 	for _, pkg := range resolved {
 		mc, ok, err := readManifestCapabilities(pkg.Dir)
 		if err != nil {
@@ -151,9 +176,19 @@ func WebDAVSources(resolved []lockfile.ResolvedPackage) ([]webdav.Source, error)
 		if slug == "" {
 			slug = pkg.Name
 		}
+		prefix := wd.Prefix
+		if prefix == "" {
+			// /dav is the RESERVED protocol namespace (core's isDavPath): no
+			// package slug or SPA route can claim it, so a defaulted mount can
+			// never shadow the app shell the way a bare /<slug> prefix did.
+			prefix = "/dav/" + slug
+		}
+		if err := validateDAVPrefix(seenPrefixes, prefix, slug); err != nil {
+			return nil, err
+		}
 		sources = append(sources, webdav.Source{
 			Slug:       slug,
-			Prefix:     wd.Prefix,
+			Prefix:     prefix,
 			Collection: wd.Collection,
 			Fields: webdav.FieldMap{
 				Name:     wd.Fields.Name,
@@ -187,6 +222,7 @@ const defaultCalDAVPrefix = "/caldav"
 // a tenant has no Sentry hub to report into.
 func CalDAVSources(resolved []lockfile.ResolvedPackage) ([]caldav.Source, error) {
 	var sources []caldav.Source
+	seenPrefixes := map[string]string{}
 	for _, pkg := range resolved {
 		mc, ok, err := readManifestCapabilities(pkg.Dir)
 		if err != nil {
@@ -203,6 +239,9 @@ func CalDAVSources(resolved []lockfile.ResolvedPackage) ([]caldav.Source, error)
 		prefix := cd.Prefix
 		if prefix == "" {
 			prefix = defaultCalDAVPrefix
+		}
+		if err := validateDAVPrefix(seenPrefixes, prefix, slug); err != nil {
+			return nil, err
 		}
 		sources = append(sources, caldav.Source{
 			Slug:               slug,

@@ -37,11 +37,16 @@ func TestWriteAppConfigWritesOrgURL(t *testing.T) {
 	if cfg.AppURL != "https://acme.tenants.example.test" {
 		t.Fatalf("appURL = %q", cfg.AppURL)
 	}
+	if len(cfg.TrustedProxyHeaders) != 1 || cfg.TrustedProxyHeaders[0] != "X-Forwarded-For" {
+		t.Fatalf("trustedProxyHeaders = %v, want [X-Forwarded-For]", cfg.TrustedProxyHeaders)
+	}
 }
 
-// A host with no OrgURL hook (tests, exotic wiring) materializes nothing and
-// the tenant keeps its stored settings untouched.
-func TestWriteAppConfigSkipsWhenUnwired(t *testing.T) {
+// A host with no OrgURL hook (tests, exotic wiring) still materializes the
+// proxy-trust config: every router-managed tenant is reached exclusively
+// through the router's socket, where RemoteAddr is empty — without trusting
+// X-Forwarded-For, per-IP rate limiting collapses into a single bucket.
+func TestWriteAppConfigWithoutOrgURLStillMaterializesProxyTrust(t *testing.T) {
 	orgDir := t.TempDir()
 	m := &OrgManager{cfg: Config{}}
 
@@ -49,10 +54,22 @@ func TestWriteAppConfigSkipsWhenUnwired(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if path != "" {
-		t.Fatalf("path = %q, want empty for an unwired host", path)
+	if path == "" {
+		t.Fatal("want app.json written even with no OrgURL hook (it carries the proxy trust config)")
 	}
-	if _, err := os.Stat(filepath.Join(orgDir, ".runtime", "app.json")); !os.IsNotExist(err) {
-		t.Fatalf("no app.json should be written when OrgURL is unwired, stat err = %v", err)
+
+	body, err := os.ReadFile(filepath.Join(orgDir, ".runtime", "app.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var cfg appConfigFile
+	if err := json.Unmarshal(body, &cfg); err != nil {
+		t.Fatal(err)
+	}
+	if cfg.AppURL != "" {
+		t.Fatalf("appURL = %q, want empty when OrgURL is unwired", cfg.AppURL)
+	}
+	if len(cfg.TrustedProxyHeaders) != 1 || cfg.TrustedProxyHeaders[0] != "X-Forwarded-For" {
+		t.Fatalf("trustedProxyHeaders = %v, want [X-Forwarded-For]", cfg.TrustedProxyHeaders)
 	}
 }

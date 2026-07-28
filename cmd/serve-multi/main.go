@@ -78,6 +78,13 @@ func run() error {
 		// here, and proxy mode's documented deployment is behind an external
 		// TLS proxy on 443.
 		OrgURL: func(slug string) string { return "https://" + slug + "." + baseDomain },
+		// In file/autocert mode this process terminates TLS, so the TCP peer
+		// is the end client; in proxy mode the peer is the fronting LB and
+		// its forwarded chain names the client (see ForwardedConfig).
+		Forwarded: orgmanager.ForwardedConfig{
+			Proto:        "https",
+			PeerIsClient: tlsMode != server.TLSProxy,
+		},
 	})
 	defer mgr.Shutdown()
 

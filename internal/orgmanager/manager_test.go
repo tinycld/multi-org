@@ -27,6 +27,12 @@ func quietLogger() *slog.Logger {
 // newTestManager wires a manager over a fake spawner and a store holding one
 // trivial package.
 func newTestManager(t *testing.T, sp *fakeSpawner) *OrgManager {
+	return newTestManagerForwarded(t, sp, ForwardedConfig{})
+}
+
+// newTestManagerForwarded is newTestManager with an explicit forwarding config,
+// for the proxy-header tests.
+func newTestManagerForwarded(t *testing.T, sp *fakeSpawner, fw ForwardedConfig) *OrgManager {
 	t.Helper()
 	root := t.TempDir()
 
@@ -44,6 +50,7 @@ func newTestManager(t *testing.T, sp *fakeSpawner) *OrgManager {
 		Spawner:   sp,
 		Logger:    quietLogger(),
 		HooksPool: 2,
+		Forwarded: fw,
 		LookupOrg: stubLookup(map[string]OrgRecord{
 			"acme":      {Slug: "acme", Status: "active", Lockfile: []byte(`{"@tinycld/core":"1.0.0"}`)},
 			"suspended": {Slug: "suspended", Status: "suspended", Lockfile: []byte(`{"@tinycld/core":"1.0.0"}`)},
@@ -98,6 +105,87 @@ func TestProxy_PreservesHostAndSetsForwardedHeaders(t *testing.T) {
 	}
 	if gotFwd == "" {
 		t.Fatal("expected X-Forwarded-For to be set")
+	}
+}
+
+// In proxy mode (the default) the direct peer is the fronting LB, and the
+// X-Forwarded-For chain it sent already ends with the client IP it observed.
+// The tenant resolves the client as the RIGHTMOST chain entry, so the proxy
+// must forward that chain verbatim — appending the LB's own address (what
+// SetXForwarded alone does) shadows the client and collapses per-IP rate
+// limiting into one bucket per LB. The LB's X-Forwarded-Proto likewise wins
+// over the plaintext hop the router itself observed.
+func TestProxy_ProxyModePreservesUpstreamForwardedChain(t *testing.T) {
+	var gotFwd, gotProto string
+	sp := &fakeSpawner{handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotFwd = r.Header.Get("X-Forwarded-For")
+		gotProto = r.Header.Get("X-Forwarded-Proto")
+	})}
+	mgr := newTestManagerForwarded(t, sp, ForwardedConfig{Proto: "https"})
+
+	inst, err := mgr.Get(context.Background(), "acme")
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodGet, "/api/health", nil)
+	req.RemoteAddr = "10.0.0.5:4711" // the LB's connection, not the client
+	req.Header.Set("X-Forwarded-For", "203.0.113.9")
+	req.Header.Set("X-Forwarded-Proto", "https")
+	inst.Mux().ServeHTTP(httptest.NewRecorder(), req)
+
+	if gotFwd != "203.0.113.9" {
+		t.Fatalf("X-Forwarded-For = %q, want the LB's chain %q untouched (rightmost entry is the client)", gotFwd, "203.0.113.9")
+	}
+	if gotProto != "https" {
+		t.Fatalf("X-Forwarded-Proto = %q, want the LB's %q, not the router's plaintext hop", gotProto, "https")
+	}
+}
+
+// Without an inbound X-Forwarded-Proto, proxy mode must fall back to the
+// configured public scheme, not the plaintext hop between LB and router.
+func TestProxy_ProxyModeDefaultsToConfiguredProto(t *testing.T) {
+	var gotProto string
+	sp := &fakeSpawner{handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotProto = r.Header.Get("X-Forwarded-Proto")
+	})}
+	mgr := newTestManagerForwarded(t, sp, ForwardedConfig{Proto: "https"})
+
+	inst, err := mgr.Get(context.Background(), "acme")
+	if err != nil {
+		t.Fatal(err)
+	}
+	inst.Mux().ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/api/health", nil))
+
+	if gotProto != "https" {
+		t.Fatalf("X-Forwarded-Proto = %q, want the configured public scheme %q", gotProto, "https")
+	}
+}
+
+// When the router terminates TLS itself the peer IS the client, so its IP is
+// appended to whatever chain arrived — a spoofed inbound header ends up to the
+// LEFT of the genuine peer entry, keeping the rightmost entry trustworthy.
+func TestProxy_TerminatingModeAppendsPeerToChain(t *testing.T) {
+	var gotFwd, gotProto string
+	sp := &fakeSpawner{handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotFwd = r.Header.Get("X-Forwarded-For")
+		gotProto = r.Header.Get("X-Forwarded-Proto")
+	})}
+	mgr := newTestManagerForwarded(t, sp, ForwardedConfig{Proto: "https", PeerIsClient: true})
+
+	inst, err := mgr.Get(context.Background(), "acme")
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodGet, "/api/health", nil)
+	req.RemoteAddr = "203.0.113.7:1234"
+	req.Header.Set("X-Forwarded-For", "6.6.6.6") // client-spoofed
+	inst.Mux().ServeHTTP(httptest.NewRecorder(), req)
+
+	if gotFwd != "6.6.6.6, 203.0.113.7" {
+		t.Fatalf("X-Forwarded-For = %q, want %q (peer appended, spoof pushed left)", gotFwd, "6.6.6.6, 203.0.113.7")
+	}
+	if gotProto != "https" {
+		t.Fatalf("X-Forwarded-Proto = %q, want %q", gotProto, "https")
 	}
 }
 
@@ -289,20 +377,38 @@ func TestEvict_StopsChildAndNextGetRespawns(t *testing.T) {
 	}
 }
 
-// A child that ignores SIGTERM must be killed rather than lingering.
-func TestEvict_KillsChildThatIgnoresSIGTERM(t *testing.T) {
+// A child that ignores SIGTERM must be killed rather than lingering. Driven
+// through inst.shutdown with explicit small budgets so the test doesn't wait
+// out the production killTimeout; Evict's hand-off to shutdown is covered by
+// its own tests.
+func TestShutdown_KillsChildThatIgnoresSIGTERM(t *testing.T) {
 	sp := &fakeSpawner{ignoreSIGTERM: true}
 	mgr := newTestManager(t, sp)
 
-	if _, err := mgr.Get(context.Background(), "acme"); err != nil {
+	inst, err := mgr.Get(context.Background(), "acme")
+	if err != nil {
 		t.Fatal(err)
 	}
 	proc := sp.lastProc()
 
-	go mgr.Evict("acme")
+	go inst.shutdown(10*time.Millisecond, 50*time.Millisecond)
 
-	if !waitFor(killTimeout+5*time.Second, func() bool { return proc.killed.Load() }) {
+	if !waitFor(5*time.Second, func() bool { return proc.killed.Load() }) {
 		t.Fatal("child ignoring SIGTERM was never killed")
+	}
+}
+
+// The child is handed --drain as its post-SIGTERM graceful budget and told
+// "the parent SIGKILLs us if we overrun"; a child holding an open SSE stream
+// legitimately uses ALL of it (its srv.Shutdown returns only at ctx expiry).
+// So the parent's patience between SIGTERM and SIGKILL must exceed that
+// budget, or every SSE-holding teardown ends in an avoidable SIGKILL — the
+// child's drain window exists only on paper.
+func TestTeardown_KillPatienceExceedsChildDrainBudget(t *testing.T) {
+	if killTimeout <= drainTimeout {
+		t.Fatalf("killTimeout (%s) must exceed the child's drain budget (%s): "+
+			"the parent SIGKILLs a child that is still inside the graceful window it was promised",
+			killTimeout, drainTimeout)
 	}
 }
 
@@ -377,6 +483,78 @@ func TestBackoff_CrashLoopingOrgIsRejectedWithoutSpawning(t *testing.T) {
 	}
 }
 
+// syncBuffer is a goroutine-safe bytes.Buffer for capturing log output written
+// from the supervisor goroutine.
+type syncBuffer struct {
+	mu  sync.Mutex
+	buf strings.Builder
+}
+
+func (b *syncBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *syncBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
+// One failed spawn is ONE crash. load already records it; the supervisor must
+// not count the same exit a second time — that makes the first backoff start
+// at 2s instead of the documented backoffMin, and logs a child the host
+// itself killed at Error as "exited unexpectedly".
+func TestBackoff_FailedSpawnCountsOnce(t *testing.T) {
+	var logs syncBuffer
+	sp := &fakeSpawner{dieBeforeReady: true}
+	root := t.TempDir()
+
+	s := store.New(root)
+	if err := s.Publish("@tinycld/core", "1.0.0", map[string][]byte{
+		"client/dist/index.html": []byte("<html></html>"),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	mgr := New(Config{
+		Root:    root,
+		Store:   s,
+		Spawner: sp,
+		Logger:  slog.New(slog.NewTextHandler(&logs, nil)),
+		LookupOrg: stubLookup(map[string]OrgRecord{
+			"acme": {Slug: "acme", Status: "active", Lockfile: []byte(`{"@tinycld/core":"1.0.0"}`)},
+		}),
+	})
+	t.Cleanup(mgr.Shutdown)
+
+	if _, err := mgr.Get(context.Background(), "acme"); err == nil {
+		t.Fatal("expected the spawn to fail")
+	}
+
+	// Give the supervisor time to finish any (wrong) second accounting: it has
+	// already observed the exit by the time Get returns, so the settle window
+	// only needs to cover its remaining map/lock work.
+	time.Sleep(100 * time.Millisecond)
+
+	mgr.mu.RLock()
+	cs := mgr.crashes["acme"]
+	mgr.mu.RUnlock()
+	if cs == nil {
+		t.Fatal("expected crash state after a failed spawn")
+	}
+	if cs.consecutive != 1 {
+		t.Fatalf("consecutive = %d, want 1 — a single failed spawn must not double-count", cs.consecutive)
+	}
+	if wait, ok := mgr.backoffRemaining("acme"); !ok || wait > backoffMin+backoffMin/4 {
+		t.Fatalf("backoff = %v (ok=%v), want within backoffMin %s + max jitter after ONE failure",
+			wait, ok, backoffMin)
+	}
+	if strings.Contains(logs.String(), "exited unexpectedly") {
+		t.Fatal("a child the host itself failed/killed was logged as an unexpected exit")
+	}
+}
+
 // A successful boot must clear prior crash history.
 func TestBackoff_ClearedOnSuccessfulBoot(t *testing.T) {
 	sp := &fakeSpawner{}
@@ -394,6 +572,24 @@ func TestBackoff_ClearedOnSuccessfulBoot(t *testing.T) {
 	if stillTracked {
 		t.Fatal("crash state survived a successful boot")
 	}
+}
+
+// A sub-2ns MaxIdle used to hand NewTicker a zero interval, panicking the
+// sweeper goroutine — which takes down the whole process, not just the sweep.
+func TestSweep_TinyMaxIdleDoesNotPanic(t *testing.T) {
+	sp := &fakeSpawner{}
+	root := t.TempDir()
+	mgr := New(Config{
+		Root:      root,
+		Store:     store.New(root),
+		Spawner:   sp,
+		Logger:    quietLogger(),
+		MaxIdle:   time.Nanosecond,
+		LookupOrg: stubLookup(nil),
+	})
+	// Let the sweeper goroutine take at least one tick before shutting down.
+	time.Sleep(20 * time.Millisecond)
+	mgr.Shutdown()
 }
 
 func TestShutdown_IsIdempotent(t *testing.T) {

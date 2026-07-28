@@ -44,6 +44,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"slices"
 	"syscall"
 	"time"
 
@@ -72,7 +73,7 @@ func main() {
 		caldavConfig = flag.String("caldav-config", "", "path to the org's materialized caldav.json")
 		quotaConfig  = flag.String("quota-config", "", "path to the org's materialized quota.json")
 		pkgsConfig   = flag.String("packages-config", "", "path to the org's materialized packages.json (resolved slugs)")
-		appConfig    = flag.String("app-config", "", "path to the org's materialized app.json (public URL)")
+		appConfig    = flag.String("app-config", "", "path to the org's materialized app.json (public URL + proxy trust)")
 		davConfig    = flag.String("carddav-config", "", "path to the CardDAV source JSON")
 		drain        = flag.Duration("drain", 10*time.Second, "graceful shutdown budget")
 		confinePkg   = flag.String("confine-packages", "", "remount this dir read-only in our mount namespace")
@@ -134,7 +135,7 @@ func run(orgDir, socketPath, slug string, hooksPool int, davConfigPath, caldavCo
 		return fmt.Errorf("load packages config: %w", err)
 	}
 
-	appURL, err := loadAppURL(appConfigPath)
+	appCfg, err := loadAppConfig(appConfigPath)
 	if err != nil {
 		return fmt.Errorf("load app config: %w", err)
 	}
@@ -183,19 +184,43 @@ func run(orgDir, socketPath, slug string, hooksPool int, davConfigPath, caldavCo
 	}
 	defer app.ResetBootstrapState()
 
-	// Adopt the org's public URL as Meta.AppURL — the value PB interpolates
-	// into {APP_URL} for verification / password-reset / email-change links.
-	// Persisted rather than patched in memory so a settings reload (e.g. a
-	// tenant superuser saving unrelated settings) cannot revert it to PB's
-	// default http://localhost:8090.
-	if appURL != "" && app.Settings().Meta.AppURL != appURL {
-		app.Settings().Meta.AppURL = appURL
+	// Adopt the router-materialized app config into settings. Persisted rather
+	// than patched in memory so a settings reload (e.g. a tenant superuser
+	// saving unrelated settings) cannot revert it.
+	//
+	//   - Meta.AppURL: the value PB interpolates into {APP_URL} for
+	//     verification / password-reset / email-change links; without it every
+	//     auth email carries PB's default http://localhost:8090.
+	//   - TrustedProxy.Headers: over the router's unix socket RemoteAddr is
+	//     empty, so unless the router's X-Forwarded-For is trusted, RealIP()
+	//     resolves every request to the same client and per-IP rate limiting
+	//     is one shared bucket. The router guarantees the rightmost entry is
+	//     the client, matching PB's default (UseLeftmostIP false).
+	settingsDirty := false
+	if appCfg.AppURL != "" && app.Settings().Meta.AppURL != appCfg.AppURL {
+		app.Settings().Meta.AppURL = appCfg.AppURL
+		settingsDirty = true
+	}
+	if len(appCfg.TrustedProxyHeaders) > 0 &&
+		!slices.Equal(app.Settings().TrustedProxy.Headers, appCfg.TrustedProxyHeaders) {
+		app.Settings().TrustedProxy.Headers = appCfg.TrustedProxyHeaders
+		settingsDirty = true
+	}
+	if settingsDirty {
 		if err := app.Save(app.Settings()); err != nil {
-			return fmt.Errorf("set app url: %w", err)
+			return fmt.Errorf("adopt app config into settings: %w", err)
 		}
 	}
 
+	// bind(2) creates the socket file honouring the umask, so mask it to 0600
+	// AT creation instead of chmodding after — the chmod below still runs as a
+	// belt, but without the umask there is a window where the socket sits at
+	// 0755. Process-wide, but nothing else in this process creates files
+	// between here and the restore. (On the primary layout the per-org socket
+	// dir is 0700 anyway; the fallback dir and defence-in-depth want this.)
+	oldUmask := syscall.Umask(0o177)
 	listener, err := net.Listen("unix", socketPath)
+	syscall.Umask(oldUmask)
 	if err != nil {
 		return fmt.Errorf("listen on %s: %w", socketPath, err)
 	}
@@ -318,27 +343,32 @@ func loadPackageSlugs(path string) ([]string, error) {
 	return cfg.Slugs, nil
 }
 
-// loadAppURL reads .runtime/app.json (written by the router from
-// MT_BASE_DOMAIN + slug). An empty path or a missing file means the host
-// manages no public URL here — leave the tenant's stored settings alone.
-func loadAppURL(path string) (string, error) {
+// appConfig mirrors orgmanager's appConfigFile (.runtime/app.json).
+type appConfig struct {
+	AppURL              string   `json:"appURL"`
+	TrustedProxyHeaders []string `json:"trustedProxyHeaders"`
+}
+
+// loadAppConfig reads .runtime/app.json (written by the router: public URL
+// from MT_BASE_DOMAIN + slug, plus the forwarded-header trust). An empty path
+// or a missing file means the host manages no app config here — leave the
+// tenant's stored settings alone.
+func loadAppConfig(path string) (appConfig, error) {
 	if path == "" {
-		return "", nil
+		return appConfig{}, nil
 	}
 	body, err := os.ReadFile(path)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return "", nil
+			return appConfig{}, nil
 		}
-		return "", err
+		return appConfig{}, err
 	}
-	var cfg struct {
-		AppURL string `json:"appURL"`
-	}
+	var cfg appConfig
 	if err := json.Unmarshal(body, &cfg); err != nil {
-		return "", err
+		return appConfig{}, err
 	}
-	return cfg.AppURL, nil
+	return cfg, nil
 }
 
 func loadWebDAVSources(path string) ([]webdav.Source, error) {

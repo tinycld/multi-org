@@ -914,30 +914,26 @@ confirmed; `[S]` = strong code-reading inference, not executed. Items already in
   only `Chmod` in the repo is the socket. That is the `ATTACH DATABASE` read the
   boundary claims to close. End-to-end exploit `[S]` (depends on WAL `-shm`
   access); the missing mode restriction is unambiguous.
-- **[V] A single failed spawn counts as two crashes** (`manager.go:243` +
-  `:455`), so backoff starts at 2s instead of the documented 1s, and a child the
-  host itself killed is logged at Error as "exited unexpectedly".
-- **[V] The child gets a 10s drain budget it can never use** — the parent
-  SIGKILLs 5s after SIGTERM (`manager.go:300` vs `:42-46`).
+- ~~**[V] A single failed spawn counts as two crashes**~~ **FIXED 2026-07-27
+  (P4-2):** the supervisor waits for the instance's fate (`published`/`closed`)
+  before accounting; interval asserted by test.
+- ~~**[V] The child gets a 10s drain budget it can never use**~~ **FIXED
+  2026-07-27 (P4-3):** `killTimeout = drainTimeout + 5s`, relationship pinned
+  by test.
 - **[V] `Deploy` re-materializes the *running* tenant's `pb_public`/`pb_hooks`
   before evicting it** (`provisioning.go:134`; `Materialize` does RemoveAll +
   recreate), so the live tenant 404s on static assets during that window and the
   whole drain. Evict-first, or materialize to a temp dir and rename.
-- **[V] A `webdav` manifest block with no `prefix` mounts a site-wide catch-all
-  or panics** (`cmd/serve-org/main.go:186-191`). CalDAV has
-  `defaultCalDAVPrefix` and two tests for exactly this reason; `WebDAVSources`
-  copies the prefix verbatim with no default or validation.
-- **[V] The proxy drops the client IP twice over.** `SetXForwarded()` in Rewrite
-  mode discards the inbound XFF chain and forces `X-Forwarded-Proto: http`
-  (`instance.go:78`) — wrong under the documented default `MT_TLS_MODE=proxy`;
-  and over a unix socket `RemoteAddr` is empty with no `TrustedProxy` header
-  materialized, so PB's per-IP rate limiting collapses to one bucket
-  (`instance.go:58-70`).
-- **[V] `evalManifest` runs untrusted package JS with no interrupt or timeout**
-  (`controlplane/manifest.go:70-85`): `while(true){}` in a `manifest.ts` hangs
-  the `POST /api/store/packages` goroutine unrecoverably. Superuser-gated. The
-  comment's "pure object literal" is an assumption about input, not an enforced
-  property.
+- ~~**[V] A `webdav` manifest block with no `prefix` mounts a site-wide catch-all
+  or panics**~~ **FIXED 2026-07-27 (P4-5):** defaults to the reserved
+  `/dav/<slug>`; malformed and duplicate prefixes (WebDAV and CalDAV) fail the
+  load naming the packages.
+- ~~**[V] The proxy drops the client IP twice over.**~~ **FIXED 2026-07-27
+  (P4-6):** rightmost-entry contract + `ForwardedConfig` from MT_TLS_MODE;
+  TrustedProxy materialized via `.runtime/app.json` and adopted at tenant boot.
+  Verified end-to-end through the real binary (`e.realIP()`).
+- ~~**[V] `evalManifest` runs untrusted package JS with no interrupt or
+  timeout**~~ **FIXED 2026-07-27 (P4-7):** `vm.Interrupt` on a 5s deadline.
 
 *Authorization / data*
 - **[V] Neither comments collection carries the disabled clause.**
@@ -1324,10 +1320,13 @@ collide on ports — §5.3); every e2e finding above is from reading the specs.
 > shipped no `playwright.config.ts`, so `tinycld-pkg test:e2e` could not run
 > it at all, which is why bug 2 survived.
 >
-> **Next, after the gate:** Phase 4's remaining clusters (P4-3 drain budget
-> and P4-6 proxy IP first), P5-2…P5-4, and Phase 6 docs — where P6-1
-> (CLAUDE.md/CONTRIBUTING still teach the deleted org contract) ranks above
-> its severity.
+> **Next, after the gate:** ~~Phase 4's remaining clusters (P4-3 drain budget
+> and P4-6 proxy IP first)~~ **the router cluster shipped 2026-07-27** — P4-2,
+> P4-3, P4-5, P4-6, P4-7, P4-8 and P4-11 (which also closed P6-3's README
+> items); see REMEDIATION-PLAN.md for per-item evidence. Remaining in Phase 4:
+> the mail cluster (P4-12 JS-stitched joins, P4-13 residual N+1s). Then
+> P5-2…P5-4, and Phase 6 docs — where P6-1 (CLAUDE.md/CONTRIBUTING still
+> teach the deleted org contract) ranks above its severity.
 
 The original list, kept for the review record:
 

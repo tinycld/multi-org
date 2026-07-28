@@ -98,7 +98,7 @@ func (s *linuxSpawner) Spawn(ctx context.Context, req SpawnRequest, log *slog.Lo
 	// cmd/serve-org's --confine-packages handling.
 	req.ConfinePackages = root && s.conf.UIDBase > 0 && s.conf.UIDRange > 0
 
-	cmd := buildCmd(ctx, req, log)
+	cmd := buildCmd(req, log)
 
 	attr := cmd.SysProcAttr // buildCmd already set Setpgid
 

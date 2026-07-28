@@ -49,6 +49,11 @@ type OrgInstance struct {
 
 	closed chan struct{} // closed when shutdown starts; new requests bail with 503
 	dead   chan struct{} // closed once Wait() has returned
+	// published closes when the manager stores the instance in its map. Until
+	// one of published/closed closes, the instance's fate is undecided and the
+	// supervisor must not account for its exit: a child that dies during a
+	// failed spawn is counted (once) by the load path, not the supervisor.
+	published chan struct{}
 	// torndown closes when shutdown has fully completed — including the
 	// socket cleanup that runs AFTER dead. Since the child no longer unlinks
 	// its own socket on listener close (see serve-org's SetUnlinkOnClose),
@@ -65,9 +70,36 @@ func (i *OrgInstance) Slug() string      { return i.slug }
 
 func (i *OrgInstance) touch(now int64) { i.lastUsed.Store(now) }
 
+// ForwardedConfig tells the per-tenant proxy how to build the X-Forwarded-*
+// headers it hands a tenant. The contract with the tenant is positional: the
+// RIGHTMOST X-Forwarded-For entry the router forwards is the best-known client
+// IP, and the tenant (whose RemoteAddr over the unix socket is empty) is told
+// via .runtime/app.json to trust exactly that.
+type ForwardedConfig struct {
+	// Proto is the public scheme clients used, when the router's own hop
+	// cannot tell ("https" in every documented deployment — TLS terminates
+	// either here or at the fronting proxy). Empty falls back to the scheme
+	// of the router's own hop, which is right only for direct plain-HTTP use.
+	Proto string
+
+	// PeerIsClient is true when this process terminates TLS itself
+	// (MT_TLS_MODE=file/autocert), so the TCP peer is the end client and its
+	// IP is appended to the forwarded chain — a spoofed inbound header ends
+	// up to the LEFT of it, keeping the rightmost entry trustworthy.
+	//
+	// False in proxy mode: the peer is the fronting LB and the chain it
+	// forwarded already ends with the client IP it observed; appending the
+	// LB's own address would shadow that and collapse per-IP rate limiting
+	// into one bucket per LB. (This trusts the fronting proxy to manage the
+	// chain — which is the documented deployment for proxy mode. Exposing
+	// proxy mode directly to clients lets them choose their rate-limit
+	// bucket; it also means serving plaintext, so don't.)
+	PeerIsClient bool
+}
+
 // newProxy builds the reverse proxy for a tenant's unix socket. Three of these
 // settings are load-bearing and fail quietly if omitted; see the comments.
-func newProxy(sockPath string, log *slog.Logger) *httputil.ReverseProxy {
+func newProxy(sockPath string, fw ForwardedConfig, log *slog.Logger) *httputil.ReverseProxy {
 	transport := &http.Transport{
 		DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
 			var d net.Dialer
@@ -86,7 +118,7 @@ func newProxy(sockPath string, log *slog.Logger) *httputil.ReverseProxy {
 			pr.Out.URL.Scheme = "http"
 			// Ignored by the unix dialer, but net/http requires a non-empty host.
 			pr.Out.URL.Host = "tenant"
-			pr.SetXForwarded()
+			setForwardedHeaders(pr, fw)
 			// Rewrite mode does not carry the inbound Host over (unlike the
 			// legacy Director). PocketBase builds absolute URLs — verification
 			// links, OAuth redirects — from the request host, so losing it
@@ -107,6 +139,49 @@ func newProxy(sockPath string, log *slog.Logger) *httputil.ReverseProxy {
 			http.Error(w, "organization backend unavailable", http.StatusBadGateway)
 		},
 	}
+}
+
+// setForwardedHeaders builds the X-Forwarded-* headers per ForwardedConfig's
+// rightmost-entry contract. Rewrite mode strips the inbound X-Forwarded-*
+// headers from pr.Out before we run, so the chain must be carried explicitly —
+// bare SetXForwarded() drops the LB's chain and stamps the router's own
+// plaintext hop as the client's scheme.
+func setForwardedHeaders(pr *httputil.ProxyRequest, fw ForwardedConfig) {
+	inboundChain := pr.In.Header.Values("X-Forwarded-For")
+	if len(inboundChain) > 0 {
+		pr.Out.Header["X-Forwarded-For"] = inboundChain
+	}
+
+	if fw.PeerIsClient || len(inboundChain) == 0 {
+		// The peer is the client (terminating mode), or it is all we know
+		// (proxy mode with no inbound chain — a misconfigured or absent LB):
+		// append its IP so the rightmost entry is the best-known client.
+		pr.SetXForwarded()
+	} else {
+		// Proxy mode with a chain: the LB's last entry IS the client. Set only
+		// what SetXForwarded would otherwise have contributed alongside.
+		pr.Out.Header.Set("X-Forwarded-Host", pr.In.Host)
+	}
+
+	pr.Out.Header.Set("X-Forwarded-Proto", forwardedProto(pr, fw))
+}
+
+// forwardedProto resolves the scheme the CLIENT used. In proxy mode the
+// fronting LB's X-Forwarded-Proto is authoritative (it terminated the TLS);
+// otherwise the configured public scheme; last, the router's own hop.
+func forwardedProto(pr *httputil.ProxyRequest, fw ForwardedConfig) string {
+	if !fw.PeerIsClient {
+		if p := pr.In.Header.Get("X-Forwarded-Proto"); p != "" {
+			return p
+		}
+	}
+	if fw.Proto != "" {
+		return fw.Proto
+	}
+	if pr.In.TLS != nil {
+		return "https"
+	}
+	return "http"
 }
 
 // serveProxied tracks the request as in-flight so shutdown can drain it.

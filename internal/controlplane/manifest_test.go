@@ -5,7 +5,9 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
+	"time"
 
 	"tinycld.org/multi-org/internal/davconfig"
 	"tinycld.org/multi-org/internal/lockfile"
@@ -103,6 +105,31 @@ func TestEmitManifestJSON_ParsesTSDefaultExport(t *testing.T) {
 	// Other files pass through untouched.
 	if _, ok := out["pb-hooks/contacts.pb.ts"]; !ok {
 		t.Error("pb-hooks file dropped")
+	}
+}
+
+// A manifest is untrusted package JS. Without an interrupt, `while(true){}`
+// spins the POST /api/store/packages goroutine forever and nothing can
+// recover it — the "pure object literal" the evaluator expects is an
+// assumption about input, not an enforced property.
+func TestEvalManifest_InterruptsRunawayScript(t *testing.T) {
+	orig := manifestEvalTimeout
+	manifestEvalTimeout = 200 * time.Millisecond
+	t.Cleanup(func() { manifestEvalTimeout = orig })
+
+	errCh := make(chan error, 1)
+	go func() {
+		_, err := evalManifest("const manifest = {}\nwhile (true) {}\nexport default manifest", "manifest.ts")
+		errCh <- err
+	}()
+
+	select {
+	case err := <-errCh:
+		if err == nil {
+			t.Fatal("expected a timeout error for a runaway manifest")
+		}
+	case <-time.After(manifestEvalTimeout + 5*time.Second):
+		t.Fatal("evalManifest never returned for a runaway script")
 	}
 }
 
@@ -231,6 +258,78 @@ func TestWebDAVSources_SkipsPackagesWithoutWebDAV(t *testing.T) {
 	}
 	if len(sources) != 0 {
 		t.Errorf("expected no sources, got %d", len(sources))
+	}
+}
+
+// A webdav block that omits `prefix` must mount inside the reserved /dav
+// namespace, not at the site root: an empty prefix registers Any("") +
+// Any("/{path...}") — a site-wide Basic-Auth catch-all in front of the SPA.
+// CalDAV has had this default since it shipped; WebDAV never did.
+func TestWebDAVSources_DefaultsPrefixIntoReservedNamespace(t *testing.T) {
+	dir := writeManifestPkg(t, `
+const manifest = {
+    name: 'Files', slug: 'files', version: '1.0.0', description: 'files',
+    webdav: { collection: 'file_items', fields: { name: 'name', parent: 'parent' } },
+}
+export default manifest
+`)
+
+	sources, err := WebDAVSources([]lockfile.ResolvedPackage{{Name: "files", Dir: dir}})
+	if err != nil {
+		t.Fatalf("WebDAVSources: %v", err)
+	}
+	if got := sources[0].Prefix; got != "/dav/files" {
+		t.Errorf("prefix = %q, want the reserved-namespace default /dav/files", got)
+	}
+}
+
+// A malformed prefix (no leading slash, bare root, trailing slash) would mount
+// somewhere other than the operator intended — reject it at load with an error
+// naming the package instead of letting the router mount it.
+func TestWebDAVSources_RejectsMalformedPrefix(t *testing.T) {
+	for _, bad := range []string{"drive", "/", "/drive/"} {
+		dir := writeManifestPkg(t, `
+const manifest = {
+    name: 'Files', slug: 'files', version: '1.0.0', description: 'files',
+    webdav: { prefix: '`+bad+`', collection: 'file_items', fields: { name: 'name' } },
+}
+export default manifest
+`)
+		_, err := WebDAVSources([]lockfile.ResolvedPackage{{Name: "files", Dir: dir}})
+		if err == nil {
+			t.Errorf("prefix %q: expected an error, got none", bad)
+			continue
+		}
+		if !strings.Contains(err.Error(), "files") {
+			t.Errorf("prefix %q: error %q does not name the package", bad, err)
+		}
+	}
+}
+
+// Two packages claiming one prefix is a boot panic inside the tenant (duplicate
+// route registration). Fail the load instead, naming both packages.
+func TestWebDAVSources_RejectsDuplicatePrefixes(t *testing.T) {
+	manifest := func(slug string) string {
+		return `
+const manifest = {
+    name: 'X', slug: '` + slug + `', version: '1.0.0', description: 'x',
+    webdav: { prefix: '/dav/files', collection: '` + slug + `_items', fields: { name: 'name' } },
+}
+export default manifest
+`
+	}
+	dirA := writeManifestPkg(t, manifest("aaa"))
+	dirB := writeManifestPkg(t, manifest("bbb"))
+
+	_, err := WebDAVSources([]lockfile.ResolvedPackage{
+		{Name: "aaa", Dir: dirA},
+		{Name: "bbb", Dir: dirB},
+	})
+	if err == nil {
+		t.Fatal("expected duplicate-prefix error, got none")
+	}
+	if !strings.Contains(err.Error(), "aaa") || !strings.Contains(err.Error(), "bbb") {
+		t.Errorf("error %q should name both packages", err)
 	}
 }
 
@@ -486,6 +585,38 @@ export default manifest
 	}
 	if got := sources[0].Prefix; got != "/rooms-cal" {
 		t.Errorf("prefix = %q, want the manifest's own value", got)
+	}
+}
+
+// Same boot-panic class as WebDAV: two caldav blocks on one prefix (e.g. both
+// left to the /caldav default) must fail the load, not panic the tenant.
+func TestCalDAVSources_RejectsDuplicatePrefixes(t *testing.T) {
+	manifest := func(slug string) string {
+		return `
+const manifest = {
+    name: 'X', slug: '` + slug + `', version: '1.0.0', description: 'x',
+    caldav: {
+        calendarCollection: '` + slug + `_calendars',
+        eventCollection: '` + slug + `_events',
+        calendar: { name: 'name' },
+        event: { calendar: 'calendar', uid: 'uid', start: 'start', end: 'end' },
+    },
+}
+export default manifest
+`
+	}
+	dirA := writeManifestPkg(t, manifest("aaa"))
+	dirB := writeManifestPkg(t, manifest("bbb"))
+
+	_, err := CalDAVSources([]lockfile.ResolvedPackage{
+		{Name: "aaa", Dir: dirA},
+		{Name: "bbb", Dir: dirB},
+	})
+	if err == nil {
+		t.Fatal("expected duplicate-prefix error, got none")
+	}
+	if !strings.Contains(err.Error(), "aaa") || !strings.Contains(err.Error(), "bbb") {
+		t.Errorf("error %q should name both packages", err)
 	}
 }
 

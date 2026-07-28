@@ -1,7 +1,6 @@
 package orgmanager
 
 import (
-	"context"
 	"io"
 	"log/slog"
 	"strings"
@@ -27,7 +26,7 @@ func TestBuildCmd_EnvIsAllowlistOnly(t *testing.T) {
 		SocketPath: "/tmp/acme.sock",
 		BinaryPath: "/nonexistent/serve-org",
 	}
-	cmd := buildCmd(context.Background(), req, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	cmd := buildCmd(req, slog.New(slog.NewTextHandler(io.Discard, nil)))
 
 	allowed := map[string]bool{"HOME": true, "TMPDIR": true, "PATH": true}
 	for _, kv := range cmd.Env {

@@ -3,10 +3,19 @@ package controlplane
 import (
 	"encoding/json"
 	"fmt"
+	"time"
 
 	"github.com/evanw/esbuild/pkg/api"
 	"github.com/grafana/sobek"
 )
+
+// manifestEvalTimeout bounds evalManifest's VM run. A manifest is expected to
+// be a pure object literal, but that is an assumption about untrusted package
+// JS, not an enforced property — without an interrupt, `while(true){}` hangs
+// the publish handler's goroutine unrecoverably. Generous: a genuine manifest
+// evaluates in microseconds. A var only so the runaway-script test doesn't
+// spin a core for the full production window.
+var manifestEvalTimeout = 5 * time.Second
 
 // manifestJSONFile is the store filename holding a package's parsed manifest.
 // Emitted at publish time from manifest.ts so the host (orgmanager) can read a
@@ -79,6 +88,11 @@ func evalManifest(src, name string) (any, error) {
 	if err := vm.Set("exports", exports); err != nil {
 		return nil, err
 	}
+
+	interrupt := time.AfterFunc(manifestEvalTimeout, func() {
+		vm.Interrupt(fmt.Sprintf("manifest evaluation exceeded %s", manifestEvalTimeout))
+	})
+	defer interrupt.Stop()
 
 	if _, err := vm.RunString(string(res.Code)); err != nil {
 		return nil, err

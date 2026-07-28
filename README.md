@@ -29,15 +29,17 @@ unix domain socket and never holds a tenant app object.
        │ PocketBase app│   │  map[slug]*Inst  │  + supervise + idle eviction
        │ orgs/packages/│   └────────┬─────────┘
        │ deployments   │            │ ReverseProxy over
-       │ + provisioning│            │ <root>/run/<slug>.sock
+       │ + provisioning│            │ <root>/run/<slug>/<slug>.sock
        └───────────────┘   ┌────────▼─────────┐
                            │ serve-org process│  ← OS boundary
-        host-side, shared: │  own uid + netns │
-          • store          │  stock PB + jsvm │
-          • materialize    │  (Sandboxed)     │
-            (symlinks      │  + CardDAV       │
-             pb_hooks/     └──────────────────┘
-             pb_public)      one process per org
+        host-side, shared: │  own uid + mount │
+          • store          │  + pid ns        │
+          • materialize    │  stock PB + jsvm │
+            (symlinks      │  (Sandboxed)     │
+             pb_hooks/     │  + Card/Cal/Web  │
+             pb_public)    │    DAV           │
+                           └──────────────────┘
+                             one process per org
 ```
 
 ### Packages
@@ -50,11 +52,11 @@ unix domain socket and never holds a tenant app object.
 | `internal/controlplane` | Control-plane PocketBase app: `orgs`/`packages`/`deployments` schema, `Provisioner` (create/deploy/suspend/resume/archive/publish), HTTP routes, and the DB-backed `OrgLookup`. |
 | `internal/orgmanager` | Lazy per-org process supervisor: materialize → spawn `serve-org` → readiness handshake → reverse proxy. Singleflight-collapsed spawns, crash supervision with backoff, drain-then-kill `Evict`, idle sweeper. |
 | `internal/orgerr` | The three sentinels (`ErrOrgNotFound` / `ErrOrgNotActive` / `ErrOrgUnavailable`) the front router classifies into 404 / 503. |
-| `internal/davconfig` | JSON wire format for the CardDAV source list the host hands each tenant. |
+| `internal/davconfig` | JSON wire formats for the runtime config the host hands each tenant: CardDAV / CalDAV / WebDAV source lists and quota sources. |
 | `internal/frontrouter` | Plain `http.Handler`: `Host` → subdomain → control-plane / org / apex-redirect. |
 | `internal/server` | Single `http.Server` + wildcard autocert TLS + graceful shutdown. |
 | `cmd/serve-multi` | The router. Wires it all together. |
-| `cmd/serve-org` | The tenant. One org, stock PocketBase + sandboxed jsvm + CardDAV, on a unix socket. |
+| `cmd/serve-org` | The tenant. One org on a unix socket: `coreserver.RegisterTenant` (core guards, sandboxed jsvm, CardDAV/CalDAV/WebDAV, quota) plus the pinned feature-Go menu (`internal/tenantpkgs`), gated by the org's resolved package set. |
 
 ## Running
 
@@ -103,10 +105,19 @@ and *unknown-future* vectors uniformly, which is the point: four successive
 audits each found another capability re-entering through a *kept* binding, and
 that pattern is what per-process isolation ends.
 
+**There is deliberately no network namespace.** Tenants make legitimate
+outbound connections — calendar ICS subscription fetches, mail provider APIs,
+Sentry — so `CLONE_NEWNET` without veth/NAT plumbing would break shipped
+features for no boundary gain (`$http` is already withheld by the sandbox as
+defence in depth, and the DB/filesystem boundary does not depend on the
+network). If per-tenant egress policy is ever wanted, it is an operator
+firewall concern, not a namespace one.
+
 `TestConfinement_*` in `internal/orgmanager` asserts these properties directly
 (cross-org `ATTACH` fails, tenants run as distinct non-root uids, host secrets
-are absent from the child environment). **They require Linux and root**, so they
-do not run on a macOS dev box — see the caveat below.
+are absent from the child environment). **They require Linux and root**; they
+run as root in CI (`.github/workflows/confinement.yml`), and on a macOS dev box
+`-run TestConfinement` prints an explicit skip stub — see the caveat below.
 
 ### Retained in-process hardening (defence in depth)
 
@@ -157,14 +168,12 @@ layers (the end-to-end tests spawn two real tenant processes that serve their ow
 JS hook routes and their own CardDAV over separate sockets). The following must
 still be handled before it hosts a real tenant.
 
-### 1. Linux CI for the confinement tests
+### 1. Linux CI for the confinement tests — DONE
 
-`TestConfinement_*` assert the security properties this architecture exists to
-provide, and they require Linux and root. There is no CI for this repo, so on a
-macOS dev box they silently skip — meaning **the boundary itself is currently
-unverified by any automated run.** Everything else (spawn, proxy, lifecycle,
-crash handling, CardDAV, the sandbox) is covered on darwin. Standing up a Linux
-runner is the highest-value gap to close.
+The `confinement` workflow (`.github/workflows/confinement.yml`) clones the
+sibling repos, runs the full suite, and runs `TestConfinement_*` as root on
+every push/PR. Its first run caught a live bug (non-root spawns EPERM'd),
+which is exactly the job it exists to do.
 
 ### 2. Wildcard TLS
 
@@ -179,10 +188,9 @@ supply a DNS-01 solver or a pre-issued wildcard cert. The autocert cache lives a
   "content-addressed" wording are vestigial — the store resolves by
   `<name>/<version>`, and `content_hash`/`manifest` are never populated by
   `PublishPackage`. Either wire content hashing or drop the vocabulary.
-- **Reserved subdomains:** `validSlug` accepts `admin` and `www`, but the front
-  router routes those to the control plane / apex redirect — so an org created
-  with such a slug would be unreachable. Add the router's reserved labels to the
-  slug-rejection set.
+- **Reserved subdomains:** `validSlug` rejects `admin` and `www`
+  (`provisioning.go`), matching what the front router claims for the control
+  plane / apex redirect.
 - **peerVersions solver:** `lockfile.Resolve` only checks that referenced versions
   exist in the store. The full `peerVersions` compatibility solver (spec §7) is a
   follow-on the `CreateOrg`/`Deploy` path can call before materializing.
@@ -199,8 +207,13 @@ supply a DNS-01 solver or a pre-issued wildcard cert. The autocert cache lives a
 `go.mod` has:
 
 ```
-replace github.com/pocketbase/pocketbase => ../pocketbase
+replace github.com/pocketbase/pocketbase => ../tinycld/third_party/pocketbase
 ```
+
+That is a **vendored copy** of the fork (Go sources byte-identical to commit
+`a37c8ac` of `feat/multitenant-fork`, `ui/` stripped). The fork's own checkout
+at `~/code/tinycld/pocketbase` is for fork development and upstreaming; edits
+there reach the router only once vendored.
 
 The fork (branch `feat/multitenant-fork`) adds two seams this module still uses:
 

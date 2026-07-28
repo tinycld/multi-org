@@ -43,7 +43,14 @@ const (
 	drainTimeout = 10 * time.Second
 
 	// killTimeout is how long the child gets to honour SIGTERM before SIGKILL.
-	killTimeout = 5 * time.Second
+	// It must EXCEED drainTimeout: the child is handed --drain drainTimeout as
+	// its own post-SIGTERM graceful budget, and a child holding an open SSE
+	// stream legitimately uses all of it (its srv.Shutdown returns only at ctx
+	// expiry, then it exits itself). The margin on top is for the exit path
+	// after the child's drain — Sentry flush, bootstrap reset — so SIGKILL
+	// fires only for a genuinely wedged child, never one still inside the
+	// window it was promised.
+	killTimeout = drainTimeout + 5*time.Second
 
 	backoffMin = 1 * time.Second
 	backoffMax = 30 * time.Second
@@ -108,6 +115,12 @@ type Config struct {
 	// Host-side for the same reason as the DAV sources: the host already
 	// holds the resolved list, and the child must not walk the store.
 	PackageSlugs func(resolved []lockfile.ResolvedPackage) ([]string, error)
+
+	// Forwarded controls how each tenant's proxy constructs the
+	// X-Forwarded-* headers (client IP chain and public scheme). The zero
+	// value behaves like proxy mode with the scheme taken from the router's
+	// own hop; serve-multi wires it from MT_TLS_MODE.
+	Forwarded ForwardedConfig
 
 	// OrgURL returns an org's public URL (scheme + host, no trailing slash),
 	// e.g. "https://acme.tinycld.org". Materialized to .runtime/app.json and
@@ -284,6 +297,8 @@ func (m *OrgManager) load(ctx context.Context, slug string) (*OrgInstance, error
 	}
 	m.orgs[slug] = inst
 	m.mu.Unlock()
+	// Fate decided: the supervisor now owns accounting for this child's exit.
+	close(inst.published)
 	return inst, nil
 }
 
@@ -345,14 +360,15 @@ func (m *OrgManager) spawn(ctx context.Context, slug, orgDir string, cfgs runtim
 	}
 
 	inst := &OrgInstance{
-		slug:     slug,
-		sockPath: sockPath,
-		proc:     proc,
-		proxy:    newProxy(sockPath, log),
-		closed:   make(chan struct{}),
-		dead:     make(chan struct{}),
-		torndown: make(chan struct{}),
-		log:      log,
+		slug:      slug,
+		sockPath:  sockPath,
+		proc:      proc,
+		proxy:     newProxy(sockPath, m.cfg.Forwarded, log),
+		closed:    make(chan struct{}),
+		dead:      make(chan struct{}),
+		torndown:  make(chan struct{}),
+		published: make(chan struct{}),
+		log:       log,
 	}
 	inst.handler = http.HandlerFunc(inst.serveProxied)
 	inst.lastUsed.Store(nowNanos())
@@ -362,6 +378,11 @@ func (m *OrgManager) spawn(ctx context.Context, slug, orgDir string, cfgs runtim
 	go m.supervise(inst)
 
 	if err := awaitReady(ctx, readyR, inst); err != nil {
+		// Host-initiated teardown of a spawn that never went live: mark it so
+		// the supervisor doesn't ALSO account for the exit — the caller
+		// records exactly one crash for the failed load, and a child the host
+		// itself killed must not be logged as an unexpected exit.
+		close(inst.closed)
 		// Kill rather than TERM — it is either unresponsive or already broken —
 		// and reap it, or a late-successful child would keep holding the socket.
 		_ = proc.Kill()
@@ -505,6 +526,17 @@ func (m *OrgManager) supervise(inst *OrgInstance) {
 	case <-inst.closed:
 		return // expected: shutdown is driving and is waiting on dead
 	default:
+	}
+
+	// The child can die before load has decided the instance's fate (a crash
+	// during boot). Block until it does: a published instance's exit is ours
+	// to account for below; an abandoned spawn closes `closed` and its load
+	// path records the one crash — counting it here too doubled the first
+	// backoff and logged a host-killed child as an unexpected exit.
+	select {
+	case <-inst.closed:
+		return
+	case <-inst.published:
 	}
 
 	m.mu.Lock()
@@ -678,22 +710,27 @@ type packagesConfigFile struct {
 	Slugs []string `json:"slugs"`
 }
 
-// writeAppConfig materializes the org's public URL where the tenant can read
-// it. The tenant adopts it as Settings().Meta.AppURL at boot — the value PB
-// interpolates into {APP_URL} in every auth email — because the child knows
-// neither MT_BASE_DOMAIN nor the TLS mode.
+// writeAppConfig materializes app-level runtime config where the tenant can
+// read it: the org's public URL (adopted as Settings().Meta.AppURL — the value
+// PB interpolates into {APP_URL} in every auth email — because the child knows
+// neither MT_BASE_DOMAIN nor the TLS mode) and the proxy-trust headers
+// (adopted as Settings().TrustedProxy — over the unix socket the tenant's
+// RemoteAddr is empty, so without trusting the router's X-Forwarded-For every
+// request shares one rate-limit bucket). Always written: every router-managed
+// tenant is fronted by the router, so the trust always applies even when no
+// OrgURL hook is wired.
 func (m *OrgManager) writeAppConfig(orgDir, slug string) (string, error) {
-	if m.cfg.OrgURL == nil {
-		return "", nil
-	}
-
 	runtimeDir := filepath.Join(orgDir, ".runtime")
 	if err := os.MkdirAll(runtimeDir, 0o755); err != nil {
 		return "", err
 	}
 	path := filepath.Join(runtimeDir, "app.json")
 
-	body, err := json.Marshal(appConfigFile{AppURL: m.cfg.OrgURL(slug)})
+	cfg := appConfigFile{TrustedProxyHeaders: []string{"X-Forwarded-For"}}
+	if m.cfg.OrgURL != nil {
+		cfg.AppURL = m.cfg.OrgURL(slug)
+	}
+	body, err := json.Marshal(cfg)
 	if err != nil {
 		return "", err
 	}
@@ -706,6 +743,12 @@ func (m *OrgManager) writeAppConfig(orgDir, slug string) (string, error) {
 // appConfigFile is the wire shape of .runtime/app.json.
 type appConfigFile struct {
 	AppURL string `json:"appURL"`
+
+	// TrustedProxyHeaders is what the tenant should set as
+	// Settings().TrustedProxy.Headers. The router guarantees the RIGHTMOST
+	// entry of the (last) header is the best-known client IP — which is
+	// PocketBase's default resolution order (UseLeftmostIP false).
+	TrustedProxyHeaders []string `json:"trustedProxyHeaders"`
 }
 
 // writeWebDAVConfig is writeCardDAVConfig's counterpart for WebDAV trees. Same
@@ -815,7 +858,13 @@ func (m *OrgManager) Shutdown() {
 
 // sweep evicts instances idle longer than MaxIdle.
 func (m *OrgManager) sweep() {
-	ticker := time.NewTicker(m.cfg.MaxIdle / 2)
+	// Floor the interval: NewTicker panics on a non-positive duration, which a
+	// sub-2ns MaxIdle would otherwise produce.
+	interval := m.cfg.MaxIdle / 2
+	if interval <= 0 {
+		interval = time.Millisecond
+	}
+	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	for {
 		select {

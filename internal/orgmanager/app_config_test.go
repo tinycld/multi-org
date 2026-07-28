@@ -17,7 +17,7 @@ func TestWriteAppConfigWritesOrgURL(t *testing.T) {
 		OrgURL: func(slug string) string { return "https://" + slug + ".tenants.example.test" },
 	}}
 
-	path, err := m.writeAppConfig(orgDir, "acme")
+	path, err := m.writeAppConfig(orgDir, "acme", OrgRecord{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -50,7 +50,7 @@ func TestWriteAppConfigWithoutOrgURLStillMaterializesProxyTrust(t *testing.T) {
 	orgDir := t.TempDir()
 	m := &OrgManager{cfg: Config{}}
 
-	path, err := m.writeAppConfig(orgDir, "acme")
+	path, err := m.writeAppConfig(orgDir, "acme", OrgRecord{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -71,5 +71,33 @@ func TestWriteAppConfigWithoutOrgURLStillMaterializesProxyTrust(t *testing.T) {
 	}
 	if len(cfg.TrustedProxyHeaders) != 1 || cfg.TrustedProxyHeaders[0] != "X-Forwarded-For" {
 		t.Fatalf("trustedProxyHeaders = %v, want [X-Forwarded-For]", cfg.TrustedProxyHeaders)
+	}
+}
+
+// Org branding rides the same rail as AppURL: the control-plane display_name
+// materializes as orgName (the tenant adopts it as Settings().Meta.AppName,
+// where /api/org-info reads it back for the client), and MT_BASE_DOMAIN rides
+// along so the tenant can scope the cross-org switcher cookie.
+func TestWriteAppConfigWritesOrgNameAndBaseDomain(t *testing.T) {
+	orgDir := t.TempDir()
+	m := &OrgManager{cfg: Config{BaseDomain: "tenants.example.test"}}
+
+	path, err := m.writeAppConfig(orgDir, "acme", OrgRecord{Slug: "acme", DisplayName: "Acme Inc"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var cfg appConfigFile
+	if err := json.Unmarshal(body, &cfg); err != nil {
+		t.Fatal(err)
+	}
+	if cfg.OrgName != "Acme Inc" {
+		t.Fatalf("orgName = %q, want %q", cfg.OrgName, "Acme Inc")
+	}
+	if cfg.BaseDomain != "tenants.example.test" {
+		t.Fatalf("baseDomain = %q, want %q", cfg.BaseDomain, "tenants.example.test")
 	}
 }

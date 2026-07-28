@@ -207,9 +207,11 @@ supply a DNS-01 solver or a pre-issued wildcard cert. The autocert cache lives a
 - **Reserved subdomains:** `validSlug` rejects `admin` and `www`
   (`provisioning.go`), matching what the front router claims for the control
   plane / apex redirect.
-- **peerVersions solver:** `lockfile.Resolve` only checks that referenced versions
-  exist in the store. The full `peerVersions` compatibility solver (spec §7) is a
-  follow-on the `CreateOrg`/`Deploy` path can call before materializing.
+- **peerVersions solver:** `lockfile.Resolve` stays a pure store lookup;
+  `controlplane.CheckPeerVersions` (compat.go) enforces every resolved
+  package's `peerVersions` ranges — `CreateOrg` and `Deploy` both refuse to
+  materialize an incompatible set. A required peer missing from the lockfile
+  and an unparsable range are violations too (fail closed).
 - **Cold start:** a tenant boot is PocketBase bootstrap + migrations + JS compile,
   i.e. hundreds of ms to seconds, paid by the first request after the 30-minute
   idle sweep evicts an org. There is no warm pool. Cross-org compiled-program

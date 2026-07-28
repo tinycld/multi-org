@@ -63,6 +63,13 @@ type OrgRecord struct {
 	Status   string
 	Lockfile []byte
 
+	// DisplayName is the org's human-facing name from the control-plane
+	// record. Materialized into .runtime/app.json (orgName) and adopted as the
+	// tenant's Settings().Meta.AppName, which is where the client's
+	// /api/org-info reads branding from. Empty leaves the tenant's stored
+	// AppName alone.
+	DisplayName string
+
 	// StorageLimitBytes is the org's ceiling (0 = unlimited), set by the
 	// operator on the control-plane record. Materialized into the org's runtime
 	// config so the tenant enforces it but cannot change it.
@@ -131,6 +138,11 @@ type Config struct {
 	// carry PB's default http://localhost:8090. Nil ⇒ nothing materialized and
 	// the tenant's stored settings are left untouched.
 	OrgURL func(slug string) string
+
+	// BaseDomain is MT_BASE_DOMAIN, materialized into each org's app.json so
+	// the tenant can scope the cross-org switcher cookie to the parent domain.
+	// Empty ⇒ tenants set no cross-org cookie.
+	BaseDomain string
 }
 
 // crashState tracks a slug's consecutive unexpected exits. It lives on the
@@ -271,7 +283,7 @@ func (m *OrgManager) load(ctx context.Context, slug string) (*OrgInstance, error
 		return nil, fmt.Errorf("packages config %s: %w", slug, err)
 	}
 
-	appConfig, err := m.writeAppConfig(orgDir, slug)
+	appConfig, err := m.writeAppConfig(orgDir, slug, rec)
 	if err != nil {
 		return nil, fmt.Errorf("app config %s: %w", slug, err)
 	}
@@ -719,14 +731,18 @@ type packagesConfigFile struct {
 // request shares one rate-limit bucket). Always written: every router-managed
 // tenant is fronted by the router, so the trust always applies even when no
 // OrgURL hook is wired.
-func (m *OrgManager) writeAppConfig(orgDir, slug string) (string, error) {
+func (m *OrgManager) writeAppConfig(orgDir, slug string, rec OrgRecord) (string, error) {
 	runtimeDir := filepath.Join(orgDir, ".runtime")
 	if err := os.MkdirAll(runtimeDir, 0o755); err != nil {
 		return "", err
 	}
 	path := filepath.Join(runtimeDir, "app.json")
 
-	cfg := appConfigFile{TrustedProxyHeaders: []string{"X-Forwarded-For"}}
+	cfg := appConfigFile{
+		TrustedProxyHeaders: []string{"X-Forwarded-For"},
+		OrgName:             rec.DisplayName,
+		BaseDomain:          m.cfg.BaseDomain,
+	}
 	if m.cfg.OrgURL != nil {
 		cfg.AppURL = m.cfg.OrgURL(slug)
 	}
@@ -743,6 +759,16 @@ func (m *OrgManager) writeAppConfig(orgDir, slug string) (string, error) {
 // appConfigFile is the wire shape of .runtime/app.json.
 type appConfigFile struct {
 	AppURL string `json:"appURL"`
+
+	// OrgName is the org's display name from the control-plane record, adopted
+	// as the tenant's Settings().Meta.AppName (the client reads it back via
+	// /api/org-info). Empty = leave the tenant's stored name alone.
+	OrgName string `json:"orgName"`
+
+	// BaseDomain is MT_BASE_DOMAIN, so the tenant can scope the cross-org
+	// switcher cookie to the parent domain (Domain=.<baseDomain>). Empty = the
+	// tenant sets no cross-org cookie.
+	BaseDomain string `json:"baseDomain"`
 
 	// TrustedProxyHeaders is what the tenant should set as
 	// Settings().TrustedProxy.Headers. The router guarantees the RIGHTMOST

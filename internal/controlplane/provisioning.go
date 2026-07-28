@@ -93,6 +93,9 @@ func (p *Provisioner) CreateOrg(slug, displayName string, lock map[string]string
 	if err != nil {
 		return nil, fmt.Errorf("resolve lockfile: %w", err)
 	}
+	if err := CheckPeerVersions(resolved); err != nil {
+		return nil, fmt.Errorf("lockfile compatibility: %w", err)
+	}
 	if err := materialize.Materialize(orgDir, resolved); err != nil {
 		return nil, fmt.Errorf("materialize: %w", err)
 	}
@@ -164,6 +167,9 @@ func (p *Provisioner) Deploy(slug string, lock map[string]string) error {
 	resolved, err := lf.Resolve(p.store)
 	if err != nil {
 		return err
+	}
+	if err := CheckPeerVersions(resolved); err != nil {
+		return fmt.Errorf("lockfile compatibility: %w", err)
 	}
 	orgDir := filepath.Join(p.root, "pb_orgs", slug)
 	if err := materialize.Materialize(orgDir, resolved); err != nil {

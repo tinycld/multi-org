@@ -39,6 +39,7 @@ require (
 )
 
 require (
+	github.com/Masterminds/semver/v3 v3.5.0
 	github.com/getsentry/sentry-go v0.44.1
 	tinycld.org/packages/calc v0.0.0-00010101000000-000000000000
 	tinycld.org/packages/calendar v0.0.0-00010101000000-000000000000
@@ -49,7 +50,6 @@ require (
 )
 
 require (
-	github.com/Masterminds/semver/v3 v3.5.0 // indirect
 	github.com/SherClockHolmes/webpush-go v1.4.0 // indirect
 	github.com/adrg/strutil v0.2.2 // indirect
 	github.com/adrg/sysfont v0.1.2 // indirect

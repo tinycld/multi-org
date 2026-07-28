@@ -1,8 +1,13 @@
 # Handoff — Multi-Org PocketBase Router
 
 **Updated:** 2026-07-28 (Phase 6 complete — **all 64 items of
-`REMEDIATION-PLAN.md` are done**; that file carries per-item evidence. What
-remains is only the §6 "still open" list below, none of it a merge blocker.)
+`REMEDIATION-PLAN.md` are done**; that file carries per-item evidence. The §6
+"still open" list was then worked the same day: org branding + the cross-org
+switcher shipped, peerVersions settled and enforced, the userorg package
+renamed, the DeleteAccountModal and disabled-mailbox decisions made, mailproto
+gained its injected-listener seam, and the upstream branches are pushed. What
+remains open in §6 is only the router-side IMAP/SMTP demux/handoff and the
+solver's target-manifest re-check follow-up.)
 **Goal:** one router hosts many organizations — each org its own **OS process**,
 SQLite DB, client bundle, and server-side JS, sharing versioned code on disk but
 isolated at the kernel boundary.
@@ -577,10 +582,17 @@ matches:
   CalDAV followed the **WebDAV** shape, not CardDAV's: a `Source` field map plus
   four opt-in TS hook points (`beforeWrite`, `beforeDelete`, `canRead`,
   `filterList` — no `beforeMove`, since CalDAV has no cross-calendar move).
-  IMAP/SMTP are the remaining case:
-  `mailproto` is still **unwired**, and it binds fixed TCP ports, so it cannot
-  run per-tenant as-is — it needs an injected listener before it can follow
-  CardDAV into the tenant.
+  IMAP/SMTP are the remaining case, and the mailproto half is now DONE
+  (2026-07-28): `mailproto.ListenFunc` (on `IMAPOptions`/`SMTPOptions`)
+  replaces every TCP bind with a host-supplied listener — TLS wrapping stays in
+  mailproto, and `mailproto/listen_test.go` pins that an injected listener is
+  served on with the configured address never bound. **What remains is
+  router-side**: demux an inbound connection to an org (TLS SNI for
+  IMAPS :993 / SMTPS :465; the MX :25 has no reliable SNI and must route on
+  RCPT TO domain), hand each tenant its listener (the `ExtraFiles` fd
+  precedent, spawn_exec.go), and thread a ListenFunc through
+  `coreserver.RegisterTenant` → mail's `RegisterTenant`. Until then the
+  listeners stay host-only (mail `register.go` documents the same state).
 
 **Feature migration — DONE (2026-07-26).** All seven features are migrated; see
 §3.7 for what the last pass added.
@@ -591,11 +603,18 @@ matches:
   object and sobek has no bytecode serialization, so there is nothing to share
   across an address space). Still worth upstreaming for single-process
   embedders, but this repo no longer exercises it.
-- PR #2 `apis.BuildServeMux`: rebuild a clean branch off `v0.39.8` (the pushed
-  `-buildservemux` branch is stale; delete it after). **Still used** — for the
-  control plane, which shares the router's process. Tenants use stock
-  `apis.Serve` with `ServeEvent.Listener` (upstream, no fork needed).
-- Push the 7 `chore/bump-pocketbase-v0.39.8` branches, or fold into a release.
+- ~~PR #2 `apis.BuildServeMux`: rebuild a clean branch off `v0.39.8`.~~
+  **DONE (2026-07-28)** — `feat/apis-buildservemux` is the two BuildServeMux
+  commits cherry-picked onto `v0.39.8`, built + tested, pushed to the fork;
+  the stale `feat/jsvm-programsource-buildservemux` branch is deleted (local +
+  remote). **Still used** — for the control plane, which shares the router's
+  process. Tenants use stock `apis.Serve` with `ServeEvent.Listener`
+  (upstream, no fork needed). Opening the upstream PR remains a manual step.
+- ~~Push the 7 `chore/bump-pocketbase-v0.39.8` branches.~~ **DONE
+  (2026-07-28)** — pushed in contacts, mail, drive, text, calc, calendar and
+  tinycld (takeout is client-only, no Go). contacts' and tinycld's branch
+  pointers were first reset to the actual bump commits — each had a stray
+  `wip: §11` commit on top that already lives in the `feat/de-org` lineage.
 - ~~Give `multi-org` a remote if it should be shared/CI'd.~~ **DONE** — `origin`
   is `github.com/tinycld/multi-org` and the branch is pushed. Linux CI (§7,
   P5-1) is unblocked.
@@ -610,11 +629,28 @@ caller's credentials, so each collection's list rule narrows them, and one
 deployment is one org. Under a shared instance they would match across tenants.
 Flagged in a comment at the calendar site.
 
-*Version-pin inconsistency, cosmetic.* `peerVersions['@tinycld/core']` disagrees
-across members — drive and mail say `>=0.4.0 <0.5.0`, contacts and calendar say
-`>=0.0.4 <0.1.0`, and `core/package.json` says `0.0.4`. Nothing enforces it yet
-(`lockfile.Resolve` doesn't run the solver — see below), so it is latent, but the
-next release should settle on one range.
+*~~Version-pin inconsistency~~ — SETTLED AND ENFORCED (2026-07-28).* It was
+worse than "cosmetic": FOUR members (mail, drive, **text, calc**) said
+`>=0.4.0 <0.5.0` — a copy of the app-shell version, not core's — which is
+genuinely unsatisfiable against `@tinycld/core` 0.0.4 (`tinycld/core/
+package.json`; the `core/package.json` path this note used to cite doesn't
+exist). All seven members now declare `>=0.0.4 <0.1.0`; re-pin via the release
+skill when core's version line moves. Enforcement landed in BOTH places:
+- **Router:** `controlplane.CheckPeerVersions` (compat.go) runs after
+  `lockfile.Resolve` in `CreateOrg` AND `Deploy` — an unsatisfied range, a
+  peer missing from the lockfile, or an unparsable range refuses to
+  materialize. peerVersions travel via the store's `manifest.json` (whole-
+  object marshal already carried them; `manifestCapabilities` now decodes
+  them). `Resolve` itself stays a pure store lookup.
+- **Core:** `/api/admin/packages/versions/apply` gained the pre-flight gate
+  (`checkVersionChangeCompat`, shared solve with the check endpoint) — before
+  this the UI check was advisory-only and a direct POST bypassed it, so
+  `docs/packages.md`'s "authoritatively on the server" claim was false.
+  **Remaining follow-up:** both gates resolve peerVersions from the
+  currently-installed manifests; a target version that TIGHTENS its own
+  requirements isn't re-checked from the freshly-fetched target manifest
+  (`verifyTargetPeerVersions` in pkg_compat.go's header is documented as a
+  follow-up, not implemented).
 
 *App-shell de-org — DONE (2026-07-26).* The follow-up pass fixed four more live
 bugs of the same compiler-blind class, all found only by reading against the
@@ -712,9 +748,16 @@ Admin re-enable restores all of it.
   again. That is the right trade for a suspension, but it is a deliberate
   choice, not an accident, and it is why the disable copy says "you'll be
   signed out everywhere".
-- **Mail delivery to a disabled user's mailbox** is unaddressed — bounce,
-  silently accept, or hold? The account can't sign in, but SMTP doesn't consult
-  `disabled`.
+- ~~**Mail delivery to a disabled user's mailbox** is unaddressed.~~ **DECIDED
+  (2026-07-28): accept and store.** Disable is a reversible suspension — mail
+  keeps accumulating so it's waiting on re-enable, and senders learn nothing
+  (a bounce or 4xx would leak account state). The suspended user still can't
+  READ any of it (sign-in, IMAP, rules all closed). Recorded as a comment at
+  the member fan-out in mail's `processInboundForMailbox` (the path both the
+  webhook and inbound-SMTP routes converge on) and pinned by
+  `TestHandleInbound_DisabledUserMailboxStillReceives`, which goes red if
+  delivery ever starts consulting `disabled`. Help copy updated
+  (account-settings.md).
 - **Other packages' collection rules.** ⚠️ **This audit was incomplete — see
   §7.** It correctly found `contacts.listRule` and mail's message rules to be
   own-rows-only, and correctly flagged `mail_mailbox_aliases.listRule`. But it
@@ -725,39 +768,66 @@ Admin re-enable restores all of it.
   consults `disabled` at all** (§7.2), which is a third authentication path
   outside the "two gates" model this section describes.
 
-- **`core/server/userorg/`** is still named for the junction it no longer uses.
+- ~~**`core/server/userorg/`** is still named for the junction it no longer
+  uses.~~ **CLOSED (2026-07-28)** — renamed to `core/server/offboard`
+  (`tinycld.org/core/offboard`; files `offboard.go`/`offboard_test.go`),
+  imports updated across coreserver + calendar/calc/text/drive. Behavior
+  identical; the package doc records the lineage.
 
 - ~~Store "content-addressed" naming is vestigial (`ContentHash`/`manifest`
   unused).~~ **CLOSED (P6-5, 2026-07-28)** — `store.ContentHash`, the
   `packages.content_hash`/`manifest` columns and `orgs.custom_domains` deleted
   (all writer-less or reader-less; `manifest.json` materialization is separate
   and untouched).
-- **DeleteAccountModal's visual default disagrees with what it submits.** The
-  `ContentPlanPicker` highlights "Delete everything" when no plan has been
-  chosen (`value={plan ?? { mode: 'delete_my_data' }}`), but submitting without
-  clicking sends `plan == undefined` — which the server correctly treats as
-  "leave my content". Safe direction, but the UI shows the destructive option
-  selected while the safe one executes. Product call needed: either make the
-  picker start unselected (and require a choice) or actually default the
-  submitted plan. Found during P6-4's help-writing pass; not changed, because
-  which default is right is a shipped-UX decision.
+- ~~**DeleteAccountModal's visual default disagrees with what it submits.**~~
+  **CLOSED (2026-07-28) — product call: require an explicit choice.** The
+  picker starts unselected (`ContentPlanPicker` takes
+  `value: OffboardPlan | undefined`) and submit stays blocked until a plan is
+  chosen whenever peers exist; with no peers the picker hides and the
+  undefined plan remains the deliberate leave-content path. The flow moved
+  into `useDeleteAccountForm` so the contract is testable —
+  `delete-account-modal.test.tsx` was verified red against the old behavior.
+  RemoveMemberFlow keeps its pre-selected reassign default (honest: it submits
+  exactly what it highlights).
 - **Five inline biome-ignore waivers remain** (text `webview-editor/build.ts`
   noConsole ×2, the `__DEV__`-guarded editor warning, anchored-overlay's
   narrowed dep array, calc SheetTabs a11y) — deliberate, rationale-carrying,
   and load-bearing under the member gate; see P6-8 for why they didn't move to
   config.
-- `lockfile.Resolve` doesn't run the `peerVersions` solver yet.
-- Org switcher: `OrganizationsTab` is stubbed pending the router setting a
-  parent-domain cookie listing accessible orgs.
-- **Org branding has no source.** `useOrgInfo()` returns `org: null`, so an org
-  name/logo cannot render anywhere — `DocumentTitle` silently drops its org
-  segment, and `getOrgLogoUrl` (`core/lib/use-org-info.ts:23-27`) is unreachable
-  dead code. The router materializes `carddav.json`, `caldav.json` and
-  `quota.json` into
-  `<orgDir>/.runtime/` but nothing for branding. `document-title.spec.ts` had its
-  org-segment assertions **deleted** rather than reworded, because there is
-  currently no value for them to assert; restoring them means the router
-  materializing branding and `useOrgInfo` reading it.
+- ~~`lockfile.Resolve` doesn't run the `peerVersions` solver yet.~~ **CLOSED
+  (2026-07-28)** — see the version-pin entry above: `CheckPeerVersions` at both
+  `CreateOrg`/`Deploy` call sites, `Resolve` itself unchanged by design.
+- ~~Org switcher: `OrganizationsTab` is stubbed pending the router setting a
+  parent-domain cookie.~~ **CLOSED (2026-07-28), with one design correction:**
+  the ROUTER cannot set that cookie — it has zero user identity (no cookie
+  code, no user table; users are purely per-tenant, and no component stores a
+  user→orgs mapping). Instead each TENANT upserts its own `{slug, name, url}`
+  into a `tinycld_orgs` cookie on `Domain=.<MT_BASE_DOMAIN>` on every
+  successful users auth (`serve-org` + `internal/orgcookie`; base domain and
+  org name ride `.runtime/app.json`). The browser therefore accumulates the
+  orgs its user has actually signed into — a **navigation hint, not an
+  authorization claim** (client-writable; every org still authenticates
+  independently). Client: `core/lib/org-cookie.ts` parses it (the two files
+  are the wire contract), `useUserOrgs` feeds UserMenu / MoreDrawer /
+  the un-stubbed `OrganizationsTab`, and rows are full page loads on the
+  target org's origin (`navigateToOrgUrl`). Proven end-to-end by
+  `TestTenant_SetsSwitcherCookieOnAuth` (real serve-org binary: good auth sets
+  the parent-domain cookie with the org's display name, bad auth doesn't).
+- ~~**Org branding has no source.**~~ **CLOSED (2026-07-28), name-only.** The
+  chain: `orgs.display_name` (was written-and-never-read) → `OrgRecord` →
+  `.runtime/app.json` `orgName` (+ `baseDomain`) → serve-org adopts
+  `Settings().Meta.AppName` (persisted, AppURL's rail) → core's new
+  unauthenticated `GET /api/org-info` (registered in the SHARED composition,
+  so tenants and the standalone app both serve it; standalone's name is the
+  setup wizard's appName) → `useOrgInfo()` (react-query; `getOrgLogoUrl` and
+  the pbtsdb shim deleted) → `DocumentTitle` renders the org segment again
+  (suppressed when it merely repeats the brand). `document-title.spec.ts` got
+  its four org-segment assertions **restored** and passing — the seed sets
+  `meta.appName = "Test Organization"`, mirroring what the router
+  materializes. `MinimalProviders` gained its own QueryClient so pre-auth
+  screens can mount the hook. **No logo:** `orgs` has no file field; org
+  avatars are `NameAvatar` initials. A logo needs a control-plane file field +
+  materialization — deliberately out of scope.
 
 ---
 
@@ -1369,10 +1439,14 @@ collide on ports — §5.3); every e2e finding above is from reading the specs.
 > in `core/davhooks`); two router tests were quietly unfalsifiable and were
 > repaired; mail's "no provider" error pointed operators at a deleted env var;
 > and the standing 10 biome warnings were dead suppressions. **All 64
-> remediation items are now closed.** Still open: only §6's list (org
-> branding/switcher, mailproto's fixed ports, mail-to-disabled-mailbox policy,
-> the userorg package name, peerVersions settling, lockfile solver, the
-> DeleteAccountModal default mismatch, five deliberate biome waivers).
+> remediation items are now closed.** The §6 "still open" list was then worked
+> on 2026-07-28: org branding + the cross-org switcher shipped end-to-end,
+> peerVersions settled and enforced (router + core apply gate), userorg →
+> offboard, DeleteAccountModal requires an explicit choice, disabled-mailbox
+> delivery decided (accept-and-store, test-pinned), mailproto gained the
+> injected-listener seam, and the upstream branches are pushed. Still open:
+> router-side IMAP/SMTP demux + listener handoff, the solver's
+> target-manifest re-check, and the five deliberate biome waivers.
 
 The original list, kept for the review record:
 

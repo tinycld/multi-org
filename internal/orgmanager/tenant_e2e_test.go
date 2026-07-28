@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"strings"
 	"syscall"
@@ -52,9 +53,10 @@ func newRealManager(t *testing.T, hookSource string) *OrgManager {
 		Logger:       quietLogger(),
 		HooksPool:    2,
 		LookupOrg: stubLookup(map[string]OrgRecord{
-			"acme": {Slug: "acme", Status: "active", Lockfile: []byte(`{"@tinycld/core":"1.0.0"}`)},
+			"acme": {Slug: "acme", Status: "active", DisplayName: "Acme Incorporated", Lockfile: []byte(`{"@tinycld/core":"1.0.0"}`)},
 		}),
-		OrgURL: func(slug string) string { return "https://" + slug + ".tenants.example.test" },
+		OrgURL:     func(slug string) string { return "https://" + slug + ".tenants.example.test" },
+		BaseDomain: "tenants.example.test",
 	})
 	t.Cleanup(mgr.Shutdown)
 	return mgr
@@ -79,6 +81,103 @@ func TestTenant_AdoptsMaterializedAppURL(t *testing.T) {
 	}
 	if !strings.Contains(rec.Body.String(), `"url":"https://acme.tenants.example.test"`) {
 		t.Fatalf("tenant settings did not adopt the materialized org URL: %s", rec.Body.String())
+	}
+}
+
+// Org branding follows the AppURL rail: display_name → app.json orgName →
+// Settings().Meta.AppName. That settings value is what the client's
+// /api/org-info serves (document title, org avatar) and what PB interpolates
+// into {APP_NAME} in auth emails.
+func TestTenant_AdoptsMaterializedOrgName(t *testing.T) {
+	mgr := newRealManager(t, `routerAdd('GET','/appname',(e)=>e.json(200,{name:$app.settings().meta.appName}))`)
+
+	inst, err := mgr.Get(context.Background(), "acme")
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+
+	rec := httptest.NewRecorder()
+	inst.Mux().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/appname", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("/appname = %d body=%s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), `"name":"Acme Incorporated"`) {
+		t.Fatalf("tenant settings did not adopt the materialized org name: %s", rec.Body.String())
+	}
+}
+
+// A successful users auth must upsert this org's entry into the parent-domain
+// tinycld_orgs switcher cookie (Set-Cookie through the router's proxy), and a
+// failed auth must not. Drives the real chain: display_name + MT_BASE_DOMAIN →
+// app.json → serve-org's OnRecordAuthRequest hook → Set-Cookie.
+func TestTenant_SetsSwitcherCookieOnAuth(t *testing.T) {
+	mgr := newRealManager(t, `routerAdd('POST','/mkuser',(e)=>{
+        const col = $app.findCollectionByNameOrId('users')
+        const r = new Record(col)
+        r.setEmail('u@example.com')
+        r.setPassword('Password123!')
+        r.setVerified(true)
+        $app.save(r)
+        return e.json(200,{ok:true})
+    })`)
+
+	inst, err := mgr.Get(context.Background(), "acme")
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+
+	rec := httptest.NewRecorder()
+	inst.Mux().ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/mkuser", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("/mkuser = %d body=%s", rec.Code, rec.Body.String())
+	}
+
+	auth := func(password string) *httptest.ResponseRecorder {
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodPost, "/api/collections/users/auth-with-password",
+			strings.NewReader(`{"identity":"u@example.com","password":"`+password+`"}`))
+		req.Header.Set("Content-Type", "application/json")
+		inst.Mux().ServeHTTP(rec, req)
+		return rec
+	}
+
+	good := auth("Password123!")
+	if good.Code != http.StatusOK {
+		t.Fatalf("auth = %d body=%s", good.Code, good.Body.String())
+	}
+	cookie := ""
+	for _, c := range good.Result().Cookies() {
+		if c.Name == "tinycld_orgs" {
+			cookie = c.Value
+			if c.Domain != "tenants.example.test" && c.Domain != ".tenants.example.test" {
+				t.Fatalf("cookie domain = %q, want the parent domain", c.Domain)
+			}
+			if c.HttpOnly {
+				t.Fatal("cookie must not be HttpOnly — the switcher UI reads document.cookie")
+			}
+		}
+	}
+	if cookie == "" {
+		t.Fatalf("successful auth set no tinycld_orgs cookie; headers=%v", good.Result().Header)
+	}
+	decoded, err := url.QueryUnescape(cookie)
+	if err != nil {
+		t.Fatalf("unescape cookie: %v", err)
+	}
+	for _, want := range []string{`"slug":"acme"`, `"name":"Acme Incorporated"`, `"url":"https://acme.tenants.example.test"`} {
+		if !strings.Contains(decoded, want) {
+			t.Fatalf("cookie %s missing %s", decoded, want)
+		}
+	}
+
+	bad := auth("wrong-password")
+	if bad.Code == http.StatusOK {
+		t.Fatal("wrong password authenticated")
+	}
+	for _, c := range bad.Result().Cookies() {
+		if c.Name == "tinycld_orgs" {
+			t.Fatal("failed auth must not set the switcher cookie")
+		}
 	}
 }
 

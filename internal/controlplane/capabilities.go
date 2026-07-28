@@ -104,6 +104,10 @@ type manifestCapabilities struct {
 		SizeField  string `json:"sizeField"`
 		OwnerField string `json:"ownerField"`
 	} `json:"quota"`
+	// PeerVersions declares enforced semver ranges on other packages in the
+	// same lockfile, keyed by package name (e.g. "@tinycld/core"). Read by
+	// CheckPeerVersions before an org's set is materialized.
+	PeerVersions map[string]string `json:"peerVersions"`
 }
 
 // CardDAVSources reads each resolved package's materialized manifest.json and

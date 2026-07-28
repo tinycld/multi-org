@@ -59,6 +59,7 @@ import (
 	"tinycld.org/core/quota"
 	"tinycld.org/core/webdav"
 	"tinycld.org/multi-org/internal/davconfig"
+	"tinycld.org/multi-org/internal/orgcookie"
 	"tinycld.org/multi-org/internal/tenantpkgs"
 )
 
@@ -179,6 +180,28 @@ func run(orgDir, socketPath, slug string, hooksPool int, davConfigPath, caldavCo
 	// also called on the signal path below, since os.Exit skips defers.
 	defer sentry.Flush(2 * time.Second)
 
+	// Cross-org switcher cookie: on every successful users auth, upsert this
+	// org's {slug, name, url} into the parent-domain tinycld_orgs cookie so
+	// sibling orgs' switcher UIs can offer this one. Requires the router to
+	// have materialized both the base domain and the org URL; a standalone
+	// serve-org (no baseDomain) sets nothing. Navigation hint only — the
+	// cookie authorizes nothing, and each org authenticates independently.
+	if appCfg.BaseDomain != "" && appCfg.AppURL != "" {
+		orgName := appCfg.OrgName
+		if orgName == "" {
+			orgName = slug
+		}
+		entry := orgcookie.Entry{Slug: slug, Name: orgName, URL: appCfg.AppURL}
+		app.OnRecordAuthRequest("users").BindFunc(func(e *core.RecordAuthRequestEvent) error {
+			existing := ""
+			if c, err := e.Request.Cookie(orgcookie.Name); err == nil {
+				existing = c.Value
+			}
+			http.SetCookie(e.Response, orgcookie.Cookie(orgcookie.Merge(existing, entry), appCfg.BaseDomain))
+			return e.Next()
+		})
+	}
+
 	if err := app.Bootstrap(); err != nil {
 		return fmt.Errorf("bootstrap: %w", err)
 	}
@@ -199,6 +222,14 @@ func run(orgDir, socketPath, slug string, hooksPool int, davConfigPath, caldavCo
 	settingsDirty := false
 	if appCfg.AppURL != "" && app.Settings().Meta.AppURL != appCfg.AppURL {
 		app.Settings().Meta.AppURL = appCfg.AppURL
+		settingsDirty = true
+	}
+	// Org branding: the control-plane display_name becomes the tenant's
+	// AppName — the value /api/org-info serves to the client (document title,
+	// org avatar) and PB interpolates into {APP_NAME} in auth emails. Same
+	// guard shape as AppURL: empty means the host manages no name here.
+	if appCfg.OrgName != "" && app.Settings().Meta.AppName != appCfg.OrgName {
+		app.Settings().Meta.AppName = appCfg.OrgName
 		settingsDirty = true
 	}
 	if len(appCfg.TrustedProxyHeaders) > 0 &&
@@ -346,6 +377,8 @@ func loadPackageSlugs(path string) ([]string, error) {
 // appConfig mirrors orgmanager's appConfigFile (.runtime/app.json).
 type appConfig struct {
 	AppURL              string   `json:"appURL"`
+	OrgName             string   `json:"orgName"`
+	BaseDomain          string   `json:"baseDomain"`
 	TrustedProxyHeaders []string `json:"trustedProxyHeaders"`
 }
 

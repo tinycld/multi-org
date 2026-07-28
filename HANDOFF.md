@@ -145,7 +145,8 @@ environment so no `MT_*` secret can leak — by construction, not by filtering.
    for a retried create to resume. A verified org is left running (warm).
 
 Original brief: `docs/superpowers/specs/FOLLOWUP-os-process-isolation.md`
-(decisions 1–5 are now answered; 6 resource limits and 7 control-plane remain).
+(all seven decisions are now answered — #6 resource limits by P5-2 and #7
+control-plane provisioning by P5-3, both 2026-07-28).
 
 ---
 
@@ -534,8 +535,11 @@ matches:
   (`bootstrapTenantOnce`).~~ **CLOSED (2026-07-28, P5-3)** — deleted;
   provisioning verifies by booting the tenant through the org manager, so
   migrations run only inside the confined tenant process (§1 caveat 3).
-- **Resource limits.** `MT_CGROUP_ROOT` creates a per-tenant cgroup but writes no
-  limits; a runaway tenant can still starve the host. (Brief decision #6.)
+- ~~**Resource limits.**~~ **CLOSED (2026-07-28, P5-2)** — per-tenant cgroup
+  limits from `MT_TENANT_MEMORY_MAX`/`MT_TENANT_PIDS_MAX`/`MT_TENANT_CPU_MAX`
+  (no defaults; unset = unlimited, incoherent configs warn loudly), written
+  before the pid joins the group; `TestConfinement_CgroupLimitsApplied`
+  asserts the kernel's canonical readback. (Brief decision #6 answered.)
 
 **Protocol servers**
 - ~~A tenant-served WebDAV tree is broader than the single-tenant one.~~
@@ -1373,10 +1377,10 @@ without re-pointing the fixture leaves the next regression equally invisible.
   (`2026-07-23-tenant-jsvm-sandbox*`), multi-org CardDAV
   (`2026-07-23-carddav-multi-org.md`), process isolation
   (`FOLLOWUP-os-process-isolation.md`).
-  Note `FOLLOWUP-os-process-isolation.md` is the *pre-implementation* brief; its
-  seven deferred decisions are answered by the shipped code except #6 (resource
-  limits — P5-2); #7 (control-plane provisioning) closed 2026-07-28 by P5-3.
-  `README.md` describes what actually exists.
+  Note `FOLLOWUP-os-process-isolation.md` is the *pre-implementation* brief; all
+  seven of its deferred decisions are now answered by the shipped code — #6
+  (resource limits) closed 2026-07-28 by P5-2, #7 (control-plane provisioning)
+  closed 2026-07-28 by P5-3. `README.md` describes what actually exists.
 - **Fork seams + router design** (2026-07-22): in the fork's git history.
 - **Core capability/hook reference**: `tinycld/docs/hooks.md` (both Go↔TS seams,
   incl. the hook-point contract and its ordering trap), `tinycld/docs/packages.md`.

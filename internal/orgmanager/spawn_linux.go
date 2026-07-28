@@ -28,6 +28,12 @@ type LinuxConfinement struct {
 	// CgroupRoot is the cgroup v2 directory the host owns; each tenant gets a
 	// child cgroup under it. Empty disables cgroup placement.
 	CgroupRoot string
+
+	// Limits are the cgroup v2 limits written into each tenant's cgroup
+	// before the child is placed in it. Zero fields write nothing; a
+	// CgroupRoot with no limits at all draws a NewSpawner warning, since the
+	// group then constrains nothing.
+	Limits TenantLimits
 }
 
 // tenantUID maps a slug into the configured uid window.
@@ -58,6 +64,7 @@ func NewSpawner(log *slog.Logger) Spawner {
 		UIDBase:    envInt("MT_TENANT_UID_BASE", 0),
 		UIDRange:   envInt("MT_TENANT_UID_RANGE", 0),
 		CgroupRoot: os.Getenv("MT_CGROUP_ROOT"),
+		Limits:     TenantLimitsFromEnv(log),
 	}
 
 	if os.Geteuid() != 0 {
@@ -66,6 +73,9 @@ func NewSpawner(log *slog.Logger) Spawner {
 	} else if conf.UIDBase == 0 || conf.UIDRange == 0 {
 		log.Warn("MT_TENANT_UID_BASE/MT_TENANT_UID_RANGE unset: every tenant runs as the " +
 			"host user and can read every other org's data. Tenants are NOT confined.")
+	}
+	if msg := cgroupLimitsWarning(conf.CgroupRoot, conf.Limits); msg != "" {
+		log.Warn(msg)
 	}
 
 	return &linuxSpawner{conf: conf}
@@ -159,8 +169,9 @@ func (s *linuxSpawner) Spawn(ctx context.Context, req SpawnRequest, log *slog.Lo
 	}
 
 	if s.conf.CgroupRoot != "" {
-		if err := placeInCgroup(s.conf.CgroupRoot, req.Slug, cmd.Process.Pid); err != nil {
-			log.Warn("could not place tenant in cgroup", "slug", req.Slug, "error", err)
+		if err := placeInCgroup(s.conf.CgroupRoot, req.Slug, cmd.Process.Pid, s.conf.Limits); err != nil {
+			log.Warn("could not place tenant in cgroup — it runs with NO resource limits",
+				"slug", req.Slug, "error", err)
 		}
 	}
 
@@ -195,13 +206,51 @@ func chownTree(root string, uid int) error {
 	})
 }
 
-// placeInCgroup moves the child into its own cgroup v2 group. Limits
-// themselves are an operator concern for now (out of scope), but creating the
-// group means they can be applied without restarting the tenant.
-func placeInCgroup(root, slug string, pid int) error {
+// placeInCgroup moves the child into its own cgroup v2 group, writing the
+// configured limits BEFORE the pid so the tenant never runs unlimited inside
+// its group. A limit that cannot be written fails the whole placement — the
+// caller warns and the tenant runs outside the cgroup entirely, which is the
+// same enforcement (none) stated honestly, rather than a group that looks
+// confining and is not.
+func placeInCgroup(root, slug string, pid int, lim TenantLimits) error {
+	// cgroup v2 only materializes a controller's interface files in a child
+	// after the parent delegates it via cgroup.subtree_control. Best-effort:
+	// on a host where the operator pre-enabled the controllers this is a
+	// no-op or harmless error, and a genuine gap surfaces as the specific
+	// limit write failing below. Legal because the root dir holds only
+	// tenant-* children, never member processes.
+	if lim.Any() {
+		var ctrls []byte
+		for _, c := range []struct{ limit, name string }{
+			{lim.MemoryMax, "+memory"},
+			{lim.PidsMax, "+pids"},
+			{lim.CPUMax, "+cpu"},
+		} {
+			if c.limit != "" {
+				if len(ctrls) > 0 {
+					ctrls = append(ctrls, ' ')
+				}
+				ctrls = append(ctrls, c.name...)
+			}
+		}
+		_ = os.WriteFile(filepath.Join(root, "cgroup.subtree_control"), ctrls, 0o644)
+	}
+
 	dir := filepath.Join(root, "tenant-"+slug)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return err
+	}
+	for _, f := range []struct{ name, val string }{
+		{"memory.max", lim.MemoryMax},
+		{"pids.max", lim.PidsMax},
+		{"cpu.max", lim.CPUMax},
+	} {
+		if f.val == "" {
+			continue
+		}
+		if err := os.WriteFile(filepath.Join(dir, f.name), []byte(f.val), 0o644); err != nil {
+			return fmt.Errorf("write %s: %w", f.name, err)
+		}
 	}
 	return os.WriteFile(filepath.Join(dir, "cgroup.procs"), []byte(strconv.Itoa(pid)), 0o644)
 }

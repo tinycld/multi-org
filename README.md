@@ -81,6 +81,9 @@ deployed pair stays together without configuration.
 | `MT_TENANT_BINARY` | sibling `serve-org` | Override the tenant executable path. |
 | `MT_TENANT_UID_BASE`, `MT_TENANT_UID_RANGE` | — | **Linux.** The uid window tenants are mapped into. Unset ⇒ tenants run as the host user and are **not** confined. |
 | `MT_CGROUP_ROOT` | — | **Linux.** cgroup v2 dir to place tenants under. |
+| `MT_TENANT_MEMORY_MAX` | — | **Linux.** Per-tenant `memory.max`: bytes with optional `K`/`M`/`G`/`T` suffix (e.g. `512M`), or `max`. Unset ⇒ unlimited. |
+| `MT_TENANT_PIDS_MAX` | — | **Linux.** Per-tenant `pids.max`: positive integer (e.g. `256`), or `max`. Unset ⇒ unlimited. |
+| `MT_TENANT_CPU_MAX` | — | **Linux.** Per-tenant CPU as cores, a positive decimal (e.g. `1.5`), or `max`. Written as `cpu.max` quota against a 100ms period. Unset ⇒ unlimited. |
 
 None of these reach a tenant process: children are spawned with an explicitly
 constructed environment (see the security section).
@@ -159,9 +162,19 @@ Any new failure path must `return err`, never exit in place.
 
 ### Resource limits
 
-`serve-multi` creates a per-tenant cgroup when `MT_CGROUP_ROOT` is set, but does
-not yet write limits into it. CPU/memory/pids caps are an operator concern for
-now; a runaway tenant can still starve the host.
+When `MT_CGROUP_ROOT` is set, each tenant is placed in its own cgroup v2 group
+with the configured `MT_TENANT_MEMORY_MAX` / `MT_TENANT_PIDS_MAX` /
+`MT_TENANT_CPU_MAX` limits written **before** the pid, so a tenant never runs
+unlimited inside its group. There are deliberately no default limits: unset
+means unlimited, and the spawner warns loudly when a cgroup root is configured
+with no limits at all (the group then constrains nothing) or limits are set
+with no cgroup root (nothing will ever apply them). An invalid value is logged
+at Error and treated as unset — a typo can't take every org down, but it can't
+pass silently either. If a limit cannot be written (controller not delegated),
+the whole placement fails with a warning and the tenant runs outside the
+cgroup: the same enforcement (none), stated honestly, instead of a group that
+looks confining and is not. `TestConfinement_CgroupLimitsApplied` proves the
+kernel accepts the written limits.
 
 
 ## Operator prerequisites & known gaps

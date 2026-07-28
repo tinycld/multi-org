@@ -616,7 +616,18 @@ boundary that is known-broken just encodes the break.
   will faithfully encode a broken boundary. Needs a root-capable runner
   (privileged container or a VM), since the namespace and uid work requires
   `CAP_SYS_ADMIN`.
-- [ ] **P5-2 Resource limits.** `MT_CGROUP_ROOT` creates a per-tenant cgroup but
+- [x] **P5-2 Resource limits.** **DONE 2026-07-28:** `MT_TENANT_MEMORY_MAX` /
+  `MT_TENANT_PIDS_MAX` / `MT_TENANT_CPU_MAX` (no defaults — unset is unlimited)
+  are validated/canonicalized by `orgmanager.TenantLimitsFromEnv` (cross-platform,
+  unit-tested red-first incl. every invalid shape logging at Error and dropping
+  to unset) and written by `placeInCgroup` into `memory.max`/`pids.max`/`cpu.max`
+  **before** the pid lands in the group. Incoherent configs warn loudly
+  (cgroup root with no limits; limits with no root), and a limit the kernel
+  refuses fails the whole placement with a warning rather than leaving a
+  group that looks confining and is not. `TestConfinement_CgroupLimitsApplied`
+  (root, Linux, runs in the P5-1 confinement workflow) asserts the kernel's
+  canonical readback (`64M` → `67108864`), so bytes merely landing in a file
+  the kernel rejected cannot pass. Original text: `MT_CGROUP_ROOT` creates a per-tenant cgroup but
   writes no limits, so a runaway tenant can still starve the host. (§6, brief
   decision #6.)
 - [x] **P5-3 Provisioning out of the control plane.** **DONE 2026-07-28 —

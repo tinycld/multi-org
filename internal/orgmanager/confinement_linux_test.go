@@ -331,3 +331,67 @@ func TestConfinement_ChildEnvironmentHoldsNoHostSecrets(t *testing.T) {
 		}
 	}
 }
+
+// TestConfinement_CgroupLimitsApplied proves configured tenant limits reach
+// the kernel: placeInCgroup writes memory.max / pids.max / cpu.max into the
+// tenant's cgroup BEFORE placing the pid, and the kernel accepts each value.
+// Readback asserts the kernel's canonical form (64M reads back as bytes), so
+// this cannot pass on bytes merely landing in a file the kernel rejected.
+func TestConfinement_CgroupLimitsApplied(t *testing.T) {
+	requireConfinementEnv(t)
+	const cgfs = "/sys/fs/cgroup"
+	if _, err := os.Stat(filepath.Join(cgfs, "cgroup.subtree_control")); err != nil {
+		t.Skipf("cgroup v2 unified hierarchy not available: %v", err)
+	}
+	// Delegate the needed controllers to our test root. Best-effort: on the
+	// CI runner they are enabled already, and a genuine gap fails the limit
+	// writes below with a precise error.
+	_ = os.WriteFile(filepath.Join(cgfs, "cgroup.subtree_control"), []byte("+memory +pids +cpu"), 0o644)
+
+	root := filepath.Join(cgfs, fmt.Sprintf("mt-limits-test-%d", os.Getpid()))
+	if err := os.Mkdir(root, 0o755); err != nil {
+		t.Fatalf("create test cgroup root: %v", err)
+	}
+	t.Cleanup(func() {
+		// LIFO: the sleeper's cleanup below runs first, so by now the group
+		// is empty and rmdir succeeds.
+		_ = os.Remove(filepath.Join(root, "tenant-acme"))
+		_ = os.Remove(root)
+	})
+
+	sleeper := exec.Command("sleep", "60")
+	if err := sleeper.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = sleeper.Process.Kill()
+		_ = sleeper.Wait()
+	})
+
+	lim := TenantLimits{MemoryMax: "64M", PidsMax: "64", CPUMax: "50000 100000"}
+	if err := placeInCgroup(root, "acme", sleeper.Process.Pid, lim); err != nil {
+		t.Fatalf("placeInCgroup: %v", err)
+	}
+
+	dir := filepath.Join(root, "tenant-acme")
+	read := func(name string) string {
+		t.Helper()
+		b, err := os.ReadFile(filepath.Join(dir, name))
+		if err != nil {
+			t.Fatalf("read %s: %v", name, err)
+		}
+		return strings.TrimSpace(string(b))
+	}
+	if got := read("memory.max"); got != "67108864" {
+		t.Errorf("memory.max = %q, want 67108864 (64M canonicalized by the kernel)", got)
+	}
+	if got := read("pids.max"); got != "64" {
+		t.Errorf("pids.max = %q, want 64", got)
+	}
+	if got := read("cpu.max"); got != "50000 100000" {
+		t.Errorf("cpu.max = %q, want \"50000 100000\"", got)
+	}
+	if got := read("cgroup.procs"); got != strconv.Itoa(sleeper.Process.Pid) {
+		t.Errorf("cgroup.procs = %q, want %d — the pid must land in the LIMITED group", got, sleeper.Process.Pid)
+	}
+}

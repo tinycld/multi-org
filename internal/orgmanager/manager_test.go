@@ -611,7 +611,11 @@ func TestGet_AfterShutdownStoresNothing(t *testing.T) {
 	mgr := newTestManager(t, sp)
 	mgr.Shutdown()
 
-	_, _ = mgr.Get(context.Background(), "acme")
+	// A post-shutdown Get must refuse, not hand back a half-built instance —
+	// without the error assertion this test passes identically on `nil, nil`.
+	if _, err := mgr.Get(context.Background(), "acme"); err == nil {
+		t.Fatal("Get after Shutdown returned no error")
+	}
 
 	mgr.mu.RLock()
 	n := len(mgr.orgs)

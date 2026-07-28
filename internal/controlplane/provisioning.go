@@ -106,7 +106,6 @@ func (p *Provisioner) CreateOrg(slug, displayName string, lock map[string]string
 	rec.Set("status", "provisioning")
 	rec.Set("data_dir", filepath.Join("pb_orgs", slug))
 	rec.Set("lockfile", string(lfBytes))
-	rec.Set("custom_domains", "[]")
 	if err := p.app.Save(rec); err != nil {
 		return nil, fmt.Errorf("save org record: %w", err)
 	}

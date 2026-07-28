@@ -59,7 +59,6 @@ func createOrgs(app core.App) (*core.Collection, error) {
 	c.Fields.Add(&core.TextField{Name: "slug", Required: true})
 	c.Fields.Add(&core.SelectField{Name: "status", Values: []string{"provisioning", "active", "suspended", "archived"}, MaxSelect: 1, Required: true})
 	c.Fields.Add(&core.TextField{Name: "data_dir", Required: true})
-	c.Fields.Add(&core.JSONField{Name: "custom_domains"})
 	c.Fields.Add(&core.JSONField{Name: "lockfile"})
 	c.Fields.Add(&core.TextField{Name: "display_name"})
 	// The org's storage ceiling in bytes (0 = unlimited). This is the operator's
@@ -81,8 +80,6 @@ func createPackages(app core.App) error {
 	c.Fields.Add(&core.TextField{Name: "name", Required: true})
 	c.Fields.Add(&core.TextField{Name: "version", Required: true})
 	c.Fields.Add(&core.TextField{Name: "store_path"})
-	c.Fields.Add(&core.TextField{Name: "content_hash"})
-	c.Fields.Add(&core.JSONField{Name: "manifest"})
 	c.Fields.Add(&core.SelectField{Name: "kind", Values: []string{"official", "fork", "custom"}, MaxSelect: 1, Required: true})
 	c.Fields.Add(&core.AutodateField{Name: "created", OnCreate: true})
 	c.AddIndex("idx_packages_name_version", true, "name, version", "")

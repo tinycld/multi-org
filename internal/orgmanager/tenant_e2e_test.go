@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -371,5 +372,11 @@ func TestTenant_EvictTerminatesTheProcess(t *testing.T) {
 	if _, err := os.Stat(inst.sockPath); !os.IsNotExist(err) {
 		t.Fatalf("socket %s still present after eviction", inst.sockPath)
 	}
-	_ = pid
+
+	// And the OS process itself must be gone — signal 0 probes existence
+	// without delivering anything. The manager has already reaped the child
+	// (teardown completed), so a live pid here means Evict leaked the process.
+	if err := syscall.Kill(pid, 0); err != syscall.ESRCH {
+		t.Fatalf("tenant process %d still exists after eviction (kill 0 => %v)", pid, err)
+	}
 }

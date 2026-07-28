@@ -10,13 +10,13 @@ import (
 // tags, so marshalling them directly would make the wire format depend on Go
 // field names staying stable across a repo boundary.
 //
-// Note what is NOT carried: webdav.Source.Hooks. Those are Go callbacks
-// (authorization, quota, versioning) and cannot cross a process boundary. A
-// tenant therefore serves the tree with core's default access model — which is
-// "authenticated", since a nil hook means unrestricted. Any package whose tree
-// needs per-item authorization must either express it in the collection's
-// PocketBase rules or accept that a tenant-served tree is broader than the
-// single-tenant one. Drive is in that position today; see HANDOFF.
+// Note what is NOT carried: webdav.Source.Hooks. Those are Go callbacks and
+// cannot cross a process boundary. That is fine for the boundaries that
+// matter: authorization is the collection's own PocketBase rules
+// (app.CanAccessRecord) and quota is core/quota's record hooks, both of which
+// a tenant enforces from the schema alone. What a tenant loses is only the
+// non-boundary hooks — today the version snapshot (BeforeOverwrite), which
+// costs history, not safety.
 
 type WebDAVSource struct {
 	Slug       string         `json:"slug"`

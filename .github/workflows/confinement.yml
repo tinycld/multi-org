@@ -1,0 +1,67 @@
+# Runs the router's full Go suite, then the TestConfinement_* suite as root.
+#
+# The confinement tests are the only executable proof of the per-tenant OS
+# boundary (uid separation, mount namespaces, the read-only package store, the
+# per-org socket dirs). They are //go:build linux and skip without root, so on
+# a macOS dev box the boundary is asserted by construction only — this job is
+# where it actually runs. GitHub's ubuntu runners are full VMs (not
+# containers), so passwordless sudo grants real CAP_SYS_ADMIN and the
+# namespace/uid work all functions.
+#
+# go.mod resolves every tinycld.org module from SIBLING CHECKOUTS (the fork is
+# vendored in the tinycld repo; core and the feature menu resolve the same
+# way), so this job lays out the same workspace shape as a developer machine:
+# every repo side by side, all on the multi-org branch. If the sibling repos
+# are private, add a repo-scoped PAT as the SIBLING_CHECKOUT_TOKEN secret;
+# with public repos the default token suffices.
+name: confinement
+
+on:
+  push:
+    branches: [multi-org, main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  confinement:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: multi-org
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: multi-org
+
+      - name: Check out sibling repos (go.mod replaces)
+        env:
+          GH_TOKEN: ${{ secrets.SIBLING_CHECKOUT_TOKEN || github.token }}
+        working-directory: ${{ github.workspace }}
+        run: |
+          for repo in tinycld calc calendar contacts drive mail text; do
+            git clone --depth 1 --branch multi-org \
+              "https://x-access-token:${GH_TOKEN}@github.com/tinycld/${repo}.git" "${repo}"
+          done
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: multi-org/go.mod
+          cache-dependency-path: multi-org/go.sum
+
+      - name: Build and vet
+        run: |
+          go build ./...
+          go vet ./...
+
+      - name: Unit and integration tests
+        run: go test ./... -count=1
+
+      - name: Confinement tests (root)
+        # Root gets its own build cache; sharing the runner user's would leave
+        # root-owned files behind and break the post-job cache save. The module
+        # cache is shared read-only — the steps above already downloaded
+        # everything.
+        run: |
+          sudo env "PATH=$PATH" \
+            "GOMODCACHE=$(go env GOMODCACHE)" "GOFLAGS=-mod=mod" \
+            go test ./internal/orgmanager/ -run TestConfinement -v -count=1

@@ -1267,10 +1267,17 @@ collide on ports — §5.3); every e2e finding above is from reading the specs.
 >    unlink sites (teardown inode guard + the child's `SetUnlinkOnClose`);
 >    P4-4 fixed via atomic symlink-generation swap in `materialize`.
 >
-> **Nothing in the §7.8 order remains open.** Next up, from the plan's
-> still-open set: P2-8 (calendar subscription data loss), P2-10/P2-12/P2-14/
-> P2-15 (small breakage + swallows), P3-3…P3-8 (test-capability work), the
-> rest of Phase 4, P5-2…P5-4, and Phase 6 docs.
+> **Nothing in the §7.8 order remains open, and Phases 0–2 are complete**
+> (Phase 2 finished 2026-07-27: P2-8, P2-10, P2-12, P2-14, P2-15). The merge
+> gate's remaining open work is the **Phase 3 tail** — P3-3 (mail's folder
+> counts view has zero coverage; no mail vitest mounts a hook), P3-4 (the
+> router tests that cannot fail: manifest DeepEqual round-trips, the
+> unfalsifiable carddav cross-org assertion, integration_test's bare
+> `err != nil`), P3-5 (takeout's mirrored-schema guard covers 1 of 9+
+> collections), and the e2e scoping/discipline work (P3-7, P3-8). After the
+> gate: Phase 4's remaining clusters (P4-3 drain budget and P4-6 proxy IP
+> first), P5-2…P5-4, and Phase 6 docs — where P6-1 (CLAUDE.md/CONTRIBUTING
+> still teach the deleted org contract) ranks above its severity.
 
 The original list, kept for the review record:
 

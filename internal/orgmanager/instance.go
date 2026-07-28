@@ -47,9 +47,15 @@ type OrgInstance struct {
 	// channel close (which panics).
 	closeOnce sync.Once
 
-	closed  chan struct{} // closed when shutdown starts; new requests bail with 503
-	dead    chan struct{} // closed once Wait() has returned
-	exitErr error         // the child's exit status; set before dead is closed
+	closed chan struct{} // closed when shutdown starts; new requests bail with 503
+	dead   chan struct{} // closed once Wait() has returned
+	// torndown closes when shutdown has fully completed — including the
+	// socket cleanup that runs AFTER dead. Since the child no longer unlinks
+	// its own socket on listener close (see serve-org's SetUnlinkOnClose),
+	// "process reaped" and "socket removed" are distinct moments; anything
+	// asserting post-eviction disk state must wait on this, not dead.
+	torndown chan struct{}
+	exitErr  error // the child's exit status; set before dead is closed
 
 	log *slog.Logger
 }
@@ -131,6 +137,7 @@ func (i *OrgInstance) serveProxied(w http.ResponseWriter, r *http.Request) {
 // resorting to force. Safe to call concurrently; only the first call runs.
 func (i *OrgInstance) shutdown(drain, kill time.Duration) {
 	i.closeOnce.Do(func() {
+		defer close(i.torndown)
 		close(i.closed)
 
 		drained := make(chan struct{})

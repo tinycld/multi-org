@@ -324,15 +324,12 @@ func TestTenant_EvictTerminatesTheProcess(t *testing.T) {
 
 	mgr.Evict("acme")
 
-	if !waitFor(30*time.Second, func() bool {
-		select {
-		case <-inst.dead:
-			return true
-		default:
-			return false
-		}
-	}) {
-		t.Fatal("tenant process was never reaped after Evict")
+	// Socket removal runs AFTER the child is reaped (the parent owns the
+	// file's lifecycle now), so wait for the whole teardown, not just dead.
+	select {
+	case <-inst.torndown:
+	case <-time.After(30 * time.Second):
+		t.Fatal("teardown never completed after Evict")
 	}
 
 	// The socket must be cleaned up so the next spawn binds fresh.

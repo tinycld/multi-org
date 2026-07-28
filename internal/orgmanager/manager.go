@@ -351,6 +351,7 @@ func (m *OrgManager) spawn(ctx context.Context, slug, orgDir string, cfgs runtim
 		proxy:    newProxy(sockPath, log),
 		closed:   make(chan struct{}),
 		dead:     make(chan struct{}),
+		torndown: make(chan struct{}),
 		log:      log,
 	}
 	inst.handler = http.HandlerFunc(inst.serveProxied)

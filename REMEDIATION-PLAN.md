@@ -259,7 +259,7 @@ Same class as Phase 0, lower reachability. Land immediately after.
   the read verbs. Note the tension: the `(parent, name)` namespace is globally
   unique, so a create into an occupied invisible name must still fail somehow —
   prefer a generic conflict over a distinguishable one.
-- [ ] **P1-7 🟡 `carddav.PutAddressObject` evaluates no rule** — `tinycld` (core).
+- [x] **P1-7 🟡 `carddav.PutAddressObject` evaluates no rule** **DONE — verified 2026-07-27:** `saveAuthorized` (backend.go) save-evaluate-rollback on both create (`CreateRule`) and update (`UpdateRule`) paths, landed in `cb1fec3`; `backend_authz_test.go` covers create-denied, update-denied and a positive control (all three re-run green). — `tinycld` (core).
   Self-consistent today (owner-scoped collection) but a future contacts rule
   change silently would not apply. Add rule evaluation on both create and update,
   reusing P0-3's transaction helper.
@@ -306,7 +306,7 @@ these is live right now.
   through to the public preview; the target is a dead `/a/` route anyway. Core:
   delete `orgSlug` from `ShareSession`/`SessionResponse` (its only consumer
   ignores it). Drive: gate on `item_id`, redirect to `/drive?file=…`.
-- [ ] **P2-4 🟠 Tenant `AppURL` is never set** — `multi-org`. **More urgent
+- [x] **P2-4 🟠 Tenant `AppURL` is never set** **DONE 2026-07-27:** `Config.OrgURL` → `.runtime/app.json` (`writeAppConfig`, mirroring packages.json) → `--app-config` → serve-org persists `Settings().Meta.AppURL` post-bootstrap (persisted, not in-memory, so a tenant settings reload can't revert it); serve-multi wires `https://<slug>.<MT_BASE_DOMAIN>`. Tests: `app_config_test.go` + real-binary `TestTenant_AdoptsMaterializedAppURL` (asserts the settings value `{APP_URL}` interpolates from; template interpolation itself is upstream PB behavior). Written red-first. — `multi-org`. **More urgent
   since 2026-07-27:** feature-Go linking means tenants now run mail's Go and
   core's invite/password-reset mailers, so these emails can actually SEND once
   an org has mail creds — carrying `http://localhost:8090` links. Every org's
@@ -315,7 +315,7 @@ these is live right now.
   `MT_BASE_DOMAIN` + slug into `.runtime/`, and have `serve-org` set
   `Settings().Meta.AppURL` at boot. **Done when:** a tenant's rendered auth email
   contains the org's real URL.
-- [ ] **P2-5 🟠 mail's phantom `org` field** — `mail`. `provider.tsx:552` writes
+- [x] **P2-5 🟠 mail's phantom `org` field** **DONE 2026-07-27:** write, type field, provider.tsx scaffolding, both Go fixtures (`seedDomainMailboxAndOrg` deleted — collapsed into `seedDomainAndMailbox`), and the `dn()` factory all dropped; mail Go + `tinycld-pkg check` green. — `mail`. `provider.tsx:552` writes
   `org: orgId` into `mail_domains` — no migration defines it, and `orgId` is
   always `''`. It compiles because the local mirror `types.ts:29` declares it,
   which also makes `org` look filterable on every `mail_domains` query. Remove
@@ -323,7 +323,7 @@ these is live right now.
   (`provider.tsx:38,50,86,124,530`), the fixture uses
   (`imap_fetcher_test.go:148-149`, `aliases_test.go:40,205`) and the test factory
   (`useSendableIdentities.test.ts:22`).
-- [ ] **P2-6 🟠 Finish commit `4d52992`** — `mail`. The username-derived address
+- [x] **P2-6 🟠 Finish commit `4d52992`** **DONE 2026-07-27:** (a) `lifecycle_test.go` covers verbatim/normalized derivation, suffix collisions, unicode-sanitizes-away and the `i<=99` exhaustion; decision recorded in `handleUserCreated` — no-address stays non-fatal (a mailboxless user is recoverable, a blocked signup is not) but now logs at **Error**. (b) mail `seed.ts` derives from `username` (SeedContext gained `username`, populated by `seed-db.ts`); (c) `help/mailboxes.md` fixed (email→username, dead `user_org` reference dropped). — `mail`. The username-derived address
   change is unguarded and half-applied. (a) Test `deriveMailboxAddress`
   (`lifecycle.go:123-148`) — it has **none** — covering the `i<=99` exhaustion
   path and a unicode username, both of which currently produce **no mailbox at
@@ -332,7 +332,7 @@ these is live right now.
   deriving from the email local-part — the exact bug the commit fixed in Go — so
   seeded users get a different address than the server provisions. (c) Fix
   `help/mailboxes.md:10`.
-- [ ] **P2-7 🟡 Mail search failures are invisible** — `mail`. Server turns a SQL
+- [x] **P2-7 🟡 Mail search failures are invisible** **DONE 2026-07-27:** all three server swallows (mailbox lookup, FTS query, structured query) now log at Error and return a 500 ApiError (`TestHandleSearch_QueryFailureIsAnError`, red-first — the fixture app's missing FTS tables are the forced error); client `useMailSearch` captures (`mail.search`) and the error threads through `SearchContext` to a rendered `SearchFailedState` (`useMailSearch.test.tsx` covers the hook). — `mail`. Server turns a SQL
   error into `HTTP 200 {"items":[],"total":0}`; client sets an `error` no
   consumer reads and never captures. This is the mechanism that let §3.2's
   `ts.user_org` bug present as a silent zero. Return a real status from the
@@ -362,7 +362,7 @@ these is live right now.
 - [ ] **P2-12 🟡 Demo reset leaks `realtime_doc_updates`** — `tinycld`. No FK, so
   nothing cascades and per-room truncation never fires for a deleted room —
   unbounded growth. Add it to the per-collection wipe.
-- [ ] **P2-13 🟡 IMAP multi-term BODY search ORs** — `mail`. Both arms of the
+- [x] **P2-13 🟡 IMAP multi-term BODY search ORs** **DONE 2026-07-27:** `buildFTSMatchSet` rewritten — per-term match sets intersected (Text terms union their two indexes, then AND with the rest), unanswerable criteria fail closed, failed FTS queries logged. `imap_search_fts_test.go` (4 cases over live-shaped FTS tables), multi-term cases red-first. — `mail`. Both arms of the
   "intersect for subsequent terms" branch are byte-identical, so
   `SEARCH BODY "a" BODY "b"` matches either. Implement the intersection.
 - [ ] **P2-14 🟡 mail's swallowed failures** — `mail`. `EmailBody.tsx:41` renders
@@ -383,11 +383,21 @@ these is live right now.
 silently until this lands. Work it immediately after Phase 2 — or in parallel by
 a second person, since it barely touches the same lines.
 
-- [ ] **P3-1 🟡 RLS suites must read the shipped migrations.**
-  **PARTIAL (verified 2026-07-27):** `core/rlstest` exists and calendar's
-  suites use it (`tenant_rules_authz_test.go` is the model); drive's
-  `guest_rls_test.go` and text/calc `comments_rls_test.go` still re-declare
-  their rule strings as constants. Seven suites
+- [x] **P3-1 🟡 RLS suites must read the shipped migrations.**
+  **DONE 2026-07-27.** Re-verified against code: drive `guest_rls_test.go` +
+  `disabled_rls_test.go` and text/calc `comments_rls_test.go` were ALREADY
+  converted to `rlstest` (the earlier PARTIAL note had drifted). This pass
+  converted the two real stragglers — calendar `guest_rls_test.go` and core
+  `coreserver/guest_rls_test.go` (which needed the fixture's pre-existing
+  username index/identity dropped so core's chain applies as on a real DB) —
+  each **verified by actually neutering** the authoritative migration
+  (calendar `1830000004`, core `1870000000`): deny-tests go red, controls stay
+  green. Two suites deliberately keep exercised constants: mail (the endorsed
+  model — byte-identical constants + paired controls) and core
+  `caldav/backend_test.go`, which mirrors CALENDAR's rules — core tests must
+  not read a feature sibling's migrations or a partial assembly breaks; the
+  drift guard for those rules is calendar's own `tenant_rules_authz_test.go`.
+  Original text: seven suites
   assert rule strings re-declared as constants in the test file: drive
   `guest_rls_test.go` + `disabled_rls_test.go`, text/calc
   `comments_rls_test.go`, calendar `guest_rls_test.go` +
@@ -400,7 +410,7 @@ a second person, since it barely touches the same lines.
   the migration so drift is impossible.
   **Done when:** for each suite, neutering the guard in the migration turns
   deny-tests red while controls stay green. Verify by actually neutering.
-- [ ] **P3-2 🟡 mail's inbound fixture declares a schema that does not exist** —
+- [x] **P3-2 🟡 mail's inbound fixture declares a schema that does not exist** **DONE 2026-07-27:** fixture fields renamed `user_org`→`user` (matching migration `1713000000`); `assertThreadStateInInbox` added to `_KnownRecipientStoresMessage` + `_IdempotentRetry`, confirmed red against the phantom fixture before the rename. —
   `mail`. The sharpest instance in the review: the fixture declares
   `mail_mailbox_members.user_org` and `mail_thread_state.user_org` while
   production reads and writes `user`, so `TestHandleInbound_KnownRecipientStoresMessage`
@@ -450,7 +460,7 @@ a second person, since it barely touches the same lines.
   documents; `invite-flow.spec.ts:140` asserts `url()).toContain('/')`, which is
   vacuous; takeout's spec uses `page.goto` for in-app nav plus inline 10s–120s
   timeouts and a `[style*="width: 360"]` selector.
-- [ ] **P3-9 🟡 `TestConfinement_*` do not skip — they do not exist** —
+- [x] **P3-9 🟡 `TestConfinement_*` do not skip — they do not exist** **DONE 2026-07-27:** `confinement_stub_test.go` (`//go:build !linux`) makes `-run TestConfinement` print an explicit SKIP on darwin; CI (P5-1) is the real fix. —
   **PARTIAL (verified 2026-07-27):** on Linux without root there is now a real
   `t.Skip` (`confinement_linux_test.go:31`), and HANDOFF §4 documents the
   darwin vacuous-pass honestly — but on darwin the tests are still not
@@ -467,7 +477,7 @@ a second person, since it barely touches the same lines.
 Nothing here is a merge blocker. Grouped so one person can take a cluster.
 
 *Router lifecycle* — `multi-org`
-- [ ] **P4-1 🟡 Post-Evict socket unlink race.** A shut-down instance
+- [x] **P4-1 🟡 Post-Evict socket unlink race.** **DONE 2026-07-27 — the race had TWO unlinkers:** (1) teardown's `os.Remove` now guarded by inode ownership (`OrgInstance.sockIno` recorded at readiness, `ownsSocket()` before removal); (2) the CHILD's Go `UnixListener` unlink-on-close — which deletes whatever is at the path when the drained listener finally closes — disabled in serve-org (`SetUnlinkOnClose(false)`; the router owns the file's lifecycle). `TestTenant_EvictThenImmediateTrafficStaysReachable` holds an in-flight request through the evict (the open-SSE Deploy shape), spawns the replacement inside the drain window, and asserts the org stays reachable — red against HEAD, and still red with only the parent-side guard, which is what exposed the child-side unlink. A shut-down instance
   unconditionally removes the socket after drain+kill, but the path is
   deterministic, so a `Get` inside that window spawns a replacement that binds
   the same path — and up to 15s later the old teardown deletes the **new**
@@ -485,7 +495,7 @@ Nothing here is a merge blocker. Grouped so one person can take a cluster.
 - [ ] **P4-3 🟡 Drain budget the child can never use** — parent SIGKILLs 5s after
   SIGTERM while handing the child `--drain 10s`. Make the parent's patience
   exceed the child's budget.
-- [ ] **P4-4 🟡 `Deploy` re-materializes a running tenant** before evicting it, so
+- [x] **P4-4 🟡 `Deploy` re-materializes a running tenant** **DONE 2026-07-27:** `Materialize` now builds each of pb_hooks/pb_public/pb_migrations into a fresh generation dir (`<name>.genN`) and atomically renames a symlink over the live name (dirs can't be rename-replaced; symlinks can). The immediately-previous generation is kept until the next deploy so an in-flight path resolution never lands in a deleted tree; older ones are GC'd. Covers Deploy AND load-during-predecessor-drain. `TestMaterialize_LiveTreeNeverGoesDark` hammers 50 rebuilds under a concurrent reader — red against the in-place clear (sustained ENOENT streaks), green now (the residual is a one-syscall darwin EINVAL blip from rename-over-symlink, explicitly tolerated and documented). A brief old-hooks/new-assets mix during the drain remains — strictly better than the prior 404 window and unavoidable without per-instance tree pinning. — before evicting it, so
   the live tenant 404s on static assets during that window and the whole drain.
   Evict first, or materialize to a temp dir and rename.
 - [ ] **P4-5 🟡 WebDAV manifest prefix has no default or validation** — an empty
@@ -539,7 +549,7 @@ Nothing here is a merge blocker. Grouped so one person can take a cluster.
 Do **not** start before P0-1 and P4-9/P4-10 land: standing up CI against a
 boundary that is known-broken just encodes the break.
 
-- [ ] **P5-1 Linux CI running `TestConfinement_*` as root.** **Unblocked** — the
+- [x] **P5-1 Linux CI running `TestConfinement_*` as root.** **AUTHORED 2026-07-27 — first run pending push:** `.github/workflows/confinement.yml` clones all 7 sibling repos (the go.mod replaces) on the `multi-org` branch, runs build/vet/full suite, then `sudo go test -run TestConfinement` (ubuntu runners are full VMs, so root has real CAP_SYS_ADMIN; private siblings need a `SIBLING_CHECKOUT_TOKEN` secret). The P3-4 confinement repairs (real store-file probe through the mount namespace, per-org socket-dir assertions) were verified already in the tree. Not green until pushed — verify the first run. **Unblocked** — the
   remote exists and everything is pushed (D3). The only real prerequisites are
   technical: two of these tests are vacuous even on Linux (P3-4), so repair them
   first or CI certifies less than it appears; and P0-1/P4-9/P4-10 must land or CI

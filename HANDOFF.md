@@ -1245,21 +1245,29 @@ collide on ports — §5.3); every e2e finding above is from reading the specs.
 > see REMEDIATION-PLAN.md's reconciliation notes; that file is the canonical
 > tracker). The current order, from the verified-open set:
 >
-> 1. **P1-7** — `carddav.PutAddressObject` evaluates no PB rule; the last DAV
->    protocol not reading the schema's authorization.
-> 2. **P2-4** — tenant `AppURL`. More urgent since feature-Go linking: tenants
->    now run the invite/reset mailers, so real emails carry
->    `http://localhost:8090` links. Reuse the `.runtime/packages.json`
->    materialize pattern.
-> 3. **The verified-open mail batch** — P2-5 (phantom `org` write), P2-7
->    (search-failure swallow), P2-13 (IMAP AND/OR), P2-6 (finish `4d52992`),
->    with **P3-2** (the inbound fixture's phantom `user_org` schema) fixed
->    first so the batch has a guard that can fail.
-> 4. **P5-1** — Linux CI running `TestConfinement_*` as root (see §6 top).
-> 5. Then P3-1's remainder (drive/text/calc RLS suites still assert their own
->    constants) and Phase 4's router robustness, sharpest first: the
->    post-Evict socket race (P4-1) and Deploy's materialize-before-evict
->    (P4-4).
+> 1. ~~**P1-7** — `carddav.PutAddressObject` evaluates no PB rule~~ **done** —
+>    shipped in core `cb1fec3` (`saveAuthorized` + `backend_authz_test.go`),
+>    verified green 2026-07-27; the tracker had drifted.
+> 2. ~~**P2-4** — tenant `AppURL`~~ **done 2026-07-27** — materialized as
+>    `.runtime/app.json`, adopted (persisted) as `Meta.AppURL` at tenant boot;
+>    `TestTenant_AdoptsMaterializedAppURL` covers it through the real binary.
+> 3. ~~**The verified-open mail batch**~~ **done 2026-07-27** — P3-2 first
+>    (fixture renamed to the shipped `user` fields + delivery assertions,
+>    confirmed red against the phantom schema), then P2-5, P2-7, P2-13, P2-6.
+> 4. ~~**P5-1** — Linux CI~~ **authored 2026-07-27** —
+>    `.github/workflows/confinement.yml` (sibling checkouts + sudo run of
+>    `TestConfinement_*`); needs a push to run, verify the first run. P3-9's
+>    darwin skip stub landed with it.
+> 5. ~~P3-1's remainder / P4-1 / P4-4~~ **done 2026-07-27** — drive/text/calc
+>    were already converted (tracker drift); calendar + coreserver guest
+>    suites converted to rlstest and verified by neutering. P4-1 fixed at BOTH
+>    unlink sites (teardown inode guard + the child's `SetUnlinkOnClose`);
+>    P4-4 fixed via atomic symlink-generation swap in `materialize`.
+>
+> **Nothing in the §7.8 order remains open.** Next up, from the plan's
+> still-open set: P2-8 (calendar subscription data loss), P2-10/P2-12/P2-14/
+> P2-15 (small breakage + swallows), P3-3…P3-8 (test-capability work), the
+> rest of Phase 4, P5-2…P5-4, and Phase 6 docs.
 
 The original list, kept for the review record:
 

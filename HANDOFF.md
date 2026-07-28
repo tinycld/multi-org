@@ -1,8 +1,8 @@
 # Handoff — Multi-Org PocketBase Router
 
-**Updated:** 2026-07-28 (Phase 5 complete — P5-2 cgroup limits, P5-3
-provisioning isolation, P5-4 extended live smoke all landed; only Phase 6
-docs/cleanup remains)
+**Updated:** 2026-07-28 (Phase 6 complete — **all 64 items of
+`REMEDIATION-PLAN.md` are done**; that file carries per-item evidence. What
+remains is only the §6 "still open" list below, none of it a merge blocker.)
 **Goal:** one router hosts many organizations — each org its own **OS process**,
 SQLite DB, client bundle, and server-side JS, sharing versioned code on disk but
 isolated at the kernel boundary.
@@ -727,7 +727,25 @@ Admin re-enable restores all of it.
 
 - **`core/server/userorg/`** is still named for the junction it no longer uses.
 
-- Store "content-addressed" naming is vestigial (`ContentHash`/`manifest` unused).
+- ~~Store "content-addressed" naming is vestigial (`ContentHash`/`manifest`
+  unused).~~ **CLOSED (P6-5, 2026-07-28)** — `store.ContentHash`, the
+  `packages.content_hash`/`manifest` columns and `orgs.custom_domains` deleted
+  (all writer-less or reader-less; `manifest.json` materialization is separate
+  and untouched).
+- **DeleteAccountModal's visual default disagrees with what it submits.** The
+  `ContentPlanPicker` highlights "Delete everything" when no plan has been
+  chosen (`value={plan ?? { mode: 'delete_my_data' }}`), but submitting without
+  clicking sends `plan == undefined` — which the server correctly treats as
+  "leave my content". Safe direction, but the UI shows the destructive option
+  selected while the safe one executes. Product call needed: either make the
+  picker start unselected (and require a choice) or actually default the
+  submitted plan. Found during P6-4's help-writing pass; not changed, because
+  which default is right is a shipped-UX decision.
+- **Five inline biome-ignore waivers remain** (text `webview-editor/build.ts`
+  noConsole ×2, the `__DEV__`-guarded editor warning, anchored-overlay's
+  narrowed dep array, calc SheetTabs a11y) — deliberate, rationale-carrying,
+  and load-bearing under the member gate; see P6-8 for why they didn't move to
+  config.
 - `lockfile.Resolve` doesn't run the `peerVersions` solver yet.
 - Org switcher: `OrganizationsTab` is stubbed pending the router setting a
   parent-domain cookie listing accessible orgs.
@@ -1106,6 +1124,11 @@ found broken or would need to catch.
 
 ### 7.5 ⚪ Low / cleanup
 
+> **All items in this section are CLOSED (2026-07-28, Phase 6)** — see
+> REMEDIATION-PLAN P6-1…P6-8 (docs, help, dead code, comment rot, duplication,
+> cosmetics) plus the earlier P1-8/P1-9/P2-15/P4-8/P4-11/P4-13 entries for the
+> rest. Kept unedited below as the review record.
+
 - **Docs that now mislead.** `~/code/tinycld/CLAUDE.md` and
   `tinycld/CONTRIBUTING.md` still teach the multi-org contract: the `user_org`
   junction, `/a/<orgSlug>` routes, `getRoleForOrg`, and `OrgScope` as
@@ -1338,8 +1361,18 @@ collide on ports — §5.3); every e2e finding above is from reading the specs.
 > P5-3 (`bootstrapTenantOnce` deleted; provisioning verifies via the first
 > confined spawn, failure through the readiness pipe), and P5-4 (extended
 > live smoke, all green — see REMEDIATION-PLAN for the full transcript).
-> Remaining: Phase 6 docs — where P6-1 (CLAUDE.md/CONTRIBUTING still teach
-> the deleted org contract) ranks above its severity.
+> **PHASE 6 IS COMPLETE (2026-07-28)** — instruction docs, user-facing help,
+> dead code, comment rot, the duplication lifts and the cosmetic cluster; see
+> REMEDIATION-PLAN P6-1…P6-8 for per-item evidence. Worth knowing from that
+> pass: the webdav hook-name validation order was a REAL bug fixed red-first
+> (a typo'd key left its valid sibling registered — now shared, validate-first,
+> in `core/davhooks`); two router tests were quietly unfalsifiable and were
+> repaired; mail's "no provider" error pointed operators at a deleted env var;
+> and the standing 10 biome warnings were dead suppressions. **All 64
+> remediation items are now closed.** Still open: only §6's list (org
+> branding/switcher, mailproto's fixed ports, mail-to-disabled-mailbox policy,
+> the userorg package name, peerVersions settling, lockfile solver, the
+> DeleteAccountModal default mismatch, five deliberate biome waivers).
 
 The original list, kept for the review record:
 

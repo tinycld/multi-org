@@ -687,57 +687,116 @@ boundary that is known-broken just encodes the break.
 
 Low risk, high readability value. Safe to hand to a fresh pair of hands.
 
-- [ ] **P6-1 Instruction docs that now mislead.** `~/code/tinycld/CLAUDE.md` and
+- [x] **P6-1 Instruction docs that now mislead.** **DONE 2026-07-28** (workspace
+  `3f733cf`, tinycld `c3bc736`): CLAUDE.md and CONTRIBUTING.md teach the shipped
+  single-org contract — `OrgScope` is `{userId}`, roles on `users.role`, bare
+  routes, `app/(app)`/`app/p` route re-exports, the real `SeedContext`
+  (`user.username` included), rule-mirroring in Go instead of "manual equivalent
+  authorization". The joined-query reference example is now mail's
+  `useMailboxes.ts` (OrganizationsTab is a static stub). `docs/packages.md`
+  de-orged the same way (incl. `expand: { owner: coreStores.users }`).
+  Original text: `~/code/tinycld/CLAUDE.md` and
   `tinycld/CONTRIBUTING.md` still teach the `user_org` junction, `/a/<orgSlug>`
   routes, `getRoleForOrg`, and `OrgScope` as `{orgId, userOrgId, orgSlug}`
-  (shipped: `{userId}`). CLAUDE.md cites `OrganizationsTab.tsx` as the reference
-  joined-query example — now a static stub with no query. `docs/packages.md` has
-  the same drift. **These are the files an agent reads first**, so this ranks
-  above its severity.
-- [ ] **P6-2 `HANDOFF.md` itself.** Already corrected: the fork replace path
-  (§2/§5.4), the confinement-skip claim (§4), §5.6's nonexistent golden test, and
-  §6's incomplete disabled-user audit. Re-read after Phase 0–2 land and mark the
-  §7 items done.
+  (shipped: `{userId}`). **These are the files an agent reads first**, so this
+  ranks above its severity.
+- [x] **P6-2 `HANDOFF.md` itself.** **DONE 2026-07-28** — header, §6 and §7
+  reconciled with Phase 6 complete; see HANDOFF for the two small findings this
+  phase surfaced but did not fix (DeleteAccountModal's visual default vs the
+  submitted plan, and the five deliberate inline biome waivers).
 - [x] **P6-3 Router README** **DONE 2026-07-27** (folded into P4-11's README pass — see that entry).
-- [ ] **P6-4 User-facing help still teaches multi-org.**
-  `core/help/organizations.md` is entirely about the deleted org switcher and
-  names roles ("admin / clerical / workforce") matching nothing shipped — and it
-  is linked from `getting-started.md`. `core/help/super-admins.md` advertises org
-  management. `help/account-settings.md` has **no coverage of the disable/delete
-  flows**, so by the project's own standard the account-lifecycle feature is not
-  done. contacts' `help/carddav.md` documents a per-org book path; mail's
-  `help/provider-setup.md` documents per-org provider storage and "one worker per
-  org", both deleted.
-- [ ] **P6-5 Dead and lying code.** contacts `scripts/test-server-api.ts` is
-  unrunnable (expands a deleted junction, wrong CardDAV path) and its `fail()`
-  discards every label, so it emits nothing but an exit code. Router:
-  `orgs.custom_domains` is written and never read; `ContentHash`/`manifest` have
-  no writers. `davconfig/webdav.go:13-19` still describes tenant WebDAV as
-  unauthenticated-broad — §6 marks it **closed**, so the comment invites a
-  redundant "fix". mail's `mergeSharedFolderStates.ts` has zero importers but a
-  3-test suite. Dead statements in two router tests.
-- [ ] **P6-6 Comment rot + naming residue.** ~12 core/text/calc/drive sites still
-  reference the deleted junction; text and calc both cite a "public share-link
-  render endpoint" registered nowhere; drive cites a superseded migration and
-  says "four interception points" where there are five; mail's
-  `useThreadListItems.ts` calls plain user ids `userOrgIdsForFilter` — the one
-  file a reader opens to understand thread scoping, which is exactly how §3.2's
-  class survives. Plus the ~8 `userOrgId` naming sites §6 overstated (the
-  contracts are already user-id based; this is a mechanical rename).
-- [ ] **P6-7 Duplication worth lifting.** `webdav/tshooks_register.go` and
-  `caldav/tshooks_register.go` are ~130 near-identical lines and have **already
-  drifted** — caldav validates unknown hook names before compiling, webdav after,
-  so a typo partially registers. Fix that ordering bug, then lift to a shared
-  `core/davhooks` parameterized on prefix + names. Also: text/calc
-  `authorizeAnonShare` is byte-identical (plus four neighbours); the router
-  builds the tenant binary from two duplicated test helpers.
-- [ ] **P6-8 Cosmetic.** Two drive migrations share the `1782000000` prefix
-  (ordering rests on lexicographic filename sort — rename one). `biome.json`
-  excludes still target `app/a/[orgSlug]/…`. ~15 `biome-ignore` comments in
-  text/calc against the "never" rule (all carry rationales — either waive them
-  explicitly or fix the underlying issues). `members.tsx` casts through
-  `unknown` because the users schema type lacks `username`/`role`/`is_demo`.
-  Stale `/a/acme/...` fixture paths in unit tests.
+- [x] **P6-4 User-facing help still teaches multi-org.** **DONE 2026-07-28**
+  (tinycld `62d86e4`, contacts `dae5712`, mail `5799157`, calendar `b62f582`):
+  organizations.md rewritten around the workspace + shipped roles
+  (owner/admin/member/guest); super-admins.md stops advertising in-app org
+  management; account-settings.md documents disable (reversible, admin
+  re-enable) and delete (reassign / delete-everything / no-peers) flows;
+  contacts' carddav.md points at `/carddav/u/ab/default/` and its
+  directory/labels/importing topics de-orged; mail's provider-setup.md now
+  says the provider is deployment-wide `system_settings` configured from the
+  Setup dashboard (the env-var fallback it documented no longer exists —
+  `errNoProvider`'s message pointed at the deleted `MAIL_PROVIDER` var and was
+  fixed with it). Also found+fixed: calendar's caldav-hooks.md claimed tenants
+  don't run package TS — stale since `RegisterTenant` landed.
+- [x] **P6-5 Dead and lying code.** **DONE 2026-07-28** (multi-org `83abb5b`,
+  contacts `9ac2de5`, mail `f9f18f0`): the contacts smoke script was FIXED
+  rather than deleted (auth without the deleted expand, real
+  `/carddav/u/ab/default/` path, ok/fail actually print); router dropped
+  `orgs.custom_domains`, the never-written `packages.content_hash`/`manifest`
+  columns and `store.ContentHash` (the live manifest.json materialization is
+  untouched); the davconfig comment now records the closed state (rules +
+  core/quota travel; only the version snapshot is lost in a tenant);
+  `mergeSharedFolderStates` + its suite deleted. The two router test defects
+  were repaired, not deleted: `TestTenant_EvictTerminatesTheProcess` now
+  probes the pid with signal 0 (its `pid` capture was dead — the test never
+  checked the process), and `TestGet_AfterShutdownStoresNothing` asserts the
+  refusal error instead of discarding it (it passed identically on `nil, nil`).
+- [x] **P6-6 Comment rot + naming residue.** **DONE 2026-07-28** (tinycld
+  `2d214c7`, text `7698dc2`, calc `8a1984a`, drive `ea2cc00`+`b05e864`, mail
+  `c1922b0`, contacts `2541e3b`): all inventoried live-voice `user_org`
+  comment sites in core (mention maps, contact suggestions, share-editor,
+  MembersDrawer, UserMenu, audit-log.md, dynamic-packages-remaining.md)
+  corrected; the phantom "public share-link render endpoint" comments in
+  text/calc now name the auth-gated endpoint as the only caller (any future
+  caller must bring its own check); drive's stale `1716200001` citations
+  repointed at `1782100000` and drive.pb.ts/webdav register say five points;
+  mail's `userOrgIds*` → `userIds*` (the identifier was actually
+  `userOrgIdsForFolder`, not `...ForFilter`); the `MemberRow.userOrgId`
+  duplicate field collapsed onto `userId`; drive's `snapshotCurrentFile`
+  `userOrgID` param renamed. **Scope grew:** drive's and contacts' READMEs were
+  saturated with the same rot (nonexistent `resolveItemAndUserOrg` /
+  `getUserOrgForOrg`, per-org book paths, `(item, user_org, …)` column sets) —
+  both rewritten against the shipped code. calc e2e helper comments describing
+  an org-context race the synchronous shims made impossible were also fixed,
+  along with calc's mislabeled `RejectsItemIDMismatch` test comment + dead
+  `_ = itemID`.
+- [x] **P6-7 Duplication worth lifting.** **DONE 2026-07-28** (tinycld
+  `fbe1069`, text `4240a54`, calc `2e8977b`, multi-org `7e0d40a`). The ordering
+  bug was real and RED-FIRST:
+  `TestWebDAVHookTypoRegistersNothing` (fixture
+  `webdavHook({ beforeWrite(e){}, beforeWrit(e){} })`) failed against HEAD —
+  the valid handler stayed registered on a hook file that errored, exactly the
+  partial registration caldav's validate-first order prevents; the existing
+  unknown-name test used a lone typo'd key and could not catch it. The shared
+  `core/davhooks` now owns HostBindings, `NormalizeHandlerSource`, and the
+  validate-BEFORE-compile order; webdav/caldav keep only their name lists +
+  binding names, and coreserver's two identical adapters collapsed into one.
+  `sharelink.AuthorizeAnonRoom`/`ReadOnlyForConn` replace the byte-identical
+  text/calc pair (thin ShareClaims adapters remain; both packages' admission
+  suites now exercise the lifted code). The router's two `buildTenantBinary`
+  copies — which had already diverged, the controlplane copy lacking the
+  chmods the confinement tests need — merged into
+  `internal/testsupport.BuildTenantBinary` (one build per test run).
+  Deliberately NOT lifted, per the §6 assessment: renderETag/handleRender
+  (httpetag) and the Register/RegisterTenant/SetBootstrap boilerplate.
+- [x] **P6-8 Cosmetic.** **DONE 2026-07-28** (tinycld `1506afa`, calc
+  `791c76d`, text `9c427e6`, drive `5de30d7`):
+  - Drive's `add_thumb_index_hashes` renamed to `1781900000` (order-preserving);
+    its up() is now guarded so DBs that applied it under the old name re-run it
+    as a no-op. The `exclude_disabled` twin KEEPS its name — renaming it would
+    re-run its rule restatement after `1782100000` and regress the guest clause.
+  - biome.json: five dead `app/a/[orgSlug]`/`app/share` excludes deleted;
+    schema bumped to the 2.5.1 CLI (was the standing "1 info").
+  - The ~15 biome-ignores resolved as: **10 were dead** (the keys had become
+    composite templates; biome flagged them `suppressions/unused` — the
+    standing "10 warnings") and were deleted; the deliberate positional-key
+    waivers for calc's pivot/CSV components + text's ImportWarningBanner moved
+    into the canonical `noArrayIndexKey` override (MarkdownRenderer's existing
+    pattern), so `pnpm run checks` and `tinycld-pkg check` now agree. Five
+    inline waivers remain by choice (text build.ts noConsole ×2, the
+    `__DEV__`-guarded editor warning, anchored-overlay's narrow dep, calc
+    SheetTabs a11y) — each is load-bearing under the member gate and carries
+    its rationale; a whole-file config-off would silence future genuine hits.
+    (Along the way: biome applies the react-domain rules inconsistently for
+    sibling paths passed as `../<member>`, which is why the root lint called
+    the suppressions unused while the member gate needed them.)
+  - `members.tsx`'s three `as unknown` casts deleted — the generated users
+    type has carried `username`/`role`/`is_demo` since the schema regen, so
+    the stated justification was already false.
+  - All 27 `/a/acme/...` fixture paths in unit tests (and coreserver's
+    `static_test.go`) de-slugged; `use-server-address-gate` had the encoded
+    old path baked into an expectation.
+  `pnpm run checks` now finishes with zero errors, warnings, and infos.
 
 ---
 

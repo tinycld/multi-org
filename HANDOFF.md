@@ -1023,7 +1023,21 @@ confirmed; `[S]` = strong code-reading inference, not executed. Items already in
   comment's promise of AND.
 
 *Tests that cannot fail* — each `[V]`, and each one guards something this review
-found broken or would need to catch:
+found broken or would need to catch.
+
+> **Repaired 2026-07-27 (Phase 3), and the list below was INCOMPLETE.** Fixing
+> these surfaced two more instances the review missed, both of which had been
+> hiding a live bug: calendar's `member_create_rule_probe_test.go` (its
+> "owner adds a member" case adds the owner to a calendar they already own,
+> so it passed on a rule that made sharing impossible) and takeout's whole
+> e2e spec (orphaned — no `playwright.config.ts`, so it had never run). The
+> generalizable point: **a test written specifically to certify a security
+> rule is not exempt from this class — it is a prime candidate for it**,
+> because its author is thinking about the attack, not the feature. When
+> repairing one of these, check that the positive control exercises the shape
+> the FEATURE uses, not merely a shape the rule admits. Three of the denials
+> written during this repair were themselves vacuous on first draft and only
+> caught by neutering the guard.
 - `webdav/filesystem_test.go:143-176` — permissive `CreateRule` in both fixtures
   (masks §7.2's create hole).
 - drive `guest_rls_test.go` / `disabled_rls_test.go`, text/calc
@@ -1267,17 +1281,53 @@ collide on ports — §5.3); every e2e finding above is from reading the specs.
 >    unlink sites (teardown inode guard + the child's `SetUnlinkOnClose`);
 >    P4-4 fixed via atomic symlink-generation swap in `materialize`.
 >
-> **Nothing in the §7.8 order remains open, and Phases 0–2 are complete**
-> (Phase 2 finished 2026-07-27: P2-8, P2-10, P2-12, P2-14, P2-15). The merge
-> gate's remaining open work is the **Phase 3 tail** — P3-3 (mail's folder
-> counts view has zero coverage; no mail vitest mounts a hook), P3-4 (the
-> router tests that cannot fail: manifest DeepEqual round-trips, the
-> unfalsifiable carddav cross-org assertion, integration_test's bare
-> `err != nil`), P3-5 (takeout's mirrored-schema guard covers 1 of 9+
-> collections), and the e2e scoping/discipline work (P3-7, P3-8). After the
-> gate: Phase 4's remaining clusters (P4-3 drain budget and P4-6 proxy IP
-> first), P5-2…P5-4, and Phase 6 docs — where P6-1 (CLAUDE.md/CONTRIBUTING
-> still teach the deleted org contract) ranks above its severity.
+> **PHASE 3 IS COMPLETE (2026-07-27), so Phases 0–3 — the entire merge gate —
+> are done.** P3-3, P3-4, P3-5, P3-7 and P3-8 all landed this pass; see
+> REMEDIATION-PLAN.md for per-item evidence. Every gate is green in every
+> repo (router build/vet/test, core's 21 packages, all seven members'
+> `tinycld-pkg check`, `pnpm run checks`, `pkg:check` 582 tests) and the
+> touched e2e suites were actually RUN, not just read.
+>
+> **Making the tests capable of failing found SIX live bugs that every green
+> suite had been hiding — which is the whole thesis of §7 confirmed
+> empirically.** Each was fixed with a regression test verified red first:
+>
+> 1. **Calendar sharing was impossible.** `1830000004`'s
+>    `user = @request.auth.id` conjunct meant the only creatable membership
+>    was your own, so an owner adding a teammate got a bare 400. Its own
+>    probe test certified it by having the owner add *themselves*. Fixed by
+>    `1830000006` (see P1-5's regression note — read it; it is the sharpest
+>    fixture-trap instance in the tree).
+> 2. **Every real Drive takeout import failed** with "unexpected EOF" —
+>    fflate's streaming `Unzip` misparsed the PK headers of embedded
+>    docx/pptx archives inside data-descriptor entries. The unit suite used
+>    synthetic `zipSync` fixtures, which carry local-header sizes and so
+>    never exercise the scanner. Now iterates the central directory, with a
+>    test that streams the REAL fixture bytes.
+> 3. **Bad DAV Basic credentials returned 500 with no `WWW-Authenticate`**,
+>    so clients read a wrong password as a server fault and never re-prompted.
+>    CardDAV authenticated in the backend; CalDAV/WebDAV already did it at the
+>    route. Found by a falsifiable cross-org probe added under P3-4.
+> 4. **Core never mapped direct PocketBase field errors to forms** —
+>    `error.response.data` IS the field map, but `extractValidationErrors`
+>    only looked at `data.data`, so every validation failure became a generic
+>    "Something went wrong" toast.
+> 5. **`login()` was not idempotent**, deadlocking any spec that composed
+>    `createInvitedUser` with it. It presented as a 30s timeout — the failure
+>    mode a bumped budget would have "fixed" while leaving the deadlock.
+> 6. **mail's e2e delivered to an address the server no longer mints**
+>    (`user@tinycld.org` vs the username-derived `tester@tinycld.org`), so
+>    every inbound 403'd.
+>
+> Two of these (1 and 2) shipped broken to users; the suite was green
+> throughout. Note also that takeout's e2e spec was **orphaned** — the package
+> shipped no `playwright.config.ts`, so `tinycld-pkg test:e2e` could not run
+> it at all, which is why bug 2 survived.
+>
+> **Next, after the gate:** Phase 4's remaining clusters (P4-3 drain budget
+> and P4-6 proxy IP first), P5-2…P5-4, and Phase 6 docs — where P6-1
+> (CLAUDE.md/CONTRIBUTING still teach the deleted org contract) ranks above
+> its severity.
 
 The original list, kept for the review record:
 

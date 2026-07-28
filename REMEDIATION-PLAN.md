@@ -201,6 +201,34 @@ Same class as Phase 0, lower reachability. Land immediately after.
   (`registerOwnerMembershipBootstrap`) covers both compositions and
   `tenant_hooks_bootstrap_test.go` binds it the way a tenant runs it. The
   rules from `1830000004` remain the tenant's authorization backstop.
+  > **⚠️ REGRESSION FOUND AND FIXED 2026-07-27 — `1830000006`, calendar
+  > `c6eec3b`.** `1830000004` conjoined the restored owner check with
+  > `user = @request.auth.id`, which reads as "the row's user must be the
+  > caller" — so the only creatable membership was your own and **calendar
+  > sharing was impossible in the shipped code**: an owner adding a teammate
+  > got a bare 400 and `AddMemberDialog` silently stayed open. The clause was
+  > aimed at the takeover shape the header names
+  > (`POST {calendar: <any>, user: <self>, role: "owner"}`), which `viaOwner`
+  > already blocks by requiring the CALLER to hold an owner membership on the
+  > target calendar — so it added no protection against its own stated threat
+  > while removing the feature. `1830000006` drops it (D1-style product call:
+  > confirmed with the user before changing a shipped security rule).
+  >
+  > **Why nothing caught it, and the lesson.** `member_create_rule_probe_test.go`
+  > — written specifically to certify this rule — had its owner add
+  > **themselves** to a second calendar they already owned, which satisfies
+  > `user = @request.auth.id`. It asserted the one shape sharing never uses.
+  > This is §7.4's fixture trap in its purest form: a test authored *for* a
+  > security rule, passing on a rule that broke the feature.
+  > `member_share_rls_test.go` now covers owner-adds-someone-else against the
+  > SHIPPED rule (rlstest), with four denials — outsider→self, outsider→third
+  > party, viewer re-share, editor→third party. **Two of those denials were
+  > themselves vacuous on the first attempt** and were rewritten: "editor adds
+  > themselves" passes on `UNIQUE(calendar, user)` whatever the rule says, and
+  > "editor targets an unrelated calendar" is denied by the membership half of
+  > the predicate before the role half is consulted. Only an editor holding a
+  > row on the target calendar, adding someone else, isolates `role ?= "owner"`.
+  > Every one verified by neutering.
   **D2 resolved: calendar IS in scope for tenant hosting, so the gates must
   become rules.** A tenant links no feature package, so today a tenant user could
   `POST calendar_members {calendar: <any>, user: self, role: "owner"}` and take
@@ -418,7 +446,15 @@ a second person, since it barely touches the same lines.
   green through a total failure to deliver mail. Shared by `imap_fetcher_test.go`
   and `smtp_inbound_server_test.go`. Rename the fixture fields, then assert
   delivery actually lands on the recipient's state row.
-- [ ] **P3-3 🟡 mail's folder counts have no coverage** — `mail`. 13 tests guard
+- [x] **P3-3 🟡 mail's folder counts have no coverage** **DONE 2026-07-27** (mail
+  `018494c`): dead `computeMailboxFolderCounts` + its 13 tests and the
+  `EMPTY_FOLDER_COUNTS` re-export deleted; `useMailboxFolderCounts.test.tsx`
+  mounts the real hook against real TanStack DB collections (predicate
+  executes; u2's rows excluded), asserts the view's column set FROM the
+  shipped migration, and covers the thread_state invalidation bridge incl.
+  unsubscribe. Each guard verified red by neutering (predicate, migration
+  column, queryKey). `mailListHelpers.test.ts` `as any` stubs replaced with a
+  typed fixture. — `mail`. 13 tests guard
   `computeMailboxFolderCounts`, which the app no longer calls; the real counts
   come from the `mail_folder_counts` view, which has **zero** coverage — not its
   column names, not the predicate, not the realtime bridge. Structural cause: **no
@@ -426,7 +462,20 @@ a second person, since it barely touches the same lines.
   tested. Delete the dead tests (and the dead re-export), add coverage for the
   view. Also `mailListHelpers.test.ts:132-168`: three `as any` stubs carry 5 of 8
   fields, so a rename stays green — the cast is load-bearing, remove it.
-- [ ] **P3-4 🟡 Router tests that cannot fail** — `multi-org`. Four:
+- [x] **P3-4 🟡 Router tests that cannot fail** **DONE 2026-07-27** (`ef0ade0`):
+  `TestBuildCmd_EnvIsAllowlistOnly` pins the constructed child env (the e2e
+  secrets test is annotated as defence-in-depth — the sandbox scrubs
+  process.env, so it cannot observe an env leak); `assertFullyPopulated`
+  makes the manifest wire round-trips falsifiable (zero==zero can no longer
+  hide a dropped field; verified red by dropping a fixture field) and a
+  missing CardDAV round-trip was added; the cross-org CardDAV test gained
+  falsifiable principal probes (org A's user must 401 against org B's
+  tenant) — which found a LIVE bug: bad DAV Basic credentials returned 500
+  with no WWW-Authenticate (CardDAV authenticated in the backend, unlike
+  CalDAV/WebDAV), fixed in core `c4a7fc0` with route-level auth +
+  `register_auth_test.go` (verified red pre-fix); the malicious-migration
+  test now asserts the error names `$os`. The confinement store test was
+  already repaired under P5-1. — `multi-org`. Four:
   `tenant_e2e_test.go:201` (reads `process.env`, which the fork empties on every
   sandboxed VM — swapping `cmd.Env` for `os.Environ()` would leave it green);
   `confinement_linux_test.go:152-175` (writes to `/tmp`, never touches the
@@ -438,7 +487,15 @@ a second person, since it barely touches the same lines.
   unfalsifiable — separate DBs and processes, the name only ever inserted in
   one). Also `integration_test.go:193`, which asserts only `err != nil` and so
   stays green with `Sandboxed` removed.
-- [ ] **P3-5 🟡 Takeout's mirrored-schema guard covers 1 of 9+ collections** —
+- [x] **P3-5 🟡 Takeout's mirrored-schema guard covers 1 of 9+ collections**
+  **DONE 2026-07-27** (takeout `0761e9a`): `batch-inserter-schema.test.ts`
+  drives a full import through a recording pb and pins every dedup/poll
+  filter string and every create payload's exact key set for all ten foreign
+  collections (contacts, calendar_calendars, calendar_events, drive_items,
+  drive_shares, labels, mail_threads, mail_messages, mail_thread_state,
+  label_assignments), hand-verified against the owning migrations, plus a
+  no-`user_org`/`org` residue sweep. Verified red by reintroducing a
+  `user_org` write. —
   `takeout`. Every other foreign write is `pb`-mocked, so a rename in any owning
   package passes the whole suite. Current field names were hand-verified correct,
   so this is a guard gap, not live drift. Extend the field-name assertion to
@@ -447,7 +504,17 @@ a second person, since it barely touches the same lines.
   orphaned from every runner: the workspace-root vitest globs point at paths that
   no longer exist, so a root run collects 1 file and reports green. They pass
   when forced. Fix the globs and the stale `CORE_DIR` alias.
-- [ ] **P3-7 🟡 e2e assertions that another package can satisfy.** The collision
+- [x] **P3-7 🟡 e2e assertions that another package can satisfy** **DONE
+  2026-07-27** (mail `4711b4e`, contacts `3ccdf2f`, calc `c8d4020`, calendar
+  `ba39016`, core `eda65a9`): mail's page-wide advanced-search absence checks
+  scope to a new `advanced-search-panel` testID, the duplicate-mailbox error
+  match scopes to the form's error summary, and label rows carry
+  `mail-sidebar-label-<id>` (replacing `ancestor::*[5]`); contacts' positive
+  assertions join its deny-side ones on the contact-row testID; calc's
+  number/name assertions (incl. page-wide `toHaveCount(0)`) scope to a new
+  `calc-grid-root`; calendar's sharing assertions scope to
+  `calendar-member-row-<userId>` (replacing a `../..` walk). `SidebarItem`
+  gained an optional testID passthrough. All suites verified green. — The collision
   class §3.6 predicted. mail is worst (`mail-inbox.spec.ts:136-146` asserts five
   labels are absent from the **entire page**, so drive rendering a "Size" column
   fails a mail-search test; `mail-shared-mailbox-admin.spec.ts:87` matches four
@@ -455,7 +522,30 @@ a second person, since it barely touches the same lines.
   `ancestor::*[5]`). contacts' positive assertions are bare `getByText('Alice')`
   though its deny-side ones are correctly scoped; calc and calendar the same.
   Scope everything to row/test IDs.
-- [ ] **P3-8 ⚪ e2e discipline** — `tinycld`, `takeout`. `helpers.ts:143`
+- [x] **P3-8 ⚪ e2e discipline** **DONE 2026-07-27** (tinycld `95e3984` +
+  helpers commit, takeout `2932474`, calendar `c6eec3b`, core error fix):
+  `createInvitedUser` SPA-clicks Settings → Members instead of `page.goto`;
+  invite-flow's vacuous `url().toContain('/')` deleted (the preceding
+  `waitForURL(LANDED_URL)` is the real assertion); takeout's spec navigates
+  in-app (month stepping via header arrows), matches the event popover by
+  testID instead of `[style*="width: 360"]`, matches drive rows by aria-label,
+  and collapses its inline 10s–120s timeouts to two named budgets.
+  **Running these found five live bugs, each fixed with a regression test
+  verified red first** (the spec was orphaned — takeout shipped no
+  `playwright.config.ts`, so `test:e2e` could not run it at all):
+  1. fflate's streaming `Unzip` misparsed embedded docx/pptx archives inside
+     data-descriptor entries, failing EVERY real Drive import with
+     "unexpected EOF"; replaced with central-directory iteration.
+  2. `login()` was not idempotent — after `createInvitedUser` it hit the
+     already-authenticated shell, found no form, and deadlocked until the test
+     budget died (presenting as a timeout, which is what a bumped budget would
+     have wrongly "fixed").
+  3. calendar sharing was impossible — see P1-5 follow-up below.
+  4. mail's e2e delivered to `user@tinycld.org`, an address the
+     username-derived mailbox scheme no longer mints, so every inbound 403'd.
+  5. core's `extractValidationErrors` never mapped direct PocketBase field
+     errors (`error.response.data` IS the map), so every form validation
+     failure surfaced as a generic toast. — `tinycld`, `takeout`. `helpers.ts:143`
   hard-`goto`s `/settings/members` against the discipline the same file
   documents; `invite-flow.spec.ts:140` asserts `url()).toContain('/')`, which is
   vacuous; takeout's spec uses `page.goto` for in-app nav plus inline 10s–120s

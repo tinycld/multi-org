@@ -168,7 +168,7 @@ suspending a compromised account leaves every session live until JWT expiry.
 
 Same class as Phase 0, lower reachability. Land immediately after.
 
-- [x] **P1-1 🟡 Disabled clause on text + calc comments** **DONE — verified 2026-07-27:** migration `1782200000_comments_disabled_and_creator.js` in both repos. — `text`, `calc`.
+- [x] **P1-1 🟡 Disabled clause on text + calc comments** **DONE — verified 2026-07-27:** migration `1782200000_comments_disabled_and_creator.js` in both repos. **Correction (later same day):** the two repos sharing one filename broke the generator's global-uniqueness check (`packages:generate` failed at HEAD); calc's copy renamed to `1782200001` — idempotent, so DBs that applied it under the old name are unaffected. — `text`, `calc`.
   Neither `text_comments` nor `calc_comments` carries
   `@request.auth.disabled != true`, so a disabled user with surviving share rows
   can list, view **and create** comments via REST; the Go gate never runs for
@@ -300,7 +300,7 @@ these is live right now.
   from `NotifyContext` and gate on `userId` alone. Rewrite `bell.test.ts:22`,
   which currently calls `setNotifyContext` directly and so certifies the bug.
   **Done when:** a test drives the real mount path, not a hand-set context.
-- [x] **P2-3 🟠 Share links never redirect signed-in members** **DONE — verified 2026-07-27:** `org_slug` deleted from `anon-identity.ts`; drive's `share-routing.ts` owns the member redirect without it. — `tinycld` (core)
+- [x] **P2-3 🟠 Share links never redirect signed-in members** **DONE — verified 2026-07-27:** `org_slug` deleted from `anon-identity.ts`; drive's `share-routing.ts` owns the member redirect without it. **Correction (later same day):** the helper lived inside `public-screens/`, so the route generator emitted a nonsense `/p/drive/share/share-routing` route whose re-export failed drive's `*.tsx`-only exports map, breaking the app-shell typecheck; moved to `tinycld/drive/lib/`. — `tinycld` (core)
   + `drive`. `ShareSession.orgSlug` is typed `string` but the server stopped
   sending `org_slug`, so the redirect gate is always falsy and members fall
   through to the public preview; the target is a dead `/a/` route anyway. Core:
@@ -338,7 +338,7 @@ these is live right now.
   `ts.user_org` bug present as a silent zero. Return a real status from the
   server; surface and capture on the client. **Done when:** a forced query error
   produces a visible failure state, not an empty list.
-- [ ] **P2-8 🟡 Calendar subscription data loss** — `calendar`. Two `[S]`
+- [x] **P2-8 🟡 Calendar subscription data loss** **DONE 2026-07-27 — both `[S]` findings reproduced live first** (sync split into a testable `applyFeed` seam; suite runs the shipped migrations): (a) pruning now scoped to `from_subscription` events (new field via migration `1830000005`, no backfill — errs toward keeping data; matched events re-marked so pruning converges), with a positive prune control; (b) the `ical_uid` unique index is per-`(calendar, ical_uid)` in the same migration, sync creates stamp `Event.Defaults` before the codec (a validated user edit of an imported event now succeeds), and every write failure is logged at Error and surfaced in aggregate so the sync records `subscription_error` instead of reporting success. Sync path widened to `core.App` (§3.4). — `calendar`. Two `[S]`
   findings, both needing a live repro first. (a) Setting `subscription_url` on a
   populated calendar deletes every local event (sync removes anything whose
   `ical_uid` is absent from the feed, and UI events all have generated UIDs) —
@@ -350,7 +350,7 @@ these is live right now.
   `_ = app.SaveNoValidate(…)`), scope the index per calendar, apply Defaults.
 - [x] **P2-9 🟡 Audit-log Members filter** **DONE — verified 2026-07-27:** `audit-log.tsx` filters `resource_type='users'`, matching the writer. — `tinycld`. Filters
   `resource_type = 'user_org'`; the writer stamps `"users"`. One-word fix.
-- [ ] **P2-10 🟡 Accept-invite shows "Welcome to "** — `tinycld`. Client expects
+- [x] **P2-10 🟡 Accept-invite shows "Welcome to "** **DONE 2026-07-27:** interpolation dropped (org branding has no source — §6 — so there is no honest name to render); copy is now "You're invited", `InviteInfo` matches the handler's actual response, and both e2e assertions tightened from `/Welcome to/i` to the exact copy. — `tinycld`. Client expects
   `orgName`/`orgSlug` the handler no longer sends. Either send a deployment name
   or drop the interpolation. Tighten the e2e, which passes on a loose
   `/Welcome to/i`.
@@ -359,18 +359,18 @@ these is live right now.
   parent calendar reports all its events as imported. Also: the `DocumentPicker`
   promise has no `.catch`, and dedup lookups treat any rejection as "not found"
   so a transient error creates duplicates.
-- [ ] **P2-12 🟡 Demo reset leaks `realtime_doc_updates`** — `tinycld`. No FK, so
+- [x] **P2-12 🟡 Demo reset leaks `realtime_doc_updates`** **DONE 2026-07-27:** `wipeOrphanedRealtimeJournal` deletes journal rows whose `room_id` no longer resolves to a drive_item — keyed on room existence rather than this run's deletions, so it also drains rows leaked by pre-fix resets. Runs after the drive_items wipe. — `tinycld`. No FK, so
   nothing cascades and per-room truncation never fires for a deleted room —
   unbounded growth. Add it to the per-collection wipe.
 - [x] **P2-13 🟡 IMAP multi-term BODY search ORs** **DONE 2026-07-27:** `buildFTSMatchSet` rewritten — per-term match sets intersected (Text terms union their two indexes, then AND with the rest), unanswerable criteria fail closed, failed FTS queries logged. `imap_search_fts_test.go` (4 cases over live-shaped FTS tables), multi-term cases red-first. — `mail`. Both arms of the
   "intersect for subsequent terms" branch are byte-identical, so
   `SEARCH BODY "a" BODY "b"` matches either. Implement the intersection.
-- [ ] **P2-14 🟡 mail's swallowed failures** — `mail`. `EmailBody.tsx:41` renders
+- [x] **P2-14 🟡 mail's swallowed failures** **DONE 2026-07-27:** `EmailBody` captures + renders a visible "Couldn't load this message" state (and now rejects non-OK fetches instead of rendering the error body); `useSaveDraft` captures (`mail.draft.save`); `useAttachments` distinguishes a typed `AttachmentValidationError` (toast only — validation isn't a bug) from genuine failures (toast + capture); `useMailBulkActions` gained a shared `onError` (capture + `mutation.error` toast) on all six mutations. — `mail`. `EmailBody.tsx:41` renders
   a failed body fetch as an empty email; `useSaveDraft` doesn't capture (its
   `useSendEmail` sibling does); `useAttachments` toasts without capturing;
   `useMailBulkActions` has no `onError` at all, so a bulk action failing across N
   threads is silent.
-- [ ] **P2-15 ⚪ Silent-failure residue elsewhere** — `tinycld` (core), `drive`.
+- [x] **P2-15 ⚪ Silent-failure residue elsewhere** **DONE 2026-07-27:** `use-share-visitor-role` narrows the bare catch to 404 and captures everything else; `ShareDialog` no longer closes on a failed share-save — it captures, shows an inline error, and keeps the pending list so Done can be retried. **Phase 2 is now complete.** — `tinycld` (core), `drive`.
   `use-share-visitor-role.tsx:92-95` still has the bare `catch { return null }`
   that *hid* the original bug — narrow it to a 404 and capture otherwise.
   `ShareDialog.tsx:181` swallows a failed share-save and closes as if it worked.

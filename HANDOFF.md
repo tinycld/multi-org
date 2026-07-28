@@ -1001,12 +1001,9 @@ confirmed; `[S]` = strong code-reading inference, not executed. Items already in
   `{"total":0}`. The field itself is now correct (`ts.user`), but the swallow
   that hid it is untouched, and no test covers `buildFolderJoin`'s SQL against a
   real schema — so the same class of bug would hide again identically.
-- **[V] mail's five-query JS-stitched join.** `settings/mailboxes.tsx:37-143`
-  opens five unfiltered whole-collection live queries and hand-joins them across
-  four `Map`s, though every relation is already declared in
-  `collections.ts:21-36`. Same shape in `hooks/useMailboxes.ts:25-38` and
-  `useSendableIdentities.ts:14-26`. Against CLAUDE.md's "one query with `.join()`,
-  don't stitch with JS `Map`s".
+- ~~**[V] mail's five-query JS-stitched join.**~~ **FIXED 2026-07-27 (P4-12):**
+  all three sites resolve their relations with joined live queries; mounted-hook
+  tests execute the real joins (verified red by neutering).
 - **[V] mail swallows several user-visible failures.** `EmailBody.tsx:41`
   (`.catch(() => setHtml(''))` — a failed body fetch renders as an empty email);
   `useSaveDraft.ts:52-54` (no `captureException`, unlike its `useSendEmail`
@@ -1150,11 +1147,9 @@ found broken or would need to catch.
   plain `users.id` values `userOrgIdsForFilter` with a comment about
   "the relevant user_orgs" — that file is the one a reader opens to understand
   thread scoping, which is exactly how §3.2's class survives.
-- **Residual N+1s in mail** (`imap_session.go:92-112` — two queries per mailbox
-  membership in `Login`; `:355-370`; `lifecycle.go:90-99` — a membership query
-  per personal mailbox, up to 1000, on every user deletion). The *per-org*
-  fan-out §3.3 removed is confirmed gone; these are the per-mailbox remainder and
-  are bounded in practice.
+- ~~**Residual N+1s in mail**~~ **FIXED 2026-07-27 (P4-13):** Login batches via
+  `FindRecordsByIds`, the FTS thread arm uses one IN-subquery, the deletion
+  sweep uses one DISTINCT query (and no longer deletes on a query error).
 - **e2e discipline.** contacts' positive assertions are still bare
   `getByText('Alice')` (the deny-side ones are correctly testID-scoped) — the
   collision class §3.6 predicts "as more packages return"; calc and calendar have
@@ -1320,13 +1315,13 @@ collide on ports — §5.3); every e2e finding above is from reading the specs.
 > shipped no `playwright.config.ts`, so `tinycld-pkg test:e2e` could not run
 > it at all, which is why bug 2 survived.
 >
-> **Next, after the gate:** ~~Phase 4's remaining clusters (P4-3 drain budget
-> and P4-6 proxy IP first)~~ **the router cluster shipped 2026-07-27** — P4-2,
-> P4-3, P4-5, P4-6, P4-7, P4-8 and P4-11 (which also closed P6-3's README
-> items); see REMEDIATION-PLAN.md for per-item evidence. Remaining in Phase 4:
-> the mail cluster (P4-12 JS-stitched joins, P4-13 residual N+1s). Then
-> P5-2…P5-4, and Phase 6 docs — where P6-1 (CLAUDE.md/CONTRIBUTING still
-> teach the deleted org contract) ranks above its severity.
+> **Next, after the gate:** ~~Phase 4~~ **PHASE 4 IS COMPLETE (2026-07-27)** —
+> the router cluster (P4-2, P4-3, P4-5, P4-6, P4-7, P4-8, P4-11 — the last
+> also closed P6-3's README items) and the mail cluster (P4-12 joined live
+> queries, P4-13 batched N+1s); see REMEDIATION-PLAN.md for per-item
+> evidence. Remaining: P5-2…P5-4, and Phase 6 docs — where P6-1
+> (CLAUDE.md/CONTRIBUTING still teach the deleted org contract) ranks above
+> its severity.
 
 The original list, kept for the review record:
 

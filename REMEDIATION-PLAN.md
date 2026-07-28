@@ -599,14 +599,8 @@ Nothing here is a merge blocker. Grouped so one person can take a cluster.
 - [x] **P4-11 ⚪ No network namespace** **DONE 2026-07-27 — resolved as "correct the docs", recorded as a deliberate decision:** tenants make legitimate outbound connections (calendar ICS subscription fetches, mail provider APIs, Sentry), so `CLONE_NEWNET` without veth/NAT plumbing would break shipped features for no boundary gain — `$http` is withheld by the sandbox and the DB/filesystem boundary doesn't depend on the network. README diagram fixed (mount+pid ns, no netns) and the decision documented in its security section; per-tenant egress policy, if ever wanted, is an operator firewall concern. The README pass also fixed the P6-3 items in the same file: per-org socket path, CardDAV-only descriptions of davconfig/serve-org, the already-fixed reserved-slugs bullet, the stale "no CI" section, and the fork replace path (now the vendored `../tinycld/third_party/pocketbase`). P6-3 is thereby closed too.
 
 *Feature performance* — `mail`
-- [ ] **P4-12 🟡 JS-stitched joins.** `settings/mailboxes.tsx:37-143` opens five
-  unfiltered whole-collection live queries and hand-joins across four `Map`s
-  though every relation is declared; same shape in `useMailboxes.ts` and
-  `useSendableIdentities.ts`. Against CLAUDE.md's explicit rule.
-- [ ] **P4-13 ⚪ Residual N+1s** — two queries per mailbox membership in `Login`;
-  a per-thread-match query inside the FTS loop; a membership query per personal
-  mailbox (up to 1000) on every user deletion. The per-*org* fan-out is confirmed
-  gone; these are bounded in practice.
+- [x] **P4-12 🟡 JS-stitched joins.** **DONE 2026-07-27** (mail `5167742`): `useMailboxes`, `useSendableIdentities` and the settings screen's `useMailboxData` each resolve membership → mailbox → domain (→ aliases, left-joined) in ONE query expression; remaining Maps are per-mailbox grouping, not relation stitching. The settings screen also sheds its first-domain-only artifact (mailboxes on every configured domain now list). New `useMailboxHooks.mount.test.tsx` mounts the real hooks over real TanStack DB collections so the joins and the user predicate actually execute — verified red by neutering the predicate, which also caught the first fixture draft being insensitive (a personal-typed decoy hides behind splitMailboxes' find-first; the decoy must be shared-typed). Mailbox admin + compose e2e green. `flattenSendableIdentities` → `groupSendableIdentities` (joined-row grouping); `splitMailboxes` narrowed to the pure split/sort.
+- [x] **P4-13 ⚪ Residual N+1s** **DONE 2026-07-27** (mail `e067b59`): IMAP Login batches mailbox+domain resolution into two `FindRecordsByIds` lookups; the Text-search thread arm maps FTS thread matches to messages in one thread-IN-subquery statement (no per-match query, no IN-expansion limit); `handleUserDeleted` probes memberships with one DISTINCT query — and on a query error now sweeps NOTHING, where the old per-mailbox error path DELETED the mailbox on unknown state. Sweep gained its first test (membered kept / memberless personal swept / shared untouched). Full mail Go suite + all 8 IMAP e2e specs green. **Phase 4 is now complete.**
 
 ---
 

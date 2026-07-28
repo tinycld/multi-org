@@ -141,10 +141,13 @@ readiness pipe — instead of panicking anything shared.
 > a warning saying so. It exists so the router runs on a development machine;
 > **do not host untrusted tenants on it.**
 
-> **⚠️ Provisioning is still in-process.** `POST /api/orgs` runs a tenant's
-> migration JS via `bootstrapTenantOnce` inside the control-plane process
-> (sandboxed, but not OS-isolated). Moving that to a one-shot isolated
-> subprocess is deliberately out of scope for this change and remains open.
+Provisioning runs no tenant JS in the control-plane process. `POST /api/orgs`
+materializes the org, flips it active, and then **boots the tenant through the
+org manager** to verify it: the first spawn applies the org's migrations inside
+the confined tenant process (`apis.Serve` runs them before the readiness
+report), and a failure travels back through the readiness pipe with the child's
+reason, rolling the org back to `provisioning` for a retried create to resume.
+The control plane never opens a tenant app.
 
 ### Process hygiene
 

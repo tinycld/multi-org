@@ -88,7 +88,15 @@ func run() error {
 	})
 	defer mgr.Shutdown()
 
-	prov := controlplane.NewProvisioner(cp.App, root, pkgStore, mgr.Evict)
+	// Provision-time verification boots the new org through the manager: the
+	// first spawn applies the org's migrations inside the CONFINED tenant
+	// process (the control plane never runs tenant JS), and a failure comes
+	// back through the readiness handshake with the child's reason.
+	prov := controlplane.NewProvisioner(cp.App, root, pkgStore, mgr.Evict,
+		func(ctx context.Context, slug string) error {
+			_, err := mgr.Get(ctx, slug)
+			return err
+		})
 	prov.RegisterRoutes()
 
 	controlMux, err := apis.BuildServeMux(cp.App, apis.ServeConfig{})

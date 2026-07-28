@@ -25,7 +25,7 @@ func TestOrgLookup_ReturnsActiveOrgRecord(t *testing.T) {
 
 	s := store.New(root)
 	_ = s.Publish("@tinycld/core", "1.0.0", map[string][]byte{"server/a.pb.js": []byte("1")})
-	p := NewProvisioner(cp.App, root, s, func(string) {})
+	p := NewProvisioner(cp.App, root, s, func(string) {}, nil)
 	if _, err := p.CreateOrg("acme", "Acme", map[string]string{"@tinycld/core": "1.0.0"}); err != nil {
 		t.Fatal(err)
 	}
@@ -57,7 +57,7 @@ func TestRegisterRoutes_OrgsRequiresSuperuser(t *testing.T) {
 		t.Fatal(err)
 	}
 	s := store.New(root)
-	p := NewProvisioner(cp.App, root, s, func(string) {})
+	p := NewProvisioner(cp.App, root, s, func(string) {}, nil)
 	p.RegisterRoutes()
 
 	mux, err := apis.BuildServeMux(cp.App, apis.ServeConfig{})
@@ -87,7 +87,7 @@ func TestRegisterRoutes_PublishPackageRequiresSuperuser(t *testing.T) {
 		t.Fatal(err)
 	}
 	s := store.New(root)
-	p := NewProvisioner(cp.App, root, s, func(string) {})
+	p := NewProvisioner(cp.App, root, s, func(string) {}, nil)
 	p.RegisterRoutes()
 
 	mux, err := apis.BuildServeMux(cp.App, apis.ServeConfig{})

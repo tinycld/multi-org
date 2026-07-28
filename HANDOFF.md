@@ -124,7 +124,7 @@ at its real absolute path (a `chroot` to the org dir would break every
 defence in depth, and children are spawned with an **allowlist-constructed**
 environment so no `MT_*` secret can leak — by construction, not by filtering.
 
-**Three caveats — the first is CLOSED (2026-07-27):**
+**Three caveats — the first and third are CLOSED:**
 1. ~~**`TestConfinement_*` require Linux + root and there is no CI**~~ **CLOSED**
    — the `confinement` workflow (`.github/workflows/confinement.yml`) runs the
    full suite plus `TestConfinement_*` as root on every push/PR; first green
@@ -133,9 +133,16 @@ environment so no `MT_*` secret can leak — by construction, not by filtering.
    `-run TestConfinement` prints an explicit SKIP stub.
 2. **macOS is not a boundary.** The darwin spawner is a plain subprocess and logs
    a warning saying so. Don't host untrusted tenants on it.
-3. **Provisioning is still in-process.** `bootstrapTenantOnce` runs untrusted
-   tenant migration JS inside the control-plane process (sandboxed, not
-   OS-isolated). Moving it to a one-shot isolated subprocess was scoped out.
+3. ~~**Provisioning is still in-process.**~~ **CLOSED (2026-07-28, P5-3)** —
+   `bootstrapTenantOnce` is deleted; the control plane never opens a tenant
+   app. `CreateOrg` materializes, flips active, and **verifies by booting the
+   tenant through the org manager** (serve-multi wires
+   `Provisioner.verify` → `mgr.Get`): the first spawn applies the org's
+   migrations inside the confined tenant (`apis.Serve` runs
+   `RunAllMigrations` before readiness), a failure travels back through the
+   readiness pipe with the child's reason (the malicious-migration test still
+   asserts the error names `$os`), and the org rolls back to `provisioning`
+   for a retried create to resume. A verified org is left running (warm).
 
 Original brief: `docs/superpowers/specs/FOLLOWUP-os-process-isolation.md`
 (decisions 1–5 are now answered; 6 resource limits and 7 control-plane remain).
@@ -523,8 +530,10 @@ matches:
   vacuous even on Linux (§7.4 / P3-4), so repair them as part of standing CI
   up — and CI is also the only way to re-run confinement with feature Go
   linked (SCOPE-tenant-feature-go D4).
-- **Provision-time migrations still run in the control-plane process**
-  (`bootstrapTenantOnce`). Move to a one-shot isolated `serve-org` invocation.
+- ~~**Provision-time migrations still run in the control-plane process**
+  (`bootstrapTenantOnce`).~~ **CLOSED (2026-07-28, P5-3)** — deleted;
+  provisioning verifies by booting the tenant through the org manager, so
+  migrations run only inside the confined tenant process (§1 caveat 3).
 - **Resource limits.** `MT_CGROUP_ROOT` creates a per-tenant cgroup but writes no
   limits; a runaway tenant can still starve the host. (Brief decision #6.)
 
@@ -1177,7 +1186,8 @@ found broken or would need to catch.
   `apis.Serve` already runs `RunAllMigrations()` unconditionally inside the
   confined tenant (`apis/serve.go:155`), so the first spawn applies the same
   migrations in isolation; dropping it closes the item without building a
-  one-shot subprocess path.
+  one-shot subprocess path. *(Confirmed — removed exactly this way, 2026-07-28,
+  P5-3.)*
 - **Cosmetic.** Two drive migrations share the `1782000000` prefix (ordering
   rests on lexicographic filename sort). `biome.json` excludes still target
   `app/a/[orgSlug]/…`. `time.NewTicker(MaxIdle/2)` panics for `MaxIdle == 1ns`.
@@ -1365,8 +1375,8 @@ without re-pointing the fixture leaves the next regression equally invisible.
   (`FOLLOWUP-os-process-isolation.md`).
   Note `FOLLOWUP-os-process-isolation.md` is the *pre-implementation* brief; its
   seven deferred decisions are answered by the shipped code except #6 (resource
-  limits) and #7 (control-plane provisioning). `README.md` describes what
-  actually exists.
+  limits — P5-2); #7 (control-plane provisioning) closed 2026-07-28 by P5-3.
+  `README.md` describes what actually exists.
 - **Fork seams + router design** (2026-07-22): in the fork's git history.
 - **Core capability/hook reference**: `tinycld/docs/hooks.md` (both Go↔TS seams,
   incl. the hook-point contract and its ordering trap), `tinycld/docs/packages.md`.

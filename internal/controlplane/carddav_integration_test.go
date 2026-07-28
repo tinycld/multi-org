@@ -168,7 +168,7 @@ func setupCardDAVOrgs(t *testing.T, root string) (*orgmanager.OrgManager, *Provi
 	}
 
 	s := store.New(root)
-	p := NewProvisioner(cp.App, root, s, func(string) {})
+	p := NewProvisioner(cp.App, root, s, func(string) {}, nil)
 
 	// Publish via PublishPackage so emitManifestJSON runs (manifest.ts → manifest.json).
 	files := map[string][]byte{

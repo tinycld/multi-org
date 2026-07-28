@@ -619,7 +619,21 @@ boundary that is known-broken just encodes the break.
 - [ ] **P5-2 Resource limits.** `MT_CGROUP_ROOT` creates a per-tenant cgroup but
   writes no limits, so a runaway tenant can still starve the host. (§6, brief
   decision #6.)
-- [ ] **P5-3 Provisioning out of the control plane.** §7 refines this: it may be
+- [x] **P5-3 Provisioning out of the control plane.** **DONE 2026-07-28 —
+  removed, not relocated**, exactly as §7 suggested: `bootstrapTenantOnce`
+  deleted; `CreateOrg` materializes, activates, then **verifies by booting the
+  tenant through the org manager** (`Provisioner` gained a `verify` hook;
+  serve-multi wires it to `mgr.Get`). Migrations apply inside the confined
+  tenant (`apis.Serve` → `RunAllMigrations` before readiness); a boot failure
+  comes back through the readiness pipe with the child's reason and rolls the
+  org back to `provisioning` (resumable). Red-first:
+  `TestCreateOrg_VerifiesTenantBootBeforeReturning` +
+  `TestCreateOrg_VerifyFailureRollsBackActivation` (both confirmed red at
+  HEAD). The five provisioning integration tests were rewired to the
+  production shape (counting spawner pins provision-time spawn == 1, Get
+  reuses it); `TestIntegration_MaliciousMigrationCannotExec` still asserts the
+  sandbox reason (`$os`) — now proving it survives the trip through the
+  readiness pipe — plus a new rollback-to-provisioning assertion. §7 refines this: it may be
   **removable rather than relocatable** — `apis.Serve` already runs
   `RunAllMigrations()` unconditionally inside the confined tenant, so the first
   spawn applies the same migrations in isolation. `bootstrapTenantOnce` mainly

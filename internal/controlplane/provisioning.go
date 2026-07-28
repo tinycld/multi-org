@@ -1,16 +1,16 @@
 package controlplane
 
 import (
+	"context"
 	"encoding/base64"
 	"fmt"
 	"os"
 	"path/filepath"
 	"regexp"
+	"time"
 
-	"github.com/pocketbase/pocketbase"
 	"github.com/pocketbase/pocketbase/apis"
 	"github.com/pocketbase/pocketbase/core"
-	"github.com/pocketbase/pocketbase/plugins/jsvm"
 
 	"tinycld.org/multi-org/internal/lockfile"
 	"tinycld.org/multi-org/internal/materialize"
@@ -20,17 +20,31 @@ import (
 // EvictFunc lets provisioning invalidate a cached org instance in the manager.
 type EvictFunc func(slug string)
 
+// VerifyFunc boots the org's tenant process and reports whether it became
+// ready. serve-multi wires it to the org manager's Get: the spawn applies the
+// org's migrations inside the confined tenant (apis.Serve runs
+// RunAllMigrations before readiness), and a failure arrives back through the
+// readiness pipe carrying the child's reason. This is what keeps untrusted
+// tenant migration JS out of the control-plane process entirely — the control
+// plane never opens a tenant app.
+type VerifyFunc func(ctx context.Context, slug string) error
+
 // Provisioner performs control-plane provisioning operations against the orgs/
 // packages/deployments collections and the package store.
 type Provisioner struct {
-	app   core.App
-	root  string
-	store *store.PackageStore
-	evict EvictFunc
+	app    core.App
+	root   string
+	store  *store.PackageStore
+	evict  EvictFunc
+	verify VerifyFunc
 }
 
-func NewProvisioner(app core.App, root string, s *store.PackageStore, evict EvictFunc) *Provisioner {
-	return &Provisioner{app: app, root: root, store: s, evict: evict}
+// NewProvisioner builds a Provisioner. verify may be nil, in which case
+// CreateOrg activates the org without booting it and the org's migrations run
+// at its first spawn instead — that trades the synchronous failure report for
+// a 502 on first request, so production wiring should always pass one.
+func NewProvisioner(app core.App, root string, s *store.PackageStore, evict EvictFunc, verify VerifyFunc) *Provisioner {
+	return &Provisioner{app: app, root: root, store: s, evict: evict, verify: verify}
 }
 
 var slugRe = regexp.MustCompile(`^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$`)
@@ -45,7 +59,7 @@ func validSlug(s string) bool { return slugRe.MatchString(s) && !reservedSlugs[s
 // CreateOrg provisions a new org, or resumes a previously half-provisioned one.
 // If an org row for the slug already exists and is still active, it errors; if
 // the existing row is in a non-active (e.g. stranded "provisioning") state, it
-// resumes: re-materializes, re-bootstraps the tenant DB, and flips to active.
+// resumes: re-materializes, re-verifies the tenant boot, and flips to active.
 func (p *Provisioner) CreateOrg(slug, displayName string, lock map[string]string) (*core.Record, error) {
 	if !validSlug(slug) {
 		return nil, fmt.Errorf("invalid slug %q", slug)
@@ -97,16 +111,38 @@ func (p *Provisioner) CreateOrg(slug, displayName string, lock map[string]string
 		return nil, fmt.Errorf("save org record: %w", err)
 	}
 
-	if err := bootstrapTenantOnce(orgDir); err != nil {
-		return nil, fmt.Errorf("tenant bootstrap: %w", err)
-	}
-
+	// Activate BEFORE verifying: the manager's load path refuses a non-active
+	// org, and verification IS a load. The org's migrations run inside the
+	// confined tenant process (apis.Serve runs RunAllMigrations before the
+	// readiness report), so the control plane never executes tenant JS. On
+	// failure the child's reason arrives through the readiness pipe and the
+	// record rolls back to "provisioning", which a retried CreateOrg resumes.
+	// The brief active-but-unverified window is benign — a request racing it
+	// collapses into the same singleflight spawn the verification drives.
 	rec.Set("status", "active")
 	if err := p.app.Save(rec); err != nil {
 		return nil, fmt.Errorf("activate org record: %w", err)
 	}
+
+	if p.verify != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), tenantVerifyTimeout)
+		defer cancel()
+		if err := p.verify(ctx, slug); err != nil {
+			rec.Set("status", "provisioning")
+			if saveErr := p.app.Save(rec); saveErr != nil {
+				return nil, fmt.Errorf("tenant bootstrap: %w (and rollback to provisioning failed: %v)", err, saveErr)
+			}
+			return nil, fmt.Errorf("tenant bootstrap: %w", err)
+		}
+	}
 	return rec, nil
 }
+
+// tenantVerifyTimeout bounds the provision-time boot verification. It only
+// caps how long CreateOrg waits: the manager bounds the spawn itself with its
+// own (shorter) readiness timeout, so this fires only if the manager path
+// itself wedges.
+const tenantVerifyTimeout = 60 * time.Second
 
 // Deploy re-resolves a new lockfile, re-materializes, records a deployment, and
 // evicts the running instance so the next request loads fresh.
@@ -279,37 +315,4 @@ func (p *Provisioner) RegisterRoutes() {
 
 		return e.Next()
 	})
-}
-
-// bootstrapTenantOnce opens a fresh tenant app just long enough to run its
-// migrations at provision time. jsvm is registered so the materialized JS
-// migrations in pb_migrations are picked up (without it only the Go core
-// migrations run and the tenant boots with no application collections).
-//
-// NOTE: this runs untrusted tenant migration JS INSIDE the control-plane
-// process. It is sandboxed (jsvm Sandboxed mode) but not OS-isolated, unlike
-// the runtime path, where every org runs in its own confined process. Moving
-// provision-time migrations into a one-shot isolated subprocess of serve-org is
-// known outstanding work — see the README's security section.
-func bootstrapTenantOnce(orgDir string) error {
-	pb := pocketbase.NewWithConfig(pocketbase.Config{
-		DefaultDataDir:  filepath.Join(orgDir, "pb_data"),
-		HideStartBanner: true,
-	})
-	// Register (not MustRegister): a sandbox denial in an untrusted migration
-	// surfaces at registration time; return it as a provisioning error rather
-	// than panicking the control-plane process.
-	if err := jsvm.Register(pb, jsvm.Config{
-		HooksDir:      filepath.Join(orgDir, "pb_hooks"),
-		MigrationsDir: filepath.Join(orgDir, "pb_migrations"),
-		HooksWatch:    false,
-		Sandboxed:     true, // untrusted tenant migration JS, run in the control-plane process
-	}); err != nil {
-		return err
-	}
-	if err := pb.Bootstrap(); err != nil {
-		return err
-	}
-	defer pb.App.ResetBootstrapState()
-	return pb.App.RunAllMigrations()
 }

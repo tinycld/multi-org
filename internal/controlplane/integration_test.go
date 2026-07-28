@@ -2,10 +2,12 @@ package controlplane
 
 import (
 	"context"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/pocketbase/pocketbase"
@@ -13,6 +15,45 @@ import (
 	"tinycld.org/multi-org/internal/orgmanager"
 	"tinycld.org/multi-org/internal/store"
 )
+
+// countingSpawner wraps the real spawner and counts tenant process starts, so
+// a test can pin WHERE a spawn happened: provision-time verification must
+// spawn exactly once, and a later Get must reuse that instance rather than
+// booting a second process.
+type countingSpawner struct {
+	inner orgmanager.Spawner
+	n     atomic.Int32
+}
+
+func (c *countingSpawner) Spawn(ctx context.Context, req orgmanager.SpawnRequest, log *slog.Logger) (orgmanager.Process, error) {
+	c.n.Add(1)
+	return c.inner.Spawn(ctx, req, log)
+}
+
+// newVerifiedProvisioner builds the production-shaped provisioning wiring —
+// a real manager spawning the real serve-org binary, and a Provisioner whose
+// verify hook boots the org through it, exactly as serve-multi wires it. The
+// org's migrations therefore run inside the tenant process; the control plane
+// itself never executes tenant JS.
+func newVerifiedProvisioner(t *testing.T, cp *ControlPlane, root string, s *store.PackageStore) (*orgmanager.OrgManager, *Provisioner, *countingSpawner) {
+	t.Helper()
+	spawner := &countingSpawner{inner: orgmanager.NewSpawner(quietLogger())}
+	mgr := orgmanager.New(orgmanager.Config{
+		Root:         root,
+		Store:        s,
+		TenantBinary: buildTenantBinary(t),
+		Logger:       quietLogger(),
+		LookupOrg:    OrgLookup(cp.App),
+		HooksPool:    2,
+		Spawner:      spawner,
+	})
+	t.Cleanup(mgr.Shutdown)
+	p := NewProvisioner(cp.App, root, s, mgr.Evict, func(ctx context.Context, slug string) error {
+		_, err := mgr.Get(ctx, slug)
+		return err
+	})
+	return mgr, p, spawner
+}
 
 // widgetsMigration is a minimal PocketBase JS migration that creates one
 // application collection, standing in for a real @tinycld package's schema.
@@ -55,39 +96,37 @@ func TestIntegration_CreateOrgToLoadWithSchema(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	p := NewProvisioner(cp.App, root, s, func(string) {})
+	mgr, p, spawner := newVerifiedProvisioner(t, cp, root, s)
 	if _, err := p.CreateOrg("acme", "Acme", map[string]string{"@tinycld/core": "1.0.0"}); err != nil {
 		t.Fatalf("CreateOrg: %v", err)
 	}
 
-	// The migration must have persisted into acme's own tenant DB at provision
-	// time. Open that DB fresh and confirm the collection exists — proving schema
-	// reached the tenant, not just the control plane.
-	assertTenantHasWidgets(t, filepath.Join(root, "pb_orgs", "acme", "pb_data"))
+	// Provision-time verification must have booted the tenant — in its own
+	// process, which is where the org's migrations now run.
+	if got := spawner.n.Load(); got != 1 {
+		t.Fatalf("expected CreateOrg to spawn the tenant once for verification, got %d spawns", got)
+	}
 
-	// Now drive the full runtime chain: OrgLookup (real, DB-backed) → manager.load.
-	mgr := orgmanager.New(orgmanager.Config{
-		Root:         root,
-		Store:        s,
-		TenantBinary: buildTenantBinary(t),
-		Logger:       quietLogger(),
-		LookupOrg:    OrgLookup(cp.App),
-		HooksPool:    2,
-	})
-	defer mgr.Shutdown()
-
+	// A request reuses the verified instance rather than booting a second one.
 	inst, err := mgr.Get(context.Background(), "acme")
 	if err != nil {
 		t.Fatalf("manager.Get(acme) via real lookup: %v", err)
 	}
-
-	// The hook route serves (proves hooks materialized + app booted via the
-	// lazy-load path, not just the provision-time bootstrap).
 	rec := httptest.NewRecorder()
 	inst.Mux().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/whoami", nil))
 	if rec.Code != http.StatusOK {
 		t.Fatalf("/whoami via manager = %d body=%s", rec.Code, rec.Body.String())
 	}
+	if got := spawner.n.Load(); got != 1 {
+		t.Fatalf("Get after provisioning respawned the tenant: %d spawns", got)
+	}
+
+	// The migration must have persisted into acme's own tenant DB during the
+	// provision-time boot. Quiesce the tenant first — the assertion opens the
+	// DB in this process — then confirm the collection exists, proving schema
+	// reached the tenant.
+	mgr.Shutdown()
+	assertTenantHasWidgets(t, filepath.Join(root, "pb_orgs", "acme", "pb_data"))
 }
 
 // TestIntegration_CreateOrgToLoadWithTSSchema mirrors the JS test, but authors
@@ -113,7 +152,7 @@ func TestIntegration_CreateOrgToLoadWithTSSchema(t *testing.T) {
 	}
 
 	s := store.New(root)
-	p := NewProvisioner(cp.App, root, s, func(string) {})
+	mgr, p, _ := newVerifiedProvisioner(t, cp, root, s)
 
 	// TypeScript source with TS-only syntax — must be transpiled before it can
 	// run on the JS (sobek) engine.
@@ -135,21 +174,7 @@ func TestIntegration_CreateOrgToLoadWithTSSchema(t *testing.T) {
 		t.Fatalf("CreateOrg: %v", err)
 	}
 
-	// The TS migration (transpiled to JS, materialized, run) must have created the
-	// collection in acme's own tenant DB.
-	assertTenantHasWidgets(t, filepath.Join(root, "pb_orgs", "acme", "pb_data"))
-
-	// Drive the full runtime chain: OrgLookup (real, DB-backed) → manager.load.
-	mgr := orgmanager.New(orgmanager.Config{
-		Root:         root,
-		Store:        s,
-		TenantBinary: buildTenantBinary(t),
-		Logger:       quietLogger(),
-		LookupOrg:    OrgLookup(cp.App),
-		HooksPool:    2,
-	})
-	defer mgr.Shutdown()
-
+	// Drive the full runtime chain: OrgLookup (real, DB-backed) → manager.
 	inst, err := mgr.Get(context.Background(), "acme")
 	if err != nil {
 		t.Fatalf("manager.Get(acme) via real lookup: %v", err)
@@ -161,11 +186,20 @@ func TestIntegration_CreateOrgToLoadWithTSSchema(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("/whoami via manager = %d body=%s", rec.Code, rec.Body.String())
 	}
+
+	// The TS migration (transpiled to JS, materialized, run inside the tenant's
+	// provision-time boot) must have created the collection in acme's own DB.
+	// Quiesce the tenant before opening its DB in this process.
+	mgr.Shutdown()
+	assertTenantHasWidgets(t, filepath.Join(root, "pb_orgs", "acme", "pb_data"))
 }
 
 // TestIntegration_MaliciousMigrationCannotExec proves provision-time migrations
-// run sandboxed: a migration whose top-level code touches $os fails provisioning
-// (the binding is absent) rather than executing in the control-plane process.
+// run sandboxed INSIDE the tenant process: a migration whose top-level code
+// touches $os fails the tenant boot (the binding is absent in a sandboxed VM),
+// the reason travels back through the readiness handshake, and provisioning
+// fails with the org left resumable — the migration never executes in the
+// control-plane process, which no longer opens tenant apps at all.
 func TestIntegration_MaliciousMigrationCannotExec(t *testing.T) {
 	root := t.TempDir()
 
@@ -190,7 +224,7 @@ func TestIntegration_MaliciousMigrationCannotExec(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	p := NewProvisioner(cp.App, root, s, func(string) {})
+	_, p, _ := newVerifiedProvisioner(t, cp, root, s)
 	_, err = p.CreateOrg("evilorg", "Evil", map[string]string{"@tinycld/evil": "1.0.0"})
 	if err == nil {
 		t.Fatal("expected provisioning to fail for a migration touching $os under sandbox")
@@ -198,9 +232,18 @@ func TestIntegration_MaliciousMigrationCannotExec(t *testing.T) {
 	// A bare err != nil would stay green with Sandboxed removed if provisioning
 	// failed for any unrelated reason (a fixture path typo, a publish error).
 	// The failure must be the sandbox refusing the binding: $os is simply not
-	// defined in a sandboxed VM, so the load throws a ReferenceError naming it.
+	// defined in a sandboxed VM, so the load throws a ReferenceError naming it —
+	// and that reason must survive the trip through the readiness pipe.
 	if !strings.Contains(err.Error(), "$os") {
 		t.Fatalf("provisioning failed, but not because the sandbox withheld $os: %v", err)
+	}
+	// The failed org must be rolled back to a resumable state, never active.
+	rec, err := cp.App.FindFirstRecordByData("orgs", "slug", "evilorg")
+	if err != nil {
+		t.Fatalf("org row should survive for resume: %v", err)
+	}
+	if got := rec.GetString("status"); got != "provisioning" {
+		t.Fatalf("expected failed org rolled back to provisioning, got %q", got)
 	}
 }
 
@@ -262,10 +305,13 @@ func TestIntegration_TenantHasNoControlPlaneCollections(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	p := NewProvisioner(cp.App, root, s, func(string) {})
+	mgr, p, _ := newVerifiedProvisioner(t, cp, root, s)
 	if _, err := p.CreateOrg("acme", "Acme", map[string]string{"@tinycld/core": "1.0.0"}); err != nil {
 		t.Fatalf("CreateOrg: %v", err)
 	}
+	// Quiesce the tenant the verification boot left running before opening its
+	// DB in this process.
+	mgr.Shutdown()
 
 	tenant := pocketbase.NewWithConfig(pocketbase.Config{
 		DefaultDataDir:  filepath.Join(root, "pb_orgs", "acme", "pb_data"),
@@ -288,7 +334,8 @@ func TestIntegration_TenantHasNoControlPlaneCollections(t *testing.T) {
 }
 
 // TestIntegration_MaliciousHookCannotCrashControlPlane proves a package whose
-// hook throws at load fails provisioning with a returned error, rather than
+// hook throws at load fails provisioning with a returned error — the tenant
+// boot fails and reports through the readiness handshake — rather than
 // panicking the control-plane process.
 func TestIntegration_MaliciousHookCannotCrashControlPlane(t *testing.T) {
 	root := t.TempDir()
@@ -312,7 +359,7 @@ func TestIntegration_MaliciousHookCannotCrashControlPlane(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	p := NewProvisioner(cp.App, root, s, func(string) {})
+	_, p, _ := newVerifiedProvisioner(t, cp, root, s)
 	defer func() {
 		if r := recover(); r != nil {
 			t.Fatalf("provisioning panicked on a load-throwing hook: %v", r)

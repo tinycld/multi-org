@@ -527,9 +527,10 @@ matches:
 - ~~**Linux CI for `TestConfinement_*`**~~ **CLOSED (P5-1, 2026-07-27)** — the
   `confinement` workflow runs the full suite plus `TestConfinement_*` as root
   on every push/PR (first green run 30318853658; see §1 caveat 1). The P3-4
-  vacuous tests were repaired as part of standing it up. **Note:** the new
+  vacuous tests were repaired as part of standing it up. The new
   `TestConfinement_CgroupLimitsApplied` (P5-2) rides the same workflow —
-  verify its first run after the next push.
+  **verified green on run 30388671814 (2026-07-28), all six confinement
+  tests executed and passed as root.**
 - ~~**Provision-time migrations still run in the control-plane process**
   (`bootstrapTenantOnce`).~~ **CLOSED (2026-07-28, P5-3)** — deleted;
   provisioning verifies by booting the tenant through the org manager, so

@@ -8,26 +8,49 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 
 	"tinycld.org/multi-org/internal/lockfile"
 )
 
 // Materialize (re)builds <orgDir>/pb_hooks, pb_public, and pb_migrations from
-// resolved packages. Existing dirs are cleared first, making it idempotent.
+// resolved packages. Idempotent.
+//
+// Each of the three names is a SYMLINK to an a/b generation directory beside
+// it, and a rebuild constructs the inactive generation then renames a fresh
+// symlink over the live name — an atomic swap. It must never clear the live
+// tree in place: Deploy re-materializes a RUNNING tenant before evicting it,
+// and manager.load re-materializes while an evicted predecessor may still be
+// draining — a tenant serving static assets out of pb_public the whole time.
+// A concurrent reader sees the old tree or the new one, never a half-built
+// one. (Directories themselves cannot be atomically replaced by rename; a
+// symlink can.)
 func Materialize(orgDir string, resolved []lockfile.ResolvedPackage) error {
-	hooksDir := filepath.Join(orgDir, "pb_hooks")
-	publicDir := filepath.Join(orgDir, "pb_public")
+	liveDirs := []string{"pb_hooks", "pb_public", "pb_migrations"}
+
+	if err := os.MkdirAll(orgDir, 0o755); err != nil {
+		return err
+	}
+
+	hooksDir, err := stageDir(orgDir, "pb_hooks")
+	if err != nil {
+		return err
+	}
+	publicDir, err := stageDir(orgDir, "pb_public")
+	if err != nil {
+		return err
+	}
 	// Source uses the hyphenated "pb-migrations" (matching tinycld packages);
 	// the tenant app reads the underscore "pb_migrations".
-	migrationsDir := filepath.Join(orgDir, "pb_migrations")
-
-	for _, d := range []string{hooksDir, publicDir, migrationsDir} {
-		if err := os.RemoveAll(d); err != nil {
-			return err
-		}
-		if err := os.MkdirAll(d, 0o755); err != nil {
-			return err
-		}
+	migrationsDir, err := stageDir(orgDir, "pb_migrations")
+	if err != nil {
+		return err
+	}
+	built := map[string]string{
+		"pb_hooks":      hooksDir,
+		"pb_public":     publicDir,
+		"pb_migrations": migrationsDir,
 	}
 
 	// migrationOwners maps a materialized migration filename to the package that
@@ -50,6 +73,101 @@ func Materialize(orgDir string, resolved []lockfile.ResolvedPackage) error {
 		}
 		if err := linkMigrations(filepath.Join(pkg.Dir, "pb-migrations"), migrationsDir, pkg.Name, migrationOwners); err != nil {
 			return err
+		}
+	}
+
+	// The whole tree built cleanly — swap each name onto its new generation.
+	for _, n := range liveDirs {
+		if err := swapIn(orgDir, n, built[n]); err != nil {
+			return fmt.Errorf("swap %s: %w", n, err)
+		}
+	}
+	return nil
+}
+
+// stageDir creates and returns a FRESH generation directory to build into
+// (one higher than any on disk), leaving every existing generation — including
+// the live one — untouched while a tenant reads it.
+func stageDir(orgDir, name string) (string, error) {
+	dir := filepath.Join(orgDir, fmt.Sprintf("%s.gen%d", name, maxGeneration(orgDir, name)+1))
+	if err := os.RemoveAll(dir); err != nil {
+		return "", err
+	}
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return "", err
+	}
+	return dir, nil
+}
+
+// maxGeneration returns the highest generation number present for name, or 0.
+func maxGeneration(orgDir, name string) int {
+	entries, err := os.ReadDir(orgDir)
+	if err != nil {
+		return 0
+	}
+	most := 0
+	for _, e := range entries {
+		if n, ok := parseGeneration(e.Name(), name); ok && n > most {
+			most = n
+		}
+	}
+	return most
+}
+
+func parseGeneration(entry, name string) (int, bool) {
+	rest, ok := strings.CutPrefix(entry, name+".gen")
+	if !ok {
+		return 0, false
+	}
+	n, err := strconv.Atoi(rest)
+	if err != nil || n < 1 {
+		return 0, false
+	}
+	return n, true
+}
+
+// swapIn atomically points the live name at the freshly built generation, then
+// garbage-collects all but the two newest generations.
+//
+// The IMMEDIATELY PREVIOUS generation is deliberately kept: a reader that
+// resolved the symlink just before the swap is still walking that tree, and
+// deleting it re-opens the went-dark window one path-resolution step later.
+// It is reclaimed one deploy from now, by which point any such lookup has long
+// finished.
+func swapIn(orgDir, name, builtDir string) error {
+	live := filepath.Join(orgDir, name)
+
+	tmp := live + ".swap"
+	if err := os.Remove(tmp); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	// Relative target so the org dir can be moved or bind-mounted wholesale.
+	if err := os.Symlink(filepath.Base(builtDir), tmp); err != nil {
+		return err
+	}
+
+	// A live path that is still a REAL directory (the pre-symlink layout, or a
+	// first materialize racing nothing) cannot be renamed over. Clearing it
+	// here is a one-time upgrade cost, not the per-deploy behavior.
+	if st, err := os.Lstat(live); err == nil && st.Mode()&os.ModeSymlink == 0 {
+		if err := os.RemoveAll(live); err != nil {
+			return err
+		}
+	}
+	if err := os.Rename(tmp, live); err != nil {
+		return err
+	}
+
+	newest := maxGeneration(orgDir, name)
+	entries, err := os.ReadDir(orgDir)
+	if err != nil {
+		return err
+	}
+	for _, e := range entries {
+		if n, ok := parseGeneration(e.Name(), name); ok && n < newest-1 {
+			if err := os.RemoveAll(filepath.Join(orgDir, e.Name())); err != nil {
+				return err
+			}
 		}
 	}
 	return nil

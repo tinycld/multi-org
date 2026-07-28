@@ -84,11 +84,19 @@ func envInt(key string, def int) int {
 }
 
 func (s *linuxSpawner) Spawn(ctx context.Context, req SpawnRequest, log *slog.Logger) (Process, error) {
+	// Every confinement mechanism below needs root: namespace creation wants
+	// CAP_SYS_ADMIN in the parent user namespace, and the uid window maps
+	// arbitrary host uids, which an unprivileged user namespace cannot.
+	// NewSpawner already warned that a non-root host runs tenants UNCONFINED;
+	// gating here is what makes that degraded mode actually work instead of
+	// every spawn failing clone(2) with EPERM — every org 503ing.
+	root := os.Geteuid() == 0
+
 	// The child remounts its own namespace before serving: Go cannot run code
 	// between fork and exec, so the confinement steps that must happen inside
 	// the new mount namespace are done by serve-org itself at startup. See
 	// cmd/serve-org's --confine-packages handling.
-	req.ConfinePackages = s.conf.UIDBase > 0 && s.conf.UIDRange > 0
+	req.ConfinePackages = root && s.conf.UIDBase > 0 && s.conf.UIDRange > 0
 
 	cmd := buildCmd(ctx, req, log)
 
@@ -98,10 +106,12 @@ func (s *linuxSpawner) Spawn(ctx context.Context, req SpawnRequest, log *slog.Lo
 	// are invisible to the host and to every other tenant. CLONE_NEWPID hides
 	// other processes: the tenant cannot signal or inspect anything outside
 	// itself, and killing its PID 1 reaps the whole tree.
-	attr.Cloneflags |= syscall.CLONE_NEWNS | syscall.CLONE_NEWPID
-	attr.Unshareflags |= syscall.CLONE_NEWNS
+	if root {
+		attr.Cloneflags |= syscall.CLONE_NEWNS | syscall.CLONE_NEWPID
+		attr.Unshareflags |= syscall.CLONE_NEWNS
+	}
 
-	if s.conf.UIDBase > 0 && s.conf.UIDRange > 0 {
+	if root && s.conf.UIDBase > 0 && s.conf.UIDRange > 0 {
 		uid := tenantUID(req.Slug, s.conf.UIDBase, s.conf.UIDRange)
 		// The child has to remount the package store read-only inside its own
 		// mount namespace (see cmd/serve-org --confine-packages), and mount(2)

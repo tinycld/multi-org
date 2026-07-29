@@ -552,10 +552,10 @@ func (m *OrgManager) socketPaths(slug string, withMail bool) (orgSockets, error)
 	runDir := filepath.Join(m.cfg.Root, "run")
 	primaryDir := filepath.Join(runDir, slug)
 	if len(filepath.Join(primaryDir, longestBase(slug+".sock"))) <= maxSocketPath {
-		if err := os.MkdirAll(runDir, 0o711); err != nil {
+		if err := secureRuntimeDir(runDir, 0o711); err != nil {
 			return orgSockets{}, fmt.Errorf("%w: create run dir for %s: %v", orgerr.ErrOrgUnavailable, slug, err)
 		}
-		if err := os.MkdirAll(primaryDir, 0o700); err != nil {
+		if err := secureRuntimeDir(primaryDir, 0o700); err != nil {
 			return orgSockets{}, fmt.Errorf("%w: create socket dir for %s: %v", orgerr.ErrOrgUnavailable, slug, err)
 		}
 		return build(primaryDir, slug+".sock"), nil
@@ -566,19 +566,87 @@ func (m *OrgManager) socketPaths(slug string, withMail bool) (orgSockets, error)
 	// The fallback exists because the primary overran sun_path, so it spends
 	// its budget carefully: the slug appears only as the per-org directory
 	// name and the sockets keep fixed short basenames.
-	digest := sha256.Sum256([]byte(m.cfg.Root))
-	fallbackParent := filepath.Join(os.TempDir(), fmt.Sprintf("mt-%x", digest[:6]))
+	fallbackParent := fallbackSocketParent(m.cfg.Root)
 	fallbackDir := filepath.Join(fallbackParent, slug)
 	if len(filepath.Join(fallbackDir, longestBase("s.sock"))) > maxSocketPath {
 		return orgSockets{}, fmt.Errorf("%w: socket path for %s exceeds %d bytes", orgerr.ErrOrgUnavailable, slug, maxSocketPath)
 	}
-	if err := os.MkdirAll(fallbackParent, 0o711); err != nil {
+	if err := secureRuntimeDir(fallbackParent, 0o711); err != nil {
 		return orgSockets{}, fmt.Errorf("%w: create socket parent dir for %s: %v", orgerr.ErrOrgUnavailable, slug, err)
 	}
-	if err := os.MkdirAll(fallbackDir, 0o700); err != nil {
+	if err := secureRuntimeDir(fallbackDir, 0o700); err != nil {
 		return orgSockets{}, fmt.Errorf("%w: create socket dir for %s: %v", orgerr.ErrOrgUnavailable, slug, err)
 	}
 	return build(fallbackDir, "s.sock"), nil
+}
+
+// runtimeDirRoot is the preferred home for the fallback socket tree: a
+// root-owned directory the host controls, rather than the shared world-writable
+// temp dir. Overridable for tests and for hosts without /run.
+var runtimeDirRoot = "/run/tinycld-mt"
+
+// secureRuntimeDir creates dir with the given mode, or validates it if it
+// already exists, refusing anything we cannot safely chown afterwards.
+//
+// The spawner runs as root and chowns the per-org socket dir to a tenant uid;
+// os.MkdirAll happily accepts a path that already resolves to a directory, and
+// both it and os.Chown follow symlinks. Since the fallback path is derived only
+// from MT_ROOT — predictable to anyone who can read the unit file — an
+// unprivileged local user who wins the race to create it as a symlink gets the
+// target chowned to a tenant uid. /etc is the obvious target.
+//
+// So: never follow a symlink, and never adopt a directory that is writable by
+// anyone but its owner. Failing closed here costs an org its cold start; the
+// alternative costs the host.
+func secureRuntimeDir(dir string, mode os.FileMode) error {
+	st, err := os.Lstat(dir)
+	switch {
+	case os.IsNotExist(err):
+		if err := os.MkdirAll(dir, mode); err != nil {
+			return fmt.Errorf("create runtime dir %s: %w", dir, err)
+		}
+		// MkdirAll honours umask, so set the mode explicitly.
+		if err := os.Chmod(dir, mode); err != nil {
+			return fmt.Errorf("chmod runtime dir %s: %w", dir, err)
+		}
+		return nil
+	case err != nil:
+		return fmt.Errorf("stat runtime dir %s: %w", dir, err)
+	}
+
+	if st.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("runtime dir %s is a symlink; refusing to use it "+
+			"(a chown through it would land on the link target)", dir)
+	}
+	if !st.IsDir() {
+		return fmt.Errorf("runtime dir %s exists and is not a directory", dir)
+	}
+	// Group/other-writable means someone else can swap what lives inside it.
+	if perm := st.Mode().Perm(); perm&0o022 != 0 {
+		return fmt.Errorf("runtime dir %s is group/other-writable (%o); refusing "+
+			"to place tenant sockets there", dir, perm)
+	}
+	if err := os.Chmod(dir, mode); err != nil {
+		return fmt.Errorf("chmod runtime dir %s: %w", dir, err)
+	}
+	return nil
+}
+
+// fallbackSocketParent picks the directory holding the per-org socket dirs when
+// the primary path would overrun sun_path.
+//
+// Preference order is the host-owned runtime root, then the temp dir. The temp
+// dir remains as a fallback-of-the-fallback because a non-root developer host
+// has no writable /run — but it is only ever used through secureRuntimeDir,
+// which refuses a planted or world-writable path.
+func fallbackSocketParent(root string) string {
+	digest := sha256.Sum256([]byte(root))
+	name := fmt.Sprintf("mt-%x", digest[:6])
+
+	if err := secureRuntimeDir(runtimeDirRoot, 0o711); err == nil {
+		return filepath.Join(runtimeDirRoot, name)
+	}
+	return filepath.Join(os.TempDir(), name)
 }
 
 // readyMsg is the single line a tenant writes to its readiness pipe.

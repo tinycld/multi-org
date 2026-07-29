@@ -32,6 +32,13 @@ type fakeSpawner struct {
 	// ignoreSIGTERM makes the child refuse to stop politely, forcing the kill.
 	ignoreSIGTERM bool
 
+	// gate, when non-nil, blocks inside Spawn until it is closed. It opens the
+	// window between "load has started" and "load publishes" so a test can
+	// land an Evict inside it. spawnEntered is closed once Spawn is reached.
+	gate         chan struct{}
+	spawnEntered chan struct{}
+	enteredOnce  sync.Once
+
 	mu      sync.Mutex
 	spawned int
 	procs   []*fakeProcess
@@ -113,6 +120,18 @@ func (f *fakeSpawner) Spawn(ctx context.Context, req SpawnRequest, log *slog.Log
 	}
 
 	f.record(proc)
+
+	// Held open at the very end of Spawn: the child is fully constructed and
+	// serving, but load has not published it yet. That is the window an Evict
+	// must not fall through — and it is only meaningful once there is a real
+	// process to tear down.
+	if f.gate != nil {
+		if f.spawnEntered != nil {
+			f.enteredOnce.Do(func() { close(f.spawnEntered) })
+		}
+		<-f.gate
+	}
+
 	return proc, nil
 }
 

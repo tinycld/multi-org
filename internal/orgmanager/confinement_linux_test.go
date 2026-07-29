@@ -32,6 +32,33 @@ func requireConfinementEnv(t *testing.T) {
 	}
 }
 
+// newTestLinuxSpawner builds the real spawner and records it so tests can ask
+// which uid an org was actually allocated, rather than recomputing the mapping
+// (which would re-encode the allocator's logic into the test that guards it).
+func newTestLinuxSpawner(conf LinuxConfinement) *linuxSpawner {
+	s := &linuxSpawner{conf: conf, uids: newUIDAllocator(conf.UIDBase, conf.UIDRange)}
+	lastTestSpawner = s
+	return s
+}
+
+var lastTestSpawner *linuxSpawner
+
+// assignedUID reports the uid the spawner allocated for a slug that has already
+// been spawned.
+func assignedUID(t *testing.T, slug string) int {
+	t.Helper()
+	if lastTestSpawner == nil {
+		t.Fatal("no spawner recorded; call newConfinedManager first")
+	}
+	lastTestSpawner.uids.mu.Lock()
+	defer lastTestSpawner.uids.mu.Unlock()
+	uid, ok := lastTestSpawner.uids.bySlug[slug]
+	if !ok {
+		t.Fatalf("no uid allocated for %q", slug)
+	}
+	return uid
+}
+
 // newConfinedManager wires the real Linux spawner with uid separation enabled.
 func newConfinedManager(t *testing.T, orgs map[string]string) *OrgManager {
 	t.Helper()
@@ -67,10 +94,10 @@ func newConfinedManager(t *testing.T, orgs map[string]string) *OrgManager {
 	mgr := New(Config{
 		Root:  root,
 		Store: s,
-		Spawner: &linuxSpawner{conf: LinuxConfinement{
+		Spawner: newTestLinuxSpawner(LinuxConfinement{
 			UIDBase:  60000,
 			UIDRange: 500,
-		}},
+		}),
 		TenantBinary: bin,
 		Logger:       quietLogger(),
 		HooksPool:    2,
@@ -153,7 +180,7 @@ func TestConfinement_TenantsRunAsDistinctNonRootUIDs(t *testing.T) {
 	if hostUID == 0 {
 		t.Fatal("tenant is running as host root")
 	}
-	if want := uint32(tenantUID("alpha", 60000, 500)); hostUID != want {
+	if want := uint32(assignedUID(t, "alpha")); hostUID != want {
 		t.Fatalf("tenant host uid = %d, want %d", hostUID, want)
 	}
 }
@@ -191,7 +218,7 @@ func TestConfinement_PackageStoreIsReadOnly(t *testing.T) {
 		t.Fatalf("package store layout changed; probe target missing: %v", err)
 	}
 
-	uid := tenantUID("writer", 60000, 500)
+	uid := assignedUID(t, "writer")
 	script := fmt.Sprintf("echo pwned > %s", target)
 
 	if err := runInMountNS(t, inst.proc.Pid(), uid, script); err == nil {
@@ -248,10 +275,12 @@ func TestConfinement_SocketDirIsPerOrg(t *testing.T) {
 		t.Fatalf("beta: %v", err)
 	}
 
-	uidAlpha := tenantUID("alpha", 60000, 500)
-	uidBeta := tenantUID("beta", 60000, 500)
+	// Distinctness is the allocator's contract, not a property of these two
+	// particular slugs — assert it directly.
+	uidAlpha := assignedUID(t, "alpha")
+	uidBeta := assignedUID(t, "beta")
 	if uidAlpha == uidBeta {
-		t.Fatalf("test slugs hash to the same uid (%d); pick different slugs", uidAlpha)
+		t.Fatalf("alpha and beta share uid %d; the tenant boundary is gone for that pair", uidAlpha)
 	}
 
 	alphaDir := filepath.Dir(alpha.sockPath)

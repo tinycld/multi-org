@@ -5,7 +5,6 @@ package orgmanager
 import (
 	"context"
 	"fmt"
-	"hash/fnv"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -36,25 +35,24 @@ type LinuxConfinement struct {
 	Limits TenantLimits
 }
 
-// tenantUID maps a slug into the configured uid window.
-//
-// Hashing rather than allocating sequentially keeps the mapping stable across
-// host restarts with no persisted state, which matters because the tenant's
-// pb_data files on disk are owned by that uid. Collisions are possible and
-// benign for isolation between *most* pairs but not all — with a range well
-// above the org count they are rare, and an operator wanting guaranteed
-// distinctness should widen UIDRange.
-func tenantUID(slug string, base, span int) int {
-	h := fnv.New32a()
-	_, _ = h.Write([]byte(slug))
-	return base + int(h.Sum32()%uint32(span))
-}
-
 // linuxSpawner runs each tenant confined: its own uid, its own mount and PID
 // namespaces, and a cgroup. This is the security boundary the whole
 // per-process model exists to establish.
 type linuxSpawner struct {
 	conf LinuxConfinement
+	uids *uidAllocator
+}
+
+// tenantUID returns the org's host uid, adopting the ownership its org dir
+// already carries so a restarted host does not reallocate underneath files
+// chownTree wrote under the previous uid.
+func (s *linuxSpawner) tenantUID(slug, orgDir string) (int, error) {
+	if st, err := os.Stat(orgDir); err == nil {
+		if sys, ok := st.Sys().(*syscall.Stat_t); ok && sys.Uid != 0 {
+			s.uids.adopt(slug, int(sys.Uid))
+		}
+	}
+	return s.uids.uidFor(slug)
 }
 
 // NewSpawner returns the Linux tenant spawner, reading confinement settings
@@ -78,7 +76,7 @@ func NewSpawner(log *slog.Logger) Spawner {
 		log.Warn(msg)
 	}
 
-	return &linuxSpawner{conf: conf}
+	return &linuxSpawner{conf: conf, uids: newUIDAllocator(conf.UIDBase, conf.UIDRange)}
 }
 
 func envInt(key string, def int) int {
@@ -122,7 +120,13 @@ func (s *linuxSpawner) Spawn(ctx context.Context, req SpawnRequest, log *slog.Lo
 	}
 
 	if root && s.conf.UIDBase > 0 && s.conf.UIDRange > 0 {
-		uid := tenantUID(req.Slug, s.conf.UIDBase, s.conf.UIDRange)
+		// A uid the allocator cannot hand out safely means the boundary cannot
+		// be established, so the tenant must not start: booting it inside
+		// another org's uid is the one outcome worse than being unavailable.
+		uid, err := s.tenantUID(req.Slug, req.OrgDir)
+		if err != nil {
+			return nil, fmt.Errorf("assign tenant uid for %s: %w", req.Slug, err)
+		}
 		// The child has to remount the package store read-only inside its own
 		// mount namespace (see cmd/serve-org --confine-packages), and mount(2)
 		// needs CAP_SYS_ADMIN over that namespace — which a process that has

@@ -163,6 +163,14 @@ type OrgManager struct {
 	closed   bool
 	stop     chan struct{}
 	stopOnce sync.Once
+
+	// evictEpoch counts evictions per slug. An in-flight load captures the
+	// value before it spawns and re-checks it before publishing: if an Evict
+	// landed in between, the instance it just built is already stale and must
+	// be torn down rather than published. Without this an Evict racing a cold
+	// start matches nothing in `orgs` and is silently dropped, leaving a
+	// suspended or redeployed org serving from the pre-evict generation.
+	evictEpoch map[string]uint64
 }
 
 func nowNanos() int64 { return time.Now().UnixNano() }
@@ -178,10 +186,11 @@ func New(cfg Config) *OrgManager {
 		cfg.Spawner = NewSpawner(cfg.Logger)
 	}
 	m := &OrgManager{
-		cfg:     cfg,
-		orgs:    map[string]*OrgInstance{},
-		crashes: map[string]*crashState{},
-		stop:    make(chan struct{}),
+		cfg:        cfg,
+		orgs:       map[string]*OrgInstance{},
+		crashes:    map[string]*crashState{},
+		evictEpoch: map[string]uint64{},
+		stop:       make(chan struct{}),
 	}
 	if cfg.MaxIdle > 0 {
 		go m.sweep()
@@ -232,6 +241,13 @@ func (m *OrgManager) Get(ctx context.Context, slug string) (*OrgInstance, error)
 }
 
 func (m *OrgManager) load(ctx context.Context, slug string) (*OrgInstance, error) {
+	// Captured before any work: anything this load observes about the org
+	// (status, lockfile, materialized packages) is only valid so long as no
+	// Evict has intervened by the time we publish.
+	m.mu.RLock()
+	startEpoch := m.evictEpoch[slug]
+	m.mu.RUnlock()
+
 	rec, ok := m.cfg.LookupOrg(slug)
 	if !ok {
 		return nil, fmt.Errorf("%w: %q", orgerr.ErrOrgNotFound, slug)
@@ -246,6 +262,13 @@ func (m *OrgManager) load(ctx context.Context, slug string) (*OrgInstance, error
 	}
 
 	orgDir := filepath.Join(m.cfg.Root, "pb_orgs", slug)
+
+	// Before materialize, so the Linux spawner's chownTree walk picks the
+	// directory up and hands it to the tenant uid along with everything else.
+	if err := ensureTenantDirs(orgDir); err != nil {
+		return nil, fmt.Errorf("%w: prepare runtime dirs for %s: %w",
+			orgerr.ErrOrgUnavailable, slug, err)
+	}
 
 	lf, err := lockfile.Parse(rec.Lockfile)
 	if err != nil {
@@ -312,6 +335,16 @@ func (m *OrgManager) load(ctx context.Context, slug string) (*OrgInstance, error
 		m.mu.Unlock()
 		go inst.shutdown(drainTimeout, killTimeout)
 		return nil, fmt.Errorf("manager shut down while loading org %q", slug)
+	}
+	if m.evictEpoch[slug] != startEpoch {
+		// Suspend, archive, or deploy landed while this instance was starting.
+		// It was built from the pre-evict record, so publishing it would keep
+		// serving exactly what the operator just revoked. Tear it down and let
+		// the next Get build a fresh one from the current record.
+		m.mu.Unlock()
+		go inst.shutdown(drainTimeout, killTimeout)
+		return nil, fmt.Errorf("%w: %q was evicted while starting",
+			orgerr.ErrOrgUnavailable, slug)
 	}
 	m.orgs[slug] = inst
 	m.mu.Unlock()
@@ -940,6 +973,10 @@ func (m *OrgManager) writeCalDAVConfig(orgDir string, resolved []lockfile.Resolv
 // loop; blocking either on a full drain would be user-visible for no benefit.
 func (m *OrgManager) Evict(slug string) {
 	m.mu.Lock()
+	// Bumped unconditionally, including when nothing is resident: the whole
+	// point is to catch a load that has started but not yet published, which
+	// by definition is not in the map yet.
+	m.evictEpoch[slug]++
 	inst, ok := m.orgs[slug]
 	if ok {
 		delete(m.orgs, slug)

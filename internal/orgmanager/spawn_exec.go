@@ -52,6 +52,34 @@ func (p *execProcess) Kill() error {
 	return nil
 }
 
+// tenantTmpDir is the temp directory handed to the child as $TMPDIR.
+//
+// It must live inside the org dir rather than the host's shared /tmp: the
+// tenant spools in-flight uploads and rereadable request bodies here, and a
+// shared directory would put one org's upload bytes where another org's uid
+// can reach them (and let a basename collision swap them outright).
+func tenantTmpDir(orgDir string) string {
+	return filepath.Join(orgDir, "tmp")
+}
+
+// ensureTenantDirs creates the runtime directories the child expects to exist
+// but never creates for itself.
+//
+// $TMPDIR is the one that bites: Go's os.TempDir() returns the variable without
+// checking it, so a missing directory produces no startup error — it surfaces
+// much later as ENOENT from os.CreateTemp inside PocketBase's multipart
+// handling, i.e. an opaque 500 on every upload past the 16MB in-memory
+// threshold. Called on every load, not just at provisioning, so orgs created
+// before this existed heal on their next cold start.
+func ensureTenantDirs(orgDir string) error {
+	// 0700: the tenant uid owns this after chownTree, and nothing else has
+	// any business reading uploads in flight.
+	if err := os.MkdirAll(tenantTmpDir(orgDir), 0o700); err != nil {
+		return fmt.Errorf("create tenant tmp dir: %w", err)
+	}
+	return nil
+}
+
 // buildCmd assembles the argv, environment, and fd wiring shared by every
 // platform. The Linux spawner layers confinement on top of what this returns.
 //
@@ -109,7 +137,7 @@ func buildCmd(req SpawnRequest, log *slog.Logger) *exec.Cmd {
 	// re-enter through the surfaces you kept.
 	cmd.Env = []string{
 		"HOME=" + req.OrgDir,
-		"TMPDIR=" + filepath.Join(req.OrgDir, "tmp"),
+		"TMPDIR=" + tenantTmpDir(req.OrgDir),
 		"PATH=/usr/bin:/bin",
 	}
 

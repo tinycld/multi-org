@@ -8,8 +8,9 @@ renamed, the DeleteAccountModal and disabled-mailbox decisions made, mailproto
 gained its injected-listener seam, and the upstream branches are pushed.
 **Later the same day the router-side IMAP/SMTP demux/handoff shipped too**
 (`internal/mailrouter` + `org_mail_domains` + per-org mail sockets — see the
-protocol-servers entry in §6). What remains open in §6 is only the solver's
-target-manifest re-check follow-up.)
+protocol-servers entry in §6). The last §6 item — the solver's target-manifest
+re-check — closed the same day (`verifyTargetPeerVersions`, post-assemble in
+the rebuild; see the version-pin entry). **Nothing in §6 remains open.**)
 **Goal:** one router hosts many organizations — each org its own **OS process**,
 SQLite DB, client bundle, and server-side JS, sharing versioned code on disk but
 isolated at the kernel boundary.
@@ -693,11 +694,25 @@ skill when core's version line moves. Enforcement landed in BOTH places:
   (`checkVersionChangeCompat`, shared solve with the check endpoint) — before
   this the UI check was advisory-only and a direct POST bypassed it, so
   `docs/packages.md`'s "authoritatively on the server" claim was false.
-  **Remaining follow-up:** both gates resolve peerVersions from the
+  ~~**Remaining follow-up:** both gates resolve peerVersions from the
   currently-installed manifests; a target version that TIGHTENS its own
-  requirements isn't re-checked from the freshly-fetched target manifest
-  (`verifyTargetPeerVersions` in pkg_compat.go's header is documented as a
-  follow-up, not implemented).
+  requirements isn't re-checked from the freshly-fetched target manifest.~~
+  **CLOSED (2026-07-28)** — `verifyTargetPeerVersions` (pkg_compat.go) is now
+  implemented and wired as the rebuild's post-assemble `verifyCompat` step:
+  after assemble fetches the real files, the solve re-runs against the
+  manifests ON DISK in the build dir (base version from the nested
+  core/package.json), refusing before the build pipeline — the build dir is
+  discarded and live state is untouched (the failure precedes the DB backup).
+  This also gates UNINSTALL, which previously ran no compat solve at all — a
+  package another member's peerVersions requires can no longer be removed out
+  from under it. An unreadable member manifest fails closed. Red-first tests:
+  tightened-target refusal (with decoy versions proving disk is read, not the
+  delta), missing-peer refusal, fail-closed parse, orchestrator ordering
+  (verify between assemble and pipeline; no backup/restore on refusal), and a
+  production-wiring test against `productionRebuildDeps` (extracted from
+  `rebuild()` for exactly that falsifiability) — the wiring test and the
+  checker were both verified red by neutering. The UI check endpoint remains
+  installed-manifest-based (advisory; documented in pkg_compat.go's header).
 
 *App-shell de-org — DONE (2026-07-26).* The follow-up pass fixed four more live
 bugs of the same compiler-blind class, all found only by reading against the
@@ -1494,8 +1509,10 @@ collide on ports — §5.3); every e2e finding above is from reading the specs.
 > injected-listener seam, and the upstream branches are pushed. **The
 > router-side IMAP/SMTP demux + listener handoff then shipped as well**
 > (mailrouter, org_mail_domains, per-org mail sockets — §6 protocol servers).
-> Still open: the solver's target-manifest re-check and the five deliberate
-> biome waivers.
+> The solver's target-manifest re-check closed 2026-07-28
+> (`verifyTargetPeerVersions` — see the version-pin entry in §6), leaving only
+> the five deliberate biome waivers, which are a recorded decision, not open
+> work.
 
 The original list, kept for the review record:
 

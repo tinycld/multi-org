@@ -263,13 +263,6 @@ func (m *OrgManager) load(ctx context.Context, slug string) (*OrgInstance, error
 
 	orgDir := filepath.Join(m.cfg.Root, "pb_orgs", slug)
 
-	// Before materialize, so the Linux spawner's chownTree walk picks the
-	// directory up and hands it to the tenant uid along with everything else.
-	if err := ensureTenantDirs(orgDir); err != nil {
-		return nil, fmt.Errorf("%w: prepare runtime dirs for %s: %w",
-			orgerr.ErrOrgUnavailable, slug, err)
-	}
-
 	lf, err := lockfile.Parse(rec.Lockfile)
 	if err != nil {
 		return nil, fmt.Errorf("lockfile parse for %s: %w", slug, err)
@@ -280,6 +273,15 @@ func (m *OrgManager) load(ctx context.Context, slug string) (*OrgInstance, error
 	}
 	if err := materialize.Materialize(orgDir, resolved); err != nil {
 		return nil, fmt.Errorf("materialize %s: %w", slug, err)
+	}
+
+	// After materialize, never before: materialize is what establishes the org
+	// directory, and creating it early (via MkdirAll on a subpath) changes what
+	// the Linux spawner's chownTree walk finds and breaks tenant startup.
+	// Still before spawn, so chownTree hands this to the tenant uid.
+	if err := ensureTenantDirs(orgDir); err != nil {
+		return nil, fmt.Errorf("%w: prepare runtime dirs for %s: %w",
+			orgerr.ErrOrgUnavailable, slug, err)
 	}
 
 	davConfig, err := m.writeCardDAVConfig(orgDir, resolved)

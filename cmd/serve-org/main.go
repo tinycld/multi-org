@@ -159,6 +159,13 @@ func run(orgDir, socketPath, slug string, hooksPool int, davConfigPath, caldavCo
 		// The start banner is derived from Server.Addr, which is meaningless
 		// for a unix socket.
 		HideStartBanner: true,
+		// This process runs the org's package JS, which is untrusted: $app
+		// stays bound in a sandboxed VM and reaches raw SQL, so ATTACH DATABASE
+		// would be an arbitrary-file read/write primitive covering every other
+		// org's data.db. The uid confinement the router applies is the other
+		// half of this, and neither is sufficient alone — confinement is absent
+		// on developer hosts and when the router runs unprivileged.
+		DBConnect: core.NoAttachDBConnect,
 	})
 
 	// The full shared core composition: guards, invites, account lifecycle,

@@ -2,6 +2,7 @@ package orgmanager
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -57,6 +58,47 @@ func newRealManager(t *testing.T, hookSource string) *OrgManager {
 		}),
 		OrgURL:     func(slug string) string { return "https://" + slug + ".tenants.example.test" },
 		BaseDomain: "tenants.example.test",
+	})
+	t.Cleanup(mgr.Shutdown)
+	return mgr
+}
+
+// newRealMultiOrgManager is newRealManager for cases that need more than one
+// org resident at once — cross-tenant probes, where the whole point is that a
+// second org's data exists on disk beside the first.
+//
+// Unlike newConfinedManager it needs no root and no Linux: the properties it
+// serves are enforced in-process (the database connector), not by the kernel.
+func newRealMultiOrgManager(t *testing.T, orgs map[string]string) *OrgManager {
+	t.Helper()
+	bin := buildTenantBinary(t)
+	root := t.TempDir()
+
+	s := store.New(root)
+	lookup := map[string]OrgRecord{}
+	for slug, hook := range orgs {
+		pkg := "@tinycld/" + slug
+		if err := s.Publish(pkg, "1.0.0", map[string][]byte{
+			"server/main.pb.js":      []byte(hook),
+			"client/dist/index.html": []byte("<html></html>"),
+		}); err != nil {
+			t.Fatal(err)
+		}
+		lookup[slug] = OrgRecord{
+			Slug:     slug,
+			Status:   "active",
+			Lockfile: []byte(fmt.Sprintf(`{%q:"1.0.0"}`, pkg)),
+		}
+	}
+
+	mgr := New(Config{
+		Root:         root,
+		Store:        s,
+		Spawner:      execSpawner{},
+		TenantBinary: bin,
+		Logger:       quietLogger(),
+		HooksPool:    2,
+		LookupOrg:    stubLookup(lookup),
 	})
 	t.Cleanup(mgr.Shutdown)
 	return mgr

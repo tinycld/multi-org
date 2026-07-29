@@ -10,6 +10,17 @@ then by dependency.
 > shipped code/migrations on 2026-07-27 (evidence noted inline). Items left
 > `[ ]` were re-verified as genuinely open, except where noted "unverified".
 
+> **Reconciliation audit — 2026-07-28.** A full second-pass audit re-verified
+> every item against the shipped code and re-derived the §7 coverage mapping
+> from scratch. Result: 60 of 64 items hold with evidence; **two items marked
+> done were not** (P3-6's fix never takes effect; P2-11 closed 1 of its 3
+> defects), **one §7.4 finding had no owner at all** (calendar's self-only
+> member list rule — hidden by a coverage-table misfiling), and two HANDOFF
+> statements were never reconciled (§5.6's phantom golden test, §6's
+> `BeforeOverwrite` gap). See **Phase 7 — Reconciliation findings** and the
+> corrected Coverage check below. Reopened items keep their original text with
+> a `REOPENED` note; the fixes are tracked as R-items.
+
 **How to work this doc.** Phases 0–3 are merge blockers. Each item carries its
 §7 severity, the repo to commit in, and a **Done when** line that names the
 verification — a fix without one is not finished. Check items off in place and
@@ -382,7 +393,7 @@ these is live right now.
   `orgName`/`orgSlug` the handler no longer sends. Either send a deployment name
   or drop the interpolation. Tighten the e2e, which passes on a loose
   `/Welcome to/i`.
-- [x] **P2-11 🟡 Takeout counts dropped records as imported** **DONE — verified 2026-07-27:** skip paths compensate with `{skipped: 1, imported: -1}` (`batch-inserter.ts`). — `takeout`. The
+- [x] **P2-11 🟡 Takeout counts dropped records as imported** ~~DONE — verified 2026-07-27~~ **REOPENED 2026-07-28 → R3, re-closed same day (see R3):** the count compensation is real (`{skipped: 1, imported: -1}`, `batch-inserter.ts`), but the item's other two defects shipped untouched — the `DocumentPicker` promise still has no `.catch` (`lib/takeout-import/index.ts:76-84`, an unhandled rejection), and all ten dedup lookups still `catch { /* not found */ }` on ANY error, so a transient failure still creates duplicates. — `takeout`. The
   two early-return skip paths don't compensate the `imported: 1`, so a failed
   parent calendar reports all its events as imported. Also: the `DocumentPicker`
   promise has no `.catch`, and dedup lookups treat any rejection as "not found"
@@ -398,7 +409,7 @@ these is live right now.
   `useSendEmail` sibling does); `useAttachments` toasts without capturing;
   `useMailBulkActions` has no `onError` at all, so a bulk action failing across N
   threads is silent.
-- [x] **P2-15 ⚪ Silent-failure residue elsewhere** **DONE 2026-07-27:** `use-share-visitor-role` narrows the bare catch to 404 and captures everything else; `ShareDialog` no longer closes on a failed share-save — it captures, shows an inline error, and keeps the pending list so Done can be retried. **Phase 2 is now complete.** — `tinycld` (core), `drive`.
+- [x] **P2-15 ⚪ Silent-failure residue elsewhere** **DONE 2026-07-27:** `use-share-visitor-role` narrows the bare catch to 404 and captures everything else; `ShareDialog` no longer closes on a failed share-save — it captures, shows an inline error, and keeps the pending list so Done can be retried. ~~Phase 2 is now complete.~~ *(P2-11 reopened 2026-07-28 → R3, re-closed same day.)* — `tinycld` (core), `drive`.
   `use-share-visitor-role.tsx:92-95` still has the bare `catch { return null }`
   that *hid* the original bug — narrow it to a 404 and capture otherwise.
   `ShareDialog.tsx:181` swallows a failed share-save and closes as if it worked.
@@ -438,6 +449,12 @@ a second person, since it barely touches the same lines.
   the migration so drift is impossible.
   **Done when:** for each suite, neutering the guard in the migration turns
   deny-tests red while controls stay green. Verify by actually neutering.
+  > **Straggler found 2026-07-28 → R4.** The original seven-suite list included
+  > calendar `calendar_members_authz_test.go`, which the DONE note silently
+  > dropped from both the converted set and the endorsed keepers. It still
+  > hand-declares `calMembersUpdateRule` (`:38`) and applies it to the fixture
+  > itself, and its `|| (user = @request.auth.id)` self-clause appears in no
+  > shipped migration and is checked by no drift guard.
 - [x] **P3-2 🟡 mail's inbound fixture declares a schema that does not exist** **DONE 2026-07-27:** fixture fields renamed `user_org`→`user` (matching migration `1713000000`); `assertThreadStateInInbox` added to `_KnownRecipientStoresMessage` + `_IdempotentRetry`, confirmed red against the phantom fixture before the rename. —
   `mail`. The sharpest instance in the review: the fixture declares
   `mail_mailbox_members.user_org` and `mail_thread_state.user_org` while
@@ -500,7 +517,7 @@ a second person, since it barely touches the same lines.
   package passes the whole suite. Current field names were hand-verified correct,
   so this is a guard gap, not live drift. Extend the field-name assertion to
   every mirrored collection.
-- [x] **P3-6 🟡 `package-scripts` tests never run** **DONE — verified 2026-07-27:** workspace `vitest.config.ts` globs `package-scripts/tests/**/*.test.{ts,tsx}`. — `tinycld`. 12 tests
+- [x] **P3-6 🟡 `package-scripts` tests never run** ~~DONE — verified 2026-07-27~~ **REOPENED 2026-07-28 → R2, re-closed same day (see R2). The original fix never took effect.** The glob was added to the WORKSPACE-ROOT `vitest.config.ts`, whose root has no `package-scripts/` dir (the tests live at `tinycld/package-scripts/tests/`) — `npx vitest list` from the root still collects 1 file / 3 tests, the exact green-while-running-nothing symptom this item describes. The stale `CORE_DIR` alias is likewise unfixed (points at root `core/`, which holds only `types/`). This is the plan's own fixture-trap lesson applied to a checkbox: the DONE note verified the glob string exists, not that it matches anything. — `tinycld`. 12 tests
   orphaned from every runner: the workspace-root vitest globs point at paths that
   no longer exist, so a root run collects 1 file and reports green. They pass
   when forced. Fix the globs and the stale `CORE_DIR` alias.
@@ -599,7 +616,7 @@ Nothing here is a merge blocker. Grouped so one person can take a cluster.
 - [x] **P4-11 ⚪ No network namespace** **DONE 2026-07-27 — resolved as "correct the docs", recorded as a deliberate decision:** tenants make legitimate outbound connections (calendar ICS subscription fetches, mail provider APIs, Sentry), so `CLONE_NEWNET` without veth/NAT plumbing would break shipped features for no boundary gain — `$http` is withheld by the sandbox and the DB/filesystem boundary doesn't depend on the network. README diagram fixed (mount+pid ns, no netns) and the decision documented in its security section; per-tenant egress policy, if ever wanted, is an operator firewall concern. The README pass also fixed the P6-3 items in the same file: per-org socket path, CardDAV-only descriptions of davconfig/serve-org, the already-fixed reserved-slugs bullet, the stale "no CI" section, and the fork replace path (now the vendored `../tinycld/third_party/pocketbase`). P6-3 is thereby closed too.
 
 *Feature performance* — `mail`
-- [x] **P4-12 🟡 JS-stitched joins.** **DONE 2026-07-27** (mail `5167742`): `useMailboxes`, `useSendableIdentities` and the settings screen's `useMailboxData` each resolve membership → mailbox → domain (→ aliases, left-joined) in ONE query expression; remaining Maps are per-mailbox grouping, not relation stitching. The settings screen also sheds its first-domain-only artifact (mailboxes on every configured domain now list). New `useMailboxHooks.mount.test.tsx` mounts the real hooks over real TanStack DB collections so the joins and the user predicate actually execute — verified red by neutering the predicate, which also caught the first fixture draft being insensitive (a personal-typed decoy hides behind splitMailboxes' find-first; the decoy must be shared-typed). Mailbox admin + compose e2e green. `flattenSendableIdentities` → `groupSendableIdentities` (joined-row grouping); `splitMailboxes` narrowed to the pure split/sort.
+- [x] **P4-12 🟡 JS-stitched joins.** **DONE 2026-07-27** (mail `5167742`): `useMailboxes` and `useSendableIdentities` each resolve membership → mailbox → domain (→ aliases, left-joined) in ONE query expression; the settings screen's `useMailboxData` (admin view: every mailbox, not the caller's) resolves relations in join expressions across its queries rather than Map-stitching, with only per-mailbox grouping Maps remaining. *(Correction 2026-07-28: the earlier "each ... in ONE query" wording overstated the third hook.)* Cosmetic residue → R8: `flattenSendableIdentities.ts` kept its filename after its export was renamed `groupSendableIdentities`. The settings screen also sheds its first-domain-only artifact (mailboxes on every configured domain now list). New `useMailboxHooks.mount.test.tsx` mounts the real hooks over real TanStack DB collections so the joins and the user predicate actually execute — verified red by neutering the predicate, which also caught the first fixture draft being insensitive (a personal-typed decoy hides behind splitMailboxes' find-first; the decoy must be shared-typed). Mailbox admin + compose e2e green. `flattenSendableIdentities` → `groupSendableIdentities` (joined-row grouping); `splitMailboxes` narrowed to the pure split/sort.
 - [x] **P4-13 ⚪ Residual N+1s** **DONE 2026-07-27** (mail `e067b59`): IMAP Login batches mailbox+domain resolution into two `FindRecordsByIds` lookups; the Text-search thread arm maps FTS thread matches to messages in one thread-IN-subquery statement (no per-match query, no IN-expansion limit); `handleUserDeleted` probes memberships with one DISTINCT query — and on a query error now sweeps NOTHING, where the old per-mailbox error path DELETED the mailbox on unknown state. Sweep gained its first test (membered kept / memberless personal swept / shared untouched). Full mail Go suite + all 8 IMAP e2e specs green. **Phase 4 is now complete.**
 
 ---
@@ -750,6 +767,13 @@ Low risk, high readability value. Safe to hand to a fresh pair of hands.
   an org-context race the synchronous shims made impossible were also fixed,
   along with calc's mislabeled `RejectsItemIDMismatch` test comment + dead
   `_ = itemID`.
+  > **Residue found 2026-07-28 → R5.** The "all inventoried live-voice sites"
+  > claim over-reached: drive's `ShareDialog` chain still ships a
+  > `currentUserOrgId` prop (~10 sites; its value is a plain user id —
+  > `use-share-data.ts:98` returns `currentUserOrgId: userId`), three drive
+  > tests key fixtures on `ownerUserOrgId: 'uo1'`, and text's tests carry live
+  > `userOrgID` loop variables plus present-tense "expects `user_org` in
+  > production" comments in three Go test files.
 - [x] **P6-7 Duplication worth lifting.** **DONE 2026-07-28** (tinycld
   `fbe1069`, text `4240a54`, calc `2e8977b`, multi-org `7e0d40a`). The ordering
   bug was real and RED-FIRST:
@@ -800,22 +824,196 @@ Low risk, high readability value. Safe to hand to a fresh pair of hands.
 
 ---
 
+## Phase 7 — Reconciliation findings (2026-07-28 second-pass audit)
+
+The audit that produced this phase re-verified all 64 items against the shipped
+code (60 held with file:line evidence) and re-derived the §7 coverage mapping
+from scratch. These are the items that fell out. R1–R4 are the substance; R5–R8
+are residue and doc truth.
+
+- [x] **R1 🟠 Calendar "Shared with" cannot list other members** **DONE
+  2026-07-28:** migration `1830000007_members_visible_to_calendar_members.js`
+  (list/view = `enabled && viaMember`, down restores self-only). Red-first:
+  four new rlstest cases in `member_share_rls_test.go` (owner-lists-added-
+  member, member-lists-co-members, owner-views-row, shipped-rule clause) all
+  failed at HEAD showing exactly one self row; outsider-lists-nothing control
+  green throughout. The sharing e2e now reloads and asserts the owner sees the
+  SHAREE's member row — the assertion the old spec conspicuously lacked; it
+  failed against the pre-migration server (reproducing the bug live, and also
+  catching that `packages:generate` must run for a new migration to reach the
+  per-file symlink tree) and passes now. Full calendar Go suite + all 3
+  sharing e2e tests green. — `calendar`.
+  The one §7.4 finding that reached "all items closed" with **no owner**
+  (§7.4: "calendar's member list/delete rules are self-only, `1715000000:265-271`").
+  The coverage table's misfiled P1-4 made the §7.4 count appear to close over
+  it. Still live: `1830000004` set `calendar_members.listRule/viewRule` to
+  `enabled && user = @request.auth.id` and `1830000006` fixed only
+  `createRule`; no Go hook widens listing, and pbtsdb populates the local
+  collection through the list rule. So an owner who adds a teammate sees the
+  row only optimistically — after a reload, "Shared with" shows just their own
+  row, and there is no row to remove the teammate from (`deleteRule` DID gain
+  `viaOwner`, but the UI can't reach it). The sharing e2e passes because it
+  verifies membership via the **sharee's** CalDAV PROPFIND and only ever
+  asserts the owner's own row — precisely what §7.4 predicted.
+  **Decision (D4): membership rows are visible to every member of that
+  calendar.** New migration (`1830000007`) sets list/view to
+  `enabled && calendar.calendar_members_via_calendar.user ?= @request.auth.id`
+  — the same back-relation shape `1830000006` settled for create. Owners need
+  the full list to manage sharing; co-members seeing who else has access is
+  the standard product shape and reveals only `(calendar, user, role, color)`.
+  **Done when:** rlstest cases fail against `HEAD` — owner lists the added
+  member, a non-owner member lists co-members, an outsider still lists
+  nothing (control) — the tenant drift guard pins the new clause, and the
+  sharing e2e asserts the owner sees the **sharee's** member row after a
+  reload (the assertion shape today's spec conspicuously lacks).
+- [x] **R2 🟡 P3-6 reopened — `package-scripts` tests still orphaned** **DONE
+  2026-07-28:** the glob now lives in `tinycld/vitest.config.ts` (whose root
+  contains `package-scripts/`) — the app shell's member run collects 600 tests
+  (588 + the 12), green. The workspace-root config adopted the bootstrap
+  template's corrected `CORE_DIR`/paths, then BOTH were narrowed to what the
+  root owns (`tests/**` + the package-scripts glob): the template's
+  `tinycld/core/**` globs ran core's suite without the app-shell config's
+  stubs (`app-updater` etc.) and failed on collect — root `npx vitest` now
+  runs 15/15 green instead of erroring or vacuously collecting 1 file. —
+  `tinycld` (+ workspace root, + bootstrap template). See P3-6's REOPENED note
+  for the diagnosis. Fix where the tests actually live: glob
+  `package-scripts/tests/**` from `tinycld/vitest.config.ts` (whose root
+  contains `package-scripts/`), repair or remove the workspace-root config's
+  dead `core/**`/`package-scripts/**` globs and stale `CORE_DIR` alias, and
+  correct the bootstrap workspace template so fresh assemblies don't re-mint
+  the dead glob. **Done when:** a vitest list from the config that claims them
+  shows the 12 tests collected, and they pass.
+- [x] **R3 🟡 P2-11 reopened — takeout's other two defects** **DONE
+  2026-07-28:** `DocumentPicker` chain gained `.catch` → `captureException
+  ('takeout-pick')`; all ten dedup catches narrowed via `isNotFound` (status
+  404 only — anything else rethrows into `insertRecords`' error accounting).
+  `batch-inserter-dedup-errors.test.ts` red-first (500 and status-less
+  rejections: no create, error surfaced — both failed pre-fix by stash; 404
+  control creates). The schema suite's recording pb now rejects with a
+  404-shaped error, which the narrowing itself forced — a plain `Error` no
+  longer reads as "not found". Member check green. — `takeout`. See
+  P2-11's REOPENED note. Add `.catch` + `captureException` to the
+  `DocumentPicker` promise; narrow the ten bare dedup `catch` blocks to
+  404-only ("not found → create") and rethrow anything else so a transient
+  error fails the row visibly instead of minting a duplicate. **Done when:** a
+  unit test forcing a non-404 dedup failure asserts no create happens and the
+  error surfaces; a 404 still proceeds to create (control). Must fail against
+  `HEAD`.
+- [x] **R4 🟡 P3-1 straggler — `calendar_members_authz_test.go`** **DONE
+  2026-07-28 — kept, reframed as a deliberate fixture; new drift guard.** The
+  suite legitimately tests the Go guard (defence-in-depth), which is
+  UNREACHABLE behind the shipped owner-only updateRule — so the permissive
+  pre-`1830000004` rule is applied on purpose, renamed
+  `permissiveSelfUpdateRule` with a header saying exactly that (a fixture
+  choice, not a mirror claim). What was missing shipped-side:
+  `tenant_rules_authz_test.go` now also asserts the ABSENCE of the
+  self-update clause on `calendar_members.update` — the takeover opening
+  `1830000004` closed had no tripwire against returning. — `calendar`.
+  See P3-1's straggler note. Convert the suite to the shipped rules via
+  `rlstest`, or delete it if `member_share_rls_test.go` +
+  `tenant_rules_authz_test.go` already cover every behavior it asserts —
+  whichever it is, no hand-declared rule constant survives outside the two
+  endorsed keepers (mail, core caldav).
+- [x] **R5 ⚪ P6-6 residue — live-voice `userOrg` identifiers** **DONE
+  2026-07-28:** drive's ShareDialog chain `currentUserOrgId` → `currentUserId`
+  (dialog + Connected + `use-share-data`); the three test fixtures' dead
+  `ownerUserOrgId: 'uo1'` key (excess-property check was disabled by the
+  `...opts` spread, so the REQUIRED `ownerUserId` was silently undefined at
+  runtime) → `ownerUserId: 'u1'`; text's spec vars `userOrgID`/
+  `distinctUserOrgIDs` renamed, the three Go test files' present-tense
+  `user_org` comments corrected, `uo-*` fixture ids de-orged, and the stale
+  `user_org_resolver_test.go` reference repointed at `authorship_cache_test.go`
+  (the resolver is gone — identity comes from `conn.AuthID()`). Drive + text
+  checks green; residue grep clean. — `drive`,
+  `text`. See P6-6's residue note for the inventory. Rename
+  `currentUserOrgId` → `currentUserId` through the ShareDialog chain,
+  `ownerUserOrgId` fixture keys → `ownerUserId`, text's `userOrgID` loop
+  variables, and fix the three Go test files' present-tense `user_org`
+  comments. **Done when:** a live-voice grep over drive + text matches only
+  historical/negating references, and checks stay green.
+- [x] **R6 ⚪ HANDOFF §5.6 claims a golden test that does not exist** **DONE
+  2026-07-28 — the test was written, making the claim true** (preferred over
+  editing the claim): paired golden tests with the same fixture and
+  byte-identical expected output — router
+  `internal/controlplane/transpile_golden_test.go` and fork
+  `plugins/jsvm/transform_golden_test.go` — each referencing the other, both
+  green (both repos pin esbuild v0.28.1; an option change or lone version
+  bump on either side turns that side red). §5.6 and the §7.5 finding
+  updated. —
+  `multi-org` + `tinycld` (fork). §5.6 says the two esbuild call sites (fork
+  `transformSource`, router `transpileForStore`) are "kept in sync by a golden
+  test"; §7.5 itself records that no such test exists. Make the claim true —
+  paired golden tests, same fixture in both repos, byte-identical expected
+  output, so divergence turns one side red — or correct §5.6 to state
+  sync-by-inspection. Assess the call sites first; prefer the test.
+- [x] **R7 ⚪ Tenant `BeforeOverwrite` gap is open but untracked** **DONE
+  2026-07-28 — the seam was added (closed for real, not just recorded):**
+  `webdav.RegisterSourceHooks(app, slug, hooks)` (app-store registry;
+  `NewFileSystem` adopts onto the matching materialized Source; explicit
+  source hooks win) + drive's `RegisterTenant` registers the now-shared
+  `driveWebDAVHooks` — RegisterExtras runs before the sources mount, so the
+  ordering is built in. Red-first: two core webdav tests (materialized-shaped
+  source adopts; explicit beats registered — failed to compile at HEAD, the
+  seam didn't exist) and a drive composition test verified red by neutering
+  the one-line wiring. The three stale comments (webdav `source.go`, drive
+  `register.go`, router `davconfig/webdav.go`) and HANDOFF §6 now record the
+  closed state. — `multi-org`
+  + `tinycld` (core) + `drive`. §6 records it in present tense ("Remaining
+  gap, small"), no plan item owns it, yet HANDOFF's header now claims
+  "Nothing in §6 remains open." The gap is real and code-documented
+  (`webdav/source.go:115`: the materialized tenant Source carries no Go hooks,
+  so a tenant-served overwrite never archives the previous version — drive's
+  Go IS linked into tenants now, but `drive.RegisterTenant` cannot attach
+  hooks to a source core mounted from JSON). Either add the seam (feature Go
+  attaches `Hooks` to a named materialized source at RegisterExtras time) or
+  record the accepted limitation; in both cases make HANDOFF §6 tell the
+  truth.
+- [x] **R8 ⚪ Cosmetics + doc truth from the audit** **DONE 2026-07-28:**
+  `flattenSendableIdentities.ts` → `groupSendableIdentities.ts` (git mv + five
+  import sites, mail check green); HANDOFF header/§5.6/§6/§7.4/§7.5
+  reconciled with Phase 7. The two note-only records stand as written. —
+  `mail`, `multi-org`.
+  Rename `flattenSendableIdentities.ts` → `groupSendableIdentities.ts` (the
+  export was renamed under P4-12; the filename and five import sites were
+  not). Reconcile HANDOFF's header/§6/§7 with this phase (the "all 64 done" /
+  "nothing open" claims are stale while R-items are open). Note for the
+  record, no action: the `/dav` prefix reservation (P2-1) is enforced by
+  documentation only — nothing programmatically rejects a package slugged
+  `dav`; the biome schema bump (P6-8) landed only in `tinycld/biome.json`
+  (root/utils/bootstrap configs lag behind, checks still green).
+
+---
+
 ## Coverage check
 
-**64 items across 7 phases.** Every §7 finding is assigned exactly once:
+**64 original items + 8 reconciliation items (R1–R8) across 8 phases.**
+Corrected 2026-07-28 — the original table's arithmetic hid R1 (see below).
+Every §7 finding is assigned:
 
 | §7 section | Where it lands |
 |---|---|
 | 7.1 critical (1) | P0-1 |
 | 7.2 high security (4) | P0-2, P0-3, P0-4, P0-5 |
-| 7.3 high correctness (8) | P2-1…P2-6, P4-1, P4-10; calendar-tenant → P1-5 |
-| 7.4 medium (24) | P0-6, P1-1…P1-7, P2-7…P2-14, P4-2…P4-7, P4-9, P4-12 |
-| 7.4 tests-that-cannot-fail (11) | P3-1…P3-9 |
-| 7.5 low / cleanup (10) | P1-8, P1-9, P2-15, P4-8, P4-11, P4-13, P6-1…P6-8 |
-| §6 carried forward (3) | P5-1, P5-2, P5-3 |
+| 7.3 high correctness (9) | P2-1…P2-6, P4-1, P4-10; calendar-tenant → P1-5 |
+| 7.4 medium (24) | P0-6, P1-1…P1-3, P1-6, P1-7, P2-7…P2-14, P4-2…P4-7, P4-9, P4-12; self-only member list → **R1** |
+| 7.4 tests-that-cannot-fail (12) | P3-1…P3-6, P3-9 (P3-4 absorbs five router bullets) |
+| 7.5 low / cleanup (11) | P1-8, P1-9, P2-15, P3-7, P3-8, P4-8, P4-11, P4-13, P6-1…P6-8 |
+| §6 / §7.2 lead-in (calendar disabled clause) | P1-4 |
+| §6 carried forward (3 + 1) | P5-1, P5-2, P5-3; `BeforeOverwrite` → **R7** |
 
 Per phase: **P0** 6 · **P1** 9 · **P2** 15 · **P3** 9 · **P4** 13 · **P5** 4 ·
-**P6** 8.
+**P6** 8 · **P7** 8.
+
+> **Corrections to the original table (2026-07-28).** §7.3 has 9 findings, not
+> 8 (the cell always listed 9 items). §7.4's test cluster has 12 bullets, not
+> 11, and maps to seven P3 items — P3-7/P3-8 actually remediate §7.5's "e2e
+> discipline" bullet, where they now appear. §7.5 has 11 bullets, not 10.
+> **P1-4 covers no §7.4 bullet** — it traces to §7.2's lead-in / §6's
+> "calendar entirely" note; filing it under §7.4 made that section's count
+> appear to close while the self-only-member-list finding sat unassigned
+> (now R1). One finding is deliberately split rather than assigned once:
+> §7.5's silent-failure-residue bullet lands in P2-15 (core + drive halves)
+> and P2-11/R3 (the takeout half).
 
 Two items are deliberately absent. The **false positive** (§7's
 `author_user_org`) — that collection is dropped by `1781400000`, verified. And

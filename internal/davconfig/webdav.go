@@ -11,12 +11,13 @@ import (
 // field names staying stable across a repo boundary.
 //
 // Note what is NOT carried: webdav.Source.Hooks. Those are Go callbacks and
-// cannot cross a process boundary. That is fine for the boundaries that
-// matter: authorization is the collection's own PocketBase rules
+// cannot cross a process boundary. Nothing boundary-shaped lives there:
+// authorization is the collection's own PocketBase rules
 // (app.CanAccessRecord) and quota is core/quota's record hooks, both of which
-// a tenant enforces from the schema alone. What a tenant loses is only the
-// non-boundary hooks — today the version snapshot (BeforeOverwrite), which
-// costs history, not safety.
+// a tenant enforces from the schema alone. The one non-boundary hook (drive's
+// BeforeOverwrite version snapshot) reaches the tenant anyway: its linked
+// feature Go registers it by slug (webdav.RegisterSourceHooks) and core's
+// mount adopts it, so nothing is lost in a tenant (R7).
 
 type WebDAVSource struct {
 	Slug       string         `json:"slug"`

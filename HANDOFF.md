@@ -1,7 +1,11 @@
 # Handoff — Multi-Org PocketBase Router
 
-**Updated:** 2026-07-28 (Phase 6 complete — **all 64 items of
-`REMEDIATION-PLAN.md` are done**; that file carries per-item evidence. The §6
+**Updated:** 2026-07-28 (Phase 6 complete, then a **second-pass reconciliation
+audit** re-verified all 64 items against the shipped code: 60 held, two were
+reopened and re-fixed (P3-6, P2-11), one unowned §7.4 finding surfaced and was
+fixed (calendar's self-only member list — R1), and the §5.6 golden test plus
+the §6 `BeforeOverwrite` gap were closed. See `REMEDIATION-PLAN.md` **Phase 7**
+for the eight R-items and per-item evidence. The §6
 "still open" list was then worked the same day: org branding + the cross-org
 switcher shipped, peerVersions settled and enforced, the userorg package
 renamed, the DeleteAccountModal and disabled-mailbox decisions made, mailproto
@@ -496,7 +500,11 @@ matches:
    all-comment `.pb.ts` fails to load ("sourcemap: mappings are empty"), so
    include at least one live statement. Plain `.pb.js` is unaffected.
 6. The two esbuild call sites (fork `transformSource`, router `transpileForStore`)
-   are duplicated across repos, kept in sync by a golden test.
+   are duplicated across repos, kept in sync by PAIRED golden tests — the same
+   fixture and byte-identical expected output in `internal/controlplane/
+   transpile_golden_test.go` and the fork's `plugins/jsvm/transform_golden_test.go`
+   (R6; §7.5 found the earlier version of this claim aspirational). Change the
+   options or bump esbuild on both sides together and regenerate both goldens.
 7. **Build BOTH binaries.** `serve-multi` spawns `serve-org` and resolves it as a
    sibling of its own executable. `go build ./cmd/serve-multi` alone yields a
    router that 503s every org with "spawn: no such file or directory".
@@ -564,9 +572,14 @@ matches:
   the tenant's own `settings`, where its superusers could raise the plan they were
   sold. Sources ride the same file from each package's `quota` manifest block, so
   the total spans drive and mail.
-  **Remaining gap, small:** `BeforeOverwrite` is still a Go hook, so a
-  tenant-served overwrite does not archive the previous version. That loses
-  history; it does not let anyone exceed a limit.
+  ~~**Remaining gap, small:** `BeforeOverwrite` is still a Go hook, so a
+  tenant-served overwrite does not archive the previous version.~~ **CLOSED
+  (2026-07-28, R7).** Feature-Go linking made the fix natural: drive's
+  `RegisterTenant` registers its hooks by slug (`webdav.RegisterSourceHooks`)
+  and core's mount adopts them onto the materialized Source, so tenant
+  overwrites snapshot versions like the host. Explicit source hooks still win;
+  covered in core's webdav suite (adoption + precedence) and drive's
+  composition-parity test (wiring, verified by neutering).
 - ~~**Tenant VMs still get no `$` bindings and no hook points.**~~ **CLOSED
   (2026-07-27).** The import objection dissolved when `serve-org` moved onto
   `coreserver.RegisterTenant` (composition-gap fix, §1): the linker prunes the
@@ -1134,10 +1147,15 @@ confirmed; `[S]` = strong code-reading inference, not executed. Items already in
   events** (`subscription.go:197-202`) — sync deletes every event whose `ical_uid`
   isn't in the feed, and UI-created events all have generated UIDs. No
   confirmation, no error.
-- **[S] calendar's member list/delete rules are self-only**
+- ~~**[S] calendar's member list/delete rules are self-only**
   (`1715000000:265-271`), so the "Shared with" UI cannot list or remove other
   members. Faithful translation of main's semantics, not a de-org regression —
-  but the e2e conspicuously only ever asserts the owner's own row.
+  but the e2e conspicuously only ever asserts the owner's own row.~~ **FIXED
+  (2026-07-28, R1 — this was the one §7 finding the plan's coverage table lost;
+  see Phase 7).** `1830000006` had already widened delete; `1830000007` makes
+  membership rows visible to the calendar's members (D4), with rlstest deny/
+  allow pairs and the sharing e2e now asserting the owner sees the SHAREE's
+  row after a reload.
 - **[V] The audit-log "Members" filter can never match** — it filters
   `resource_type = 'user_org'` (`app/(app)/settings/audit-log.tsx:29`) while the
   writer stamps `"users"` (`users_guard.go:82`).
@@ -1271,10 +1289,11 @@ found broken or would need to catch.
   `~/code/tinycld/pocketbase` for the `replace ../pocketbase` — `go.mod:11`
   actually resolves `../tinycld/third_party/pocketbase` (commit `a37c8ac`); the
   router no longer builds that checkout at all. §5.6 claims the two esbuild call
-  sites are "kept in sync by a golden test" — **no such test exists** (both sides
-  assert properties independently, no shared fixture). They *are* in sync today
-  (same loader/target/sourcemap, both pin esbuild v0.28.1). §4's confinement-skip
-  claim is wrong per above.
+  sites are "kept in sync by a golden test" — at the time of this review **no
+  such test existed** (both sides asserted properties independently, no shared
+  fixture). **Resolved 2026-07-28 (R6): the paired golden tests now exist** —
+  same fixture, byte-identical expected output on both sides — so §5.6's claim
+  is true. §4's confinement-skip claim is wrong per above.
 - **Router README:** the diagram claims each tenant gets a "netns" — there is no
   network namespace anywhere (`CLONE_NEWNET` appears nowhere); reserved
   subdomains are listed as open but are fixed at `provisioning.go:41`;

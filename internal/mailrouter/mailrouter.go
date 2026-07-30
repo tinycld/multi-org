@@ -26,6 +26,7 @@ package mailrouter
 import (
 	"context"
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -185,6 +186,7 @@ func lnAddr(ln net.Listener) net.Addr {
 }
 
 func (r *Router) acceptLoop(ln net.Listener, svc string) {
+	var delay time.Duration
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
@@ -193,9 +195,32 @@ func (r *Router) acceptLoop(ln net.Listener, svc string) {
 				return
 			default:
 			}
-			r.cfg.Logger.Warn("mailrouter accept failed", "service", svc, "error", err)
-			return
+			if errors.Is(err, net.ErrClosed) {
+				return
+			}
+			// A transient failure — an fd-exhaustion burst is the canonical
+			// case — must not end this loop: the listener stays bound either
+			// way, so giving up turns the port into a black hole that accepts
+			// TCP and then hangs forever, killing mail with no crash and no
+			// alert. Retry with capped backoff, staying responsive to
+			// shutdown.
+			delay *= 2
+			switch {
+			case delay == 0:
+				delay = 5 * time.Millisecond
+			case delay > time.Second:
+				delay = time.Second
+			}
+			r.cfg.Logger.Warn("mailrouter accept failed; retrying",
+				"service", svc, "delay", delay, "error", err)
+			select {
+			case <-r.closed:
+				return
+			case <-time.After(delay):
+			}
+			continue
 		}
+		delay = 0
 		go r.handleTLSConn(conn, svc)
 	}
 }

@@ -18,6 +18,7 @@ import (
 	"path/filepath"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -258,5 +259,92 @@ func TestTLSDemux_TracksConnLifetime(t *testing.T) {
 			t.Fatalf("connection still tracked after close: %d", acme.tracked.Load())
 		}
 		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// flakyListener fails its first N Accepts with a transient error, then
+// reports closed so the loop under test terminates.
+type flakyListener struct {
+	mu       sync.Mutex
+	calls    int
+	failures int
+}
+
+func (l *flakyListener) Accept() (net.Conn, error) {
+	l.mu.Lock()
+	l.calls++
+	n := l.calls
+	l.mu.Unlock()
+	if n <= l.failures {
+		return nil, &net.OpError{Op: "accept", Net: "tcp", Err: syscall.EMFILE}
+	}
+	return nil, net.ErrClosed
+}
+
+func (l *flakyListener) Close() error   { return nil }
+func (l *flakyListener) Addr() net.Addr { return &net.TCPAddr{} }
+
+func (l *flakyListener) acceptCalls() int {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.calls
+}
+
+// A transient Accept error — an fd-exhaustion burst is the canonical case —
+// must not end the accept loop. The listener stays bound either way, so
+// giving up turns :993/:465 into a black hole that accepts TCP and then
+// hangs forever: mail dies with no crash, no restart, and no alert.
+func TestAcceptLoop_SurvivesTransientAcceptErrors(t *testing.T) {
+	ln := &flakyListener{failures: 3}
+	r := New(Config{
+		BaseDomain: testBaseDomain,
+		Logger:     slog.New(slog.NewTextHandler(io.Discard, nil)),
+	})
+
+	done := make(chan struct{})
+	go func() {
+		r.acceptLoop(ln, svcIMAP)
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("accept loop did not terminate on net.ErrClosed")
+	}
+	if got := ln.acceptCalls(); got != ln.failures+1 {
+		t.Fatalf("Accept called %d times, want %d — the loop must retry transient errors until the listener closes",
+			got, ln.failures+1)
+	}
+}
+
+// Shutdown during the retry backoff must end the loop promptly rather than
+// sleeping out the remaining delay.
+func TestAcceptLoop_ShutdownInterruptsRetryBackoff(t *testing.T) {
+	// Enough consecutive failures to drive the backoff to its cap, so a loop
+	// that ignores shutdown measurably overstays.
+	ln := &flakyListener{failures: 1 << 20}
+	r := New(Config{
+		BaseDomain: testBaseDomain,
+		Logger:     slog.New(slog.NewTextHandler(io.Discard, nil)),
+	})
+
+	done := make(chan struct{})
+	go func() {
+		r.acceptLoop(ln, svcIMAP)
+		close(done)
+	}()
+
+	// Let it fail at least once so it is inside the retry path.
+	deadline := time.Now().Add(5 * time.Second)
+	for ln.acceptCalls() == 0 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	r.Shutdown()
+
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("accept loop kept retrying after Shutdown")
 	}
 }

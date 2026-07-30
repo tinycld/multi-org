@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"math"
@@ -253,7 +254,11 @@ func (m *OrgManager) Get(ctx context.Context, slug string) (*OrgInstance, error)
 		// Deliberately NOT the caller's ctx — see the doc comment.
 		loadCtx, cancel := context.WithTimeout(context.Background(), spawnTimeout)
 		defer cancel()
-		return m.load(loadCtx, slug)
+		inst, err := m.load(loadCtx, slug)
+		if err != nil {
+			return nil, m.noteLoadFailure(slug, err)
+		}
+		return inst, nil
 	})
 
 	select {
@@ -267,6 +272,28 @@ func (m *OrgManager) Get(ctx context.Context, slug string) (*OrgInstance, error)
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	}
+}
+
+// noteLoadFailure classifies and logs a failed load — exactly once per load
+// attempt, in the singleflight path, so N collapsed waiters produce one line.
+//
+// Host-side failures with no orgerr sentinel (a pruned package version, a full
+// disk during materialize, a config write error) are wrapped as
+// ErrOrgUnavailable so the front router answers 503 + Retry-After instead of
+// its default 404: "no such organization" for an org whose store is broken
+// shows the customer a dead domain and the operator nothing, while the
+// control plane still says active. Levels match who must act — Error for host
+// problems an operator has to fix, Debug for probes of slugs that don't exist.
+func (m *OrgManager) noteLoadFailure(slug string, err error) error {
+	if errors.Is(err, orgerr.ErrOrgNotFound) || errors.Is(err, orgerr.ErrOrgNotActive) {
+		m.cfg.Logger.Debug("org load refused", "slug", slug, "error", err)
+		return err
+	}
+	m.cfg.Logger.Error("org load failed", "slug", slug, "error", err)
+	if errors.Is(err, orgerr.ErrOrgUnavailable) {
+		return err
+	}
+	return fmt.Errorf("%w: %s: %v", orgerr.ErrOrgUnavailable, slug, err)
 }
 
 func (m *OrgManager) load(ctx context.Context, slug string) (*OrgInstance, error) {

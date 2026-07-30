@@ -76,13 +76,13 @@ func run() error {
 		// 0 residents = unlimited; 0 spawns = the manager's default.
 		MaxResident:         getenvInt("MT_MAX_RESIDENT_ORGS", 0),
 		MaxConcurrentSpawns: getenvInt("MT_MAX_CONCURRENT_SPAWNS", 0),
-		TenantBinary:   tenantBinary,
-		Logger:         slog.Default(),
-		CardDAVSources: controlplane.CardDAVSources,
-		WebDAVSources:  controlplane.WebDAVSources,
-		CalDAVSources:  controlplane.CalDAVSources,
-		QuotaSources:   controlplane.QuotaSources,
-		PackageSlugs:   controlplane.PackageSlugs,
+		TenantBinary:        tenantBinary,
+		Logger:              slog.Default(),
+		CardDAVSources:      controlplane.CardDAVSources,
+		WebDAVSources:       controlplane.WebDAVSources,
+		CalDAVSources:       controlplane.CalDAVSources,
+		QuotaSources:        controlplane.QuotaSources,
+		PackageSlugs:        controlplane.PackageSlugs,
 		// Public scheme is https in every TLS mode: file/autocert terminate
 		// here, and proxy mode's documented deployment is behind an external
 		// TLS proxy on 443.

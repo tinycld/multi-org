@@ -645,3 +645,62 @@ func TestInstance_LastUsedSeededAndAdvancedByRequests(t *testing.T) {
 		t.Fatal("a proxied request did not advance lastUsed")
 	}
 }
+
+// A host-side load failure — a pruned package version, a broken store, a full
+// disk — must classify as ErrOrgUnavailable (503 + Retry-After) and log its
+// cause. Unwrapped it falls into the front router's default case: the
+// customer sees 404 "no such organization", the operator sees nothing, and
+// the control plane still says active.
+func TestLoad_HostSideFailureIsUnavailableAndLogged(t *testing.T) {
+	var logs syncBuffer
+	sp := &fakeSpawner{}
+	root := t.TempDir()
+
+	// The store has no packages at all, so the org's pinned version resolves
+	// to nothing — the "pruned package version" case.
+	mgr := New(Config{
+		Root:    root,
+		Store:   store.New(root),
+		Spawner: sp,
+		Logger:  slog.New(slog.NewTextHandler(&logs, nil)),
+		LookupOrg: stubLookup(map[string]OrgRecord{
+			"acme": {Slug: "acme", Status: "active", Lockfile: []byte(`{"@tinycld/core":"9.9.9"}`)},
+		}),
+	})
+	t.Cleanup(mgr.Shutdown)
+
+	_, err := mgr.Get(context.Background(), "acme")
+	if err == nil {
+		t.Fatal("expected the load to fail")
+	}
+	if !errors.Is(err, orgerr.ErrOrgUnavailable) {
+		t.Fatalf("err = %v, want ErrOrgUnavailable — a broken store must answer 503, not the 404 reserved for unknown slugs", err)
+	}
+	if !strings.Contains(logs.String(), "org load failed") {
+		t.Fatalf("logs = %q, want the load failure logged with its cause", logs.String())
+	}
+}
+
+// Probes of unknown slugs are routine and must not spam the error log — but
+// they still classify as NotFound for the router's shared-404 policy.
+func TestLoad_UnknownSlugIsNotLoggedAsError(t *testing.T) {
+	var logs syncBuffer
+	sp := &fakeSpawner{}
+	root := t.TempDir()
+	mgr := New(Config{
+		Root:      root,
+		Store:     store.New(root),
+		Spawner:   sp,
+		Logger:    slog.New(slog.NewTextHandler(&logs, nil)),
+		LookupOrg: stubLookup(nil),
+	})
+	t.Cleanup(mgr.Shutdown)
+
+	_, err := mgr.Get(context.Background(), "ghost")
+	if !errors.Is(err, orgerr.ErrOrgNotFound) {
+		t.Fatalf("err = %v, want ErrOrgNotFound", err)
+	}
+	if strings.Contains(logs.String(), "level=ERROR") {
+		t.Fatalf("logs = %q — an unknown-slug probe must not log at Error", logs.String())
+	}
+}

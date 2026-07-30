@@ -12,6 +12,8 @@ import (
 	"sync/atomic"
 	"syscall"
 	"time"
+
+	"tinycld.org/multi-org/internal/webpage"
 )
 
 // OrgInstance is one org's running tenant process plus the reverse proxy that
@@ -183,7 +185,7 @@ func newProxy(sockPath string, fw ForwardedConfig, log *slog.Logger) *httputil.R
 				return
 			}
 			log.Error("proxy to tenant failed", "path", r.URL.Path, "error", err)
-			http.Error(w, "organization backend unavailable", http.StatusBadGateway)
+			webpage.BackendUnavailable(w, r)
 		},
 	}
 }
@@ -235,7 +237,7 @@ func forwardedProto(pr *httputil.ProxyRequest, fw ForwardedConfig) string {
 func (i *OrgInstance) serveProxied(w http.ResponseWriter, r *http.Request) {
 	select {
 	case <-i.closed:
-		http.Error(w, "organization is restarting", http.StatusServiceUnavailable)
+		webpage.Restarting(w, r)
 		return
 	default:
 	}

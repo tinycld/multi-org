@@ -53,7 +53,8 @@ unix domain socket and never holds a tenant app object.
 | `internal/orgmanager` | Lazy per-org process supervisor: materialize → spawn `serve-org` → readiness handshake → reverse proxy. Singleflight-collapsed spawns, crash supervision with backoff, drain-then-kill `Evict`, idle sweeper. |
 | `internal/orgerr` | The three sentinels (`ErrOrgNotFound` / `ErrOrgNotActive` / `ErrOrgUnavailable`) the front router classifies into 404 / 503. |
 | `internal/davconfig` | JSON wire formats for the runtime config the host hands each tenant: CardDAV / CalDAV / WebDAV source lists and quota sources. |
-| `internal/frontrouter` | Plain `http.Handler`: `Host` → subdomain → control-plane / org / apex-redirect. |
+| `internal/frontrouter` | Plain `http.Handler`: `Host` → subdomain → control-plane / org / apex org-finder page. |
+| `internal/webpage` | Branded HTML pages (cold-start/restart interstitials, unknown-org, apex org finder) + JSON error bodies for non-browser clients. |
 | `internal/server` | Single `http.Server` + wildcard autocert TLS + graceful shutdown. |
 | `cmd/serve-multi` | The router. Wires it all together. |
 | `cmd/serve-org` | The tenant. One org on a unix socket: `coreserver.RegisterTenant` (core guards, sandboxed jsvm, CardDAV/CalDAV/WebDAV, quota) plus the pinned feature-Go menu (`internal/tenantpkgs`), gated by the org's resolved package set. |
@@ -212,7 +213,7 @@ supply a DNS-01 solver or a pre-issued wildcard cert. The autocert cache lives a
   `PublishPackage`. Either wire content hashing or drop the vocabulary.
 - **Reserved subdomains:** `validSlug` rejects `admin` and `www`
   (`provisioning.go`), matching what the front router claims for the control
-  plane / apex redirect.
+  plane / apex org-finder page.
 - **peerVersions solver:** `lockfile.Resolve` stays a pure store lookup;
   `controlplane.CheckPeerVersions` (compat.go) enforces every resolved
   package's `peerVersions` ranges — `CreateOrg` and `Deploy` both refuse to

@@ -200,6 +200,12 @@ const manifest = {
             owner: 'created_by',
             updated: 'updated',
         },
+        trash: {
+            collection: 'drive_item_state',
+            itemField: 'item',
+            userField: 'user',
+            trashedAtField: 'trashed_at',
+        },
     },
 }
 export default manifest

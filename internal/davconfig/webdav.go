@@ -24,6 +24,7 @@ type WebDAVSource struct {
 	Prefix     string         `json:"prefix"`
 	Collection string         `json:"collection"`
 	Fields     WebDAVFieldMap `json:"fields"`
+	Trash      *WebDAVTrash   `json:"trash,omitempty"`
 }
 
 type WebDAVFieldMap struct {
@@ -37,11 +38,20 @@ type WebDAVFieldMap struct {
 	Updated  string `json:"updated"`
 }
 
+// WebDAVTrash mirrors webdav.TrashConfig: the per-user soft-delete state a
+// DAV DELETE stamps instead of destroying the record.
+type WebDAVTrash struct {
+	Collection     string `json:"collection"`
+	ItemField      string `json:"itemField"`
+	UserField      string `json:"userField"`
+	TrashedAtField string `json:"trashedAtField"`
+}
+
 // EncodeWebDAV converts core's Sources into the wire form.
 func EncodeWebDAV(sources []webdav.Source) []WebDAVSource {
 	out := make([]WebDAVSource, 0, len(sources))
 	for _, s := range sources {
-		out = append(out, WebDAVSource{
+		ws := WebDAVSource{
 			Slug:       s.Slug,
 			Prefix:     s.Prefix,
 			Collection: s.Collection,
@@ -55,7 +65,16 @@ func EncodeWebDAV(sources []webdav.Source) []WebDAVSource {
 				Owner:    s.Fields.Owner,
 				Updated:  s.Fields.Updated,
 			},
-		})
+		}
+		if s.Trash != nil {
+			ws.Trash = &WebDAVTrash{
+				Collection:     s.Trash.Collection,
+				ItemField:      s.Trash.ItemField,
+				UserField:      s.Trash.UserField,
+				TrashedAtField: s.Trash.TrashedAtField,
+			}
+		}
+		out = append(out, ws)
 	}
 	return out
 }
@@ -64,7 +83,7 @@ func EncodeWebDAV(sources []webdav.Source) []WebDAVSource {
 func DecodeWebDAV(sources []WebDAVSource) []webdav.Source {
 	out := make([]webdav.Source, 0, len(sources))
 	for _, s := range sources {
-		out = append(out, webdav.Source{
+		src := webdav.Source{
 			Slug:       s.Slug,
 			Prefix:     s.Prefix,
 			Collection: s.Collection,
@@ -78,7 +97,16 @@ func DecodeWebDAV(sources []WebDAVSource) []webdav.Source {
 				Owner:    s.Fields.Owner,
 				Updated:  s.Fields.Updated,
 			},
-		})
+		}
+		if s.Trash != nil {
+			src.Trash = &webdav.TrashConfig{
+				Collection:     s.Trash.Collection,
+				ItemField:      s.Trash.ItemField,
+				UserField:      s.Trash.UserField,
+				TrashedAtField: s.Trash.TrashedAtField,
+			}
+		}
+		out = append(out, src)
 	}
 	return out
 }

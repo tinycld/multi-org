@@ -70,6 +70,14 @@ type manifestCapabilities struct {
 			Owner    string `json:"owner"`
 			Updated  string `json:"updated"`
 		} `json:"fields"`
+		// Trash binds the feature's per-user soft-delete state; set, a DAV
+		// DELETE stamps it instead of destroying the record.
+		Trash *struct {
+			Collection     string `json:"collection"`
+			ItemField      string `json:"itemField"`
+			UserField      string `json:"userField"`
+			TrashedAtField string `json:"trashedAtField"`
+		} `json:"trash"`
 	} `json:"webdav"`
 	CalDAV *struct {
 		Prefix             string `json:"prefix"`
@@ -190,7 +198,7 @@ func WebDAVSources(resolved []lockfile.ResolvedPackage) ([]webdav.Source, error)
 		if err := validateDAVPrefix(seenPrefixes, prefix, slug); err != nil {
 			return nil, err
 		}
-		sources = append(sources, webdav.Source{
+		src := webdav.Source{
 			Slug:       slug,
 			Prefix:     prefix,
 			Collection: wd.Collection,
@@ -204,7 +212,16 @@ func WebDAVSources(resolved []lockfile.ResolvedPackage) ([]webdav.Source, error)
 				Owner:    wd.Fields.Owner,
 				Updated:  wd.Fields.Updated,
 			},
-		})
+		}
+		if wd.Trash != nil {
+			src.Trash = &webdav.TrashConfig{
+				Collection:     wd.Trash.Collection,
+				ItemField:      wd.Trash.ItemField,
+				UserField:      wd.Trash.UserField,
+				TrashedAtField: wd.Trash.TrashedAtField,
+			}
+		}
+		sources = append(sources, src)
 	}
 	return sources, nil
 }

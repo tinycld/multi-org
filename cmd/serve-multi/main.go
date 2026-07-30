@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"syscall"
 	"time"
 
@@ -64,11 +65,17 @@ func run() error {
 	pkgStore := store.New(root)
 
 	mgr := orgmanager.New(orgmanager.Config{
-		Root:           root,
-		Store:          pkgStore,
-		LookupOrg:      controlplane.OrgLookup(cp.App),
-		HooksPool:      15,
-		MaxIdle:        30 * time.Minute,
+		Root:      root,
+		Store:     pkgStore,
+		LookupOrg: controlplane.OrgLookup(cp.App),
+		HooksPool: 15,
+		MaxIdle:   30 * time.Minute,
+		// Admission control: cap resident tenant processes (LRU-evicting idle
+		// ones when full) and concurrent cold starts, so one request per
+		// enumerable slug cannot hold every org resident or stampede spawns.
+		// 0 residents = unlimited; 0 spawns = the manager's default.
+		MaxResident:         getenvInt("MT_MAX_RESIDENT_ORGS", 0),
+		MaxConcurrentSpawns: getenvInt("MT_MAX_CONCURRENT_SPAWNS", 0),
 		TenantBinary:   tenantBinary,
 		Logger:         slog.Default(),
 		CardDAVSources: controlplane.CardDAVSources,
@@ -217,6 +224,21 @@ func getenv(k, def string) string {
 		return v
 	}
 	return def
+}
+
+// getenvInt parses an integer env var, treating unset OR malformed as def — a
+// typo'd limit must not silently become "unlimited", so malformed is loud.
+func getenvInt(k string, def int) int {
+	v := os.Getenv(k)
+	if v == "" {
+		return def
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil {
+		log.Printf("%s=%q is not an integer; using %d", k, v, def)
+		return def
+	}
+	return n
 }
 
 // ensureSuperuser upserts a control-plane superuser from MT_SUPERUSER_EMAIL /

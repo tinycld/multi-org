@@ -79,6 +79,8 @@ deployed pair stays together without configuration.
 | `MT_TLS_CERT`, `MT_TLS_KEY` | — | Required for `file`. |
 | `MT_SUPERUSER_EMAIL`, `MT_SUPERUSER_PASSWORD` | — | Upserts the control-plane superuser on boot. Without it every provisioning route 401s. |
 | `MT_TENANT_BINARY` | sibling `serve-org` | Override the tenant executable path. |
+| `MT_MAX_RESIDENT_ORGS` | — | Cap on resident tenant processes. When full, the least-recently-used idle org is evicted to admit a newcomer; if every resident org has live connections the newcomer gets 503. Unset ⇒ unlimited — one request per enumerable slug then holds every org resident. |
+| `MT_MAX_CONCURRENT_SPAWNS` | `4` | Cap on simultaneous cold starts (each runs migrations + hook compilation). Excess loads wait, bounded by the spawn timeout. |
 | `MT_TENANT_UID_BASE`, `MT_TENANT_UID_RANGE` | — | **Linux.** The uid window tenants are mapped into. Unset ⇒ tenants run as the host user and are **not** confined. |
 | `MT_CGROUP_ROOT` | — | **Linux.** cgroup v2 dir to place tenants under. |
 | `MT_TENANT_MEMORY_MAX` | — | **Linux.** Per-tenant `memory.max`: bytes with optional `K`/`M`/`G`/`T` suffix (e.g. `512M`), or `max`. Unset ⇒ unlimited. |

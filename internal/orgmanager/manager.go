@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"math"
 	"math/rand"
 	"net/http"
 	"os"
@@ -91,6 +92,21 @@ type Config struct {
 	// tests substitute an in-process fake.
 	Spawner Spawner
 
+	// MaxResident caps how many org instances may be resident at once. When a
+	// newcomer would exceed it, the least-recently-used instance with no
+	// tracked long-lived connections is evicted to make room; if every
+	// resident org is busy the newcomer is refused with ErrOrgUnavailable.
+	// 0 = unlimited. Without a cap, one HTTP request per enumerable slug
+	// holds every org's PocketBase process resident simultaneously.
+	MaxResident int
+
+	// MaxConcurrentSpawns caps how many cold starts may run at once — each one
+	// is a PocketBase bootstrap, RunAllMigrations, and JS compilation of the
+	// whole hook farm, so an uncapped stampede can wedge the host. Excess
+	// loads wait for a slot (bounded by the caller's spawn timeout).
+	// 0 = the default of 4.
+	MaxConcurrentSpawns int
+
 	// TenantBinary is the path to the serve-org executable.
 	TenantBinary string
 
@@ -171,6 +187,14 @@ type OrgManager struct {
 	// start matches nothing in `orgs` and is silently dropped, leaving a
 	// suspended or redeployed org serving from the pre-evict generation.
 	evictEpoch map[string]uint64
+
+	// loading holds admission reservations: slugs admitted under MaxResident
+	// but not yet published. Counting them alongside m.orgs is what stops two
+	// concurrent loads for different slugs from both squeezing under the cap.
+	loading map[string]struct{}
+
+	// spawnSem bounds concurrent cold starts (see MaxConcurrentSpawns).
+	spawnSem chan struct{}
 }
 
 func nowNanos() int64 { return time.Now().UnixNano() }
@@ -178,6 +202,9 @@ func nowNanos() int64 { return time.Now().UnixNano() }
 func New(cfg Config) *OrgManager {
 	if cfg.HooksPool <= 0 {
 		cfg.HooksPool = 15
+	}
+	if cfg.MaxConcurrentSpawns <= 0 {
+		cfg.MaxConcurrentSpawns = 4
 	}
 	if cfg.Logger == nil {
 		cfg.Logger = slog.Default()
@@ -190,6 +217,8 @@ func New(cfg Config) *OrgManager {
 		orgs:       map[string]*OrgInstance{},
 		crashes:    map[string]*crashState{},
 		evictEpoch: map[string]uint64{},
+		loading:    map[string]struct{}{},
+		spawnSem:   make(chan struct{}, cfg.MaxConcurrentSpawns),
 		stop:       make(chan struct{}),
 	}
 	if cfg.MaxIdle > 0 {
@@ -260,6 +289,19 @@ func (m *OrgManager) load(ctx context.Context, slug string) (*OrgInstance, error
 		return nil, fmt.Errorf("%w: %q is crash-looping, retry in %s",
 			orgerr.ErrOrgUnavailable, slug, wait.Round(time.Second))
 	}
+
+	// Admission before any work: a refused org must cost nothing, and an
+	// admitted one holds its reservation (m.loading) until this load settles.
+	if err := m.admit(slug); err != nil {
+		return nil, err
+	}
+	defer m.releaseAdmission(slug)
+
+	releaseSlot, err := m.acquireSpawnSlot(ctx, slug)
+	if err != nil {
+		return nil, err
+	}
+	defer releaseSlot()
 
 	orgDir := filepath.Join(m.cfg.Root, "pb_orgs", slug)
 
@@ -793,6 +835,77 @@ func (m *OrgManager) clearCrash(slug string) {
 	m.mu.Lock()
 	delete(m.crashes, slug)
 	m.mu.Unlock()
+}
+
+// admit reserves a resident slot for slug under MaxResident, evicting the
+// least-recently-used idle instance to make room. When every resident org has
+// live tracked connections the newcomer is refused instead: killing a mail
+// session under a connected client to serve a cold start would let one
+// crawler degrade every active org.
+func (m *OrgManager) admit(slug string) error {
+	if m.cfg.MaxResident <= 0 {
+		return nil
+	}
+	for {
+		m.mu.Lock()
+		if m.closed {
+			m.mu.Unlock()
+			return fmt.Errorf("manager shut down while admitting org %q", slug)
+		}
+		if len(m.orgs)+len(m.loading) < m.cfg.MaxResident {
+			m.loading[slug] = struct{}{}
+			m.mu.Unlock()
+			return nil
+		}
+		victim, ok := m.lruIdleLocked()
+		m.mu.Unlock()
+		if !ok {
+			return fmt.Errorf("%w: %q refused: resident org limit (%d) reached and every resident org has live connections",
+				orgerr.ErrOrgUnavailable, slug, m.cfg.MaxResident)
+		}
+		m.cfg.Logger.Info("resident org limit reached; evicting least-recently-used org",
+			"limit", m.cfg.MaxResident, "evicting", victim, "admitting", slug)
+		m.Evict(victim)
+		// Loop rather than admit unconditionally: another load may have taken
+		// the slot the eviction freed.
+	}
+}
+
+// lruIdleLocked picks the resident instance with the oldest lastUsed among
+// those with no tracked long-lived connections. Caller holds m.mu.
+func (m *OrgManager) lruIdleLocked() (string, bool) {
+	var victim string
+	oldest := int64(math.MaxInt64)
+	for slug, inst := range m.orgs {
+		if inst.activeConns.Load() != 0 {
+			continue
+		}
+		if lu := inst.lastUsed.Load(); lu < oldest {
+			oldest, victim = lu, slug
+		}
+	}
+	return victim, victim != ""
+}
+
+func (m *OrgManager) releaseAdmission(slug string) {
+	m.mu.Lock()
+	delete(m.loading, slug)
+	m.mu.Unlock()
+}
+
+// acquireSpawnSlot blocks until a concurrent-spawn slot frees up, bounded by
+// the load's own timeout: a host saturated with cold starts answers 503 and
+// Retry-After rather than queueing every request into the same stampede.
+func (m *OrgManager) acquireSpawnSlot(ctx context.Context, slug string) (func(), error) {
+	select {
+	case m.spawnSem <- struct{}{}:
+		return func() { <-m.spawnSem }, nil
+	case <-ctx.Done():
+		return nil, fmt.Errorf("%w: %q timed out waiting for a spawn slot (%d cold starts already running)",
+			orgerr.ErrOrgUnavailable, slug, cap(m.spawnSem))
+	case <-m.stop:
+		return nil, fmt.Errorf("manager shut down while org %q waited for a spawn slot", slug)
+	}
 }
 
 // writeCardDAVConfig resolves the org's CardDAV sources and writes them where

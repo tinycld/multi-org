@@ -29,6 +29,14 @@ func validateDAVPrefix(seen map[string]string, prefix, slug string) error {
 	if prefix == "" || prefix == "/" || !strings.HasPrefix(prefix, "/") || strings.HasSuffix(prefix, "/") {
 		return fmt.Errorf("package %s: invalid dav prefix %q (must start with '/', not end with one, and not be the bare root)", slug, prefix)
 	}
+	// A mount under a reserved namespace shadows infrastructure: /api puts a
+	// Basic-Auth DAV handler in front of PocketBase's entire REST API, /_ in
+	// front of its dashboard, /.well-known in front of protocol discovery.
+	firstSegment, _, _ := strings.Cut(strings.TrimPrefix(prefix, "/"), "/")
+	switch firstSegment {
+	case "api", "_", ".well-known":
+		return fmt.Errorf("package %s: dav prefix %q shadows the reserved /%s namespace", slug, prefix, firstSegment)
+	}
 	if other, dup := seen[prefix]; dup {
 		return fmt.Errorf("packages %s and %s both mount dav prefix %q", other, slug, prefix)
 	}

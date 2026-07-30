@@ -23,6 +23,23 @@ var manifestEvalTimeout = 5 * time.Second
 // loader.
 const manifestJSONFile = "manifest.json"
 
+// Size caps on the eval. The interrupt above bounds time, not memory: a
+// doubling-string bomb allocates gigabytes in microseconds, and the router
+// hosts every tenant, so an OOM here takes them all down. The caps refuse an
+// oversized source before eval and an oversized export before it is stored.
+// A hostile script can still allocate transiently inside the interrupt window
+// (full isolation would need a subprocess with rlimits); publish is
+// superuser-only, so these bound the accident rather than a live attack.
+const (
+	// manifestSourceMaxBytes is generous: the largest real manifest is a few
+	// KB of object literal.
+	manifestSourceMaxBytes = 1 << 20 // 1 MiB
+
+	// manifestJSONMaxBytes caps the marshalled manifest.json — the value every
+	// org load re-reads from the store.
+	manifestJSONMaxBytes = 4 << 20 // 4 MiB
+)
+
 // emitManifestJSON adds a parsed manifest.json to the file map when the package
 // ships a manifest.ts (or .js). It transpiles the manifest to CommonJS via
 // esbuild, evaluates it in a throwaway sobek VM to capture the default export,
@@ -34,6 +51,9 @@ func emitManifestJSON(files map[string][]byte) (map[string][]byte, error) {
 	if src == nil {
 		return files, nil
 	}
+	if len(src) > manifestSourceMaxBytes {
+		return nil, fmt.Errorf("%s is %d bytes (max %d): a manifest is a small object literal", name, len(src), manifestSourceMaxBytes)
+	}
 
 	obj, err := evalManifest(string(src), name)
 	if err != nil {
@@ -42,6 +62,9 @@ func emitManifestJSON(files map[string][]byte) (map[string][]byte, error) {
 	data, err := json.Marshal(obj)
 	if err != nil {
 		return nil, fmt.Errorf("marshal manifest json: %w", err)
+	}
+	if len(data) > manifestJSONMaxBytes {
+		return nil, fmt.Errorf("%s evaluates to %d bytes of JSON (max %d)", name, len(data), manifestJSONMaxBytes)
 	}
 
 	out := make(map[string][]byte, len(files)+1)

@@ -140,6 +140,9 @@ func run() error {
 		TLSMode:  tlsMode,
 		CertFile: tlsCert,
 		KeyFile:  tlsKey,
+		// Anchored under MT_ROOT so a restart from a different CWD reuses the
+		// issued certs instead of silently re-requesting them all.
+		AutocertCacheDir: filepath.Join(root, "pb_control", "autocert"),
 	})
 	if err != nil {
 		return fmt.Errorf("serve: %w", err)

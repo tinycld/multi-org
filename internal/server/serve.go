@@ -7,6 +7,7 @@ import (
 	"crypto/tls"
 	"fmt"
 	"net/http"
+	"strings"
 	"time"
 
 	"golang.org/x/crypto/acme/autocert"
@@ -40,6 +41,11 @@ type Params struct {
 	// CertFile/KeyFile are required when TLSMode is TLSFile.
 	CertFile string
 	KeyFile  string
+	// AutocertCacheDir is where autocert stores issued certs. Empty defaults
+	// to a directory relative to the working directory — real deployments
+	// should pass a path under MT_ROOT so a service restart from a different
+	// CWD does not silently re-issue everything.
+	AutocertCacheDir string
 }
 
 // BuildHandler assembles the front router handler (no server) — unit-testable.
@@ -56,13 +62,7 @@ func BuildHandler(p Params) http.Handler {
 // p.TLSMode (proxy / file / autocert; empty ⇒ proxy). Returns nil on a clean
 // shutdown.
 func Serve(ctx context.Context, addr string, p Params) error {
-	srv := &http.Server{
-		Addr:              addr,
-		Handler:           BuildHandler(p),
-		ReadTimeout:       5 * time.Minute,
-		WriteTimeout:      5 * time.Minute,
-		ReadHeaderTimeout: time.Minute,
-	}
+	srv := newServer(addr, p)
 
 	go func() {
 		<-ctx.Done()
@@ -72,6 +72,40 @@ func Serve(ctx context.Context, addr string, p Params) error {
 	}()
 
 	return listen(srv, p)
+}
+
+// newServer builds the http.Server with the timeout profile a
+// many-tenants-front-door needs. No ReadTimeout or WriteTimeout: PocketBase's
+// /api/realtime is an SSE stream that legitimately stays open for hours, and
+// drive transfers outrun any fixed budget — a whole-request timer silently
+// truncates both, undoing the tenant proxy's own care (no
+// ResponseHeaderTimeout, immediate flush) to keep realtime alive. Slow-loris
+// defense comes from ReadHeaderTimeout; IdleTimeout reaps dead keep-alives.
+func newServer(addr string, p Params) *http.Server {
+	return &http.Server{
+		Addr:              addr,
+		Handler:           BuildHandler(p),
+		ReadHeaderTimeout: time.Minute,
+		IdleTimeout:       2 * time.Minute,
+	}
+}
+
+// autocertHostPolicy admits only the hosts this deployment serves: the apex
+// and one label beneath it. Accepting every SNI would let anyone who points a
+// hostname at the router spend the deployment's Let's Encrypt rate limits on
+// certificates for arbitrary domains.
+func autocertHostPolicy(baseDomain string) autocert.HostPolicy {
+	return func(_ context.Context, host string) error {
+		host = strings.TrimSuffix(host, ".")
+		if host == baseDomain {
+			return nil
+		}
+		label, ok := strings.CutSuffix(host, "."+baseDomain)
+		if !ok || label == "" || strings.Contains(label, ".") {
+			return fmt.Errorf("server: refusing certificate for %q: not a %s host", host, baseDomain)
+		}
+		return nil
+	}
 }
 
 // listen starts the server with the transport dictated by p.TLSMode.
@@ -95,11 +129,14 @@ func listen(srv *http.Server, p Params) error {
 		// NOTE: a wildcard *.BaseDomain certificate requires a DNS-01 solver;
 		// HTTP-01 cannot issue wildcards. Operators must supply a DNS-01 solver
 		// or a pre-issued *.BaseDomain cert (use TLSFile for the latter).
-		// HostPolicy permits any host; the front router decides validity.
+		cacheDir := p.AutocertCacheDir
+		if cacheDir == "" {
+			cacheDir = "./pb_control/autocert"
+		}
 		certManager := &autocert.Manager{
 			Prompt:     autocert.AcceptTOS,
-			Cache:      autocert.DirCache("./pb_control/autocert"),
-			HostPolicy: func(_ context.Context, host string) error { return nil },
+			Cache:      autocert.DirCache(cacheDir),
+			HostPolicy: autocertHostPolicy(p.BaseDomain),
 		}
 		srv.TLSConfig = &tls.Config{MinVersion: tls.VersionTLS12, GetCertificate: certManager.GetCertificate}
 		err = srv.ListenAndServeTLS("", "")

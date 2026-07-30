@@ -348,3 +348,43 @@ func TestAcceptLoop_ShutdownInterruptsRetryBackoff(t *testing.T) {
 		t.Fatal("accept loop kept retrying after Shutdown")
 	}
 }
+
+// M11: a spliced IMAP/SMTP connection with no traffic in either direction
+// must eventually be torn down. Without an idle deadline, one abandoned TCP
+// connection (a client that vanished without FIN, a wedged MTA) holds
+// TrackConn forever — and a tracked connection pins the org resident: the
+// idle sweeper skips it and the LRU evictor cannot reclaim it.
+func TestSplice_TearsDownIdleConnections(t *testing.T) {
+	origIdle := spliceIdleTimeout
+	spliceIdleTimeout = 150 * time.Millisecond
+	defer func() { spliceIdleTimeout = origIdle }()
+
+	clientSide, routerSide := net.Pipe()
+	tenantSide, backSide := net.Pipe()
+	defer clientSide.Close()
+	defer tenantSide.Close()
+
+	done := make(chan struct{})
+	go func() {
+		splice(routerSide, backSide)
+		close(done)
+	}()
+
+	// Some traffic first: activity must push the deadline out.
+	for i := 0; i < 3; i++ {
+		time.Sleep(60 * time.Millisecond)
+		go func() { _, _ = clientSide.Write([]byte("a NOOP\r\n")) }()
+		buf := make([]byte, 16)
+		_ = tenantSide.SetReadDeadline(time.Now().Add(time.Second))
+		if _, err := tenantSide.Read(buf); err != nil {
+			t.Fatalf("active traffic should flow: %v", err)
+		}
+	}
+
+	// Then silence: the splice must give up on its own.
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("idle splice never tore down — the connection pins its org resident forever")
+	}
+}

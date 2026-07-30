@@ -64,6 +64,13 @@ func (s *PackageStore) versionPath(name, version string) (string, error) {
 
 // Publish writes a package version immutably. Re-publishing an existing version
 // is an error — versions never change once written.
+//
+// The write is staged: files land in a temp directory beside the version and
+// one os.Rename makes the version appear. Writing into the final path made a
+// partial failure permanent — the half-written directory satisfied the
+// immutability check, so every retry answered "already published" and the
+// only repair was rm -rf inside the store by hand. A version now either fully
+// exists or does not exist at all.
 func (s *PackageStore) Publish(name, version string, files map[string][]byte) error {
 	dir, err := s.versionPath(name, version)
 	if err != nil {
@@ -72,13 +79,27 @@ func (s *PackageStore) Publish(name, version string, files map[string][]byte) er
 	if _, err := os.Stat(dir); err == nil {
 		return fmt.Errorf("package %s@%s already published (immutable)", name, version)
 	}
+
+	// Staged beside the destination (same filesystem, so the rename is atomic)
+	// with a dot prefix a version string can never carry (versionRe requires a
+	// leading alphanumeric) — resolution can never mistake a stage for a
+	// version, and a crashed publish leaves only an inert dot-dir.
+	if err := os.MkdirAll(filepath.Dir(dir), 0o755); err != nil {
+		return err
+	}
+	stage, err := os.MkdirTemp(filepath.Dir(dir), ".publish-"+version+"-*")
+	if err != nil {
+		return err
+	}
+	defer os.RemoveAll(stage) // no-op after a successful rename
+
 	for rel, content := range files {
 		// The file paths inside the archive are the same escape one level
-		// down. Resolve and confirm the result is still under dir rather than
-		// pattern-matching the input: filepath.Join already collapses `..`,
-		// so a containment check catches every spelling.
-		full := filepath.Join(dir, filepath.FromSlash(rel))
-		if !isWithin(dir, full) {
+		// down. Resolve and confirm the result is still under the stage rather
+		// than pattern-matching the input: filepath.Join already collapses
+		// `..`, so a containment check catches every spelling.
+		full := filepath.Join(stage, filepath.FromSlash(rel))
+		if !isWithin(stage, full) {
 			return fmt.Errorf("package %s@%s: file path %q escapes the version directory", name, version, rel)
 		}
 		if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
@@ -87,6 +108,15 @@ func (s *PackageStore) Publish(name, version string, files map[string][]byte) er
 		if err := os.WriteFile(full, content, 0o644); err != nil {
 			return err
 		}
+	}
+
+	if err := os.Rename(stage, dir); err != nil {
+		// A concurrent publish won the rename; immutability wins over "we also
+		// finished" — report it the same as the up-front check would have.
+		if _, statErr := os.Stat(dir); statErr == nil {
+			return fmt.Errorf("package %s@%s already published (immutable)", name, version)
+		}
+		return err
 	}
 	return nil
 }

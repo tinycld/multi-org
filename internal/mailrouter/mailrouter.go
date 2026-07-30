@@ -31,6 +31,7 @@ import (
 	"io"
 	"log/slog"
 	"net"
+	"sync/atomic"
 	"time"
 
 	"tinycld.org/multi-org/internal/frontrouter"
@@ -297,27 +298,79 @@ func (r *Router) refuse(conn net.Conn, svc string) {
 	_ = conn.Close()
 }
 
+// spliceIdleTimeout is how long a spliced connection may go with no bytes in
+// EITHER direction before the router tears it down. Without it, one abandoned
+// TCP connection (a client that vanished without FIN, a wedged MTA) holds its
+// TrackConn forever — and a tracked connection pins the org resident: the
+// idle sweeper skips it and the LRU evictor cannot reclaim it. 30 minutes is
+// RFC 3501's minimum autologout timer, so a compliant IMAP client in IDLE
+// (which re-issues within 29 minutes) is never cut. Var for tests.
+var spliceIdleTimeout = 30 * time.Minute
+
 // splice copies both directions until each side's read half is done,
 // half-closing the opposite write half so in-flight bytes still flush —
 // an IMAP LOGOUT's tagged response must reach the client even though the
-// client's sending side finished first.
+// client's sending side finished first. A connection idle in both directions
+// past spliceIdleTimeout is closed outright (see the const).
 func splice(a, b net.Conn) {
+	var lastActivity atomic.Int64
+	lastActivity.Store(time.Now().UnixNano())
+
 	type closeWriter interface{ CloseWrite() error }
 	done := make(chan struct{}, 1)
+	stop := make(chan struct{})
 	cp := func(dst, src net.Conn) {
-		_, _ = io.Copy(dst, src)
+		_, _ = io.Copy(dst, &activityReader{conn: src, last: &lastActivity})
 		if cw, ok := dst.(closeWriter); ok {
 			_ = cw.CloseWrite()
 		} else {
 			_ = dst.Close()
 		}
 	}
+
+	// The watchdog closes both conns when the splice has been silent past the
+	// deadline, which unblocks both copies. Polling beats per-read
+	// SetReadDeadline juggling: two goroutines share the two conns, and a
+	// deadline set by one direction would clip the other's in-flight read.
+	go func() {
+		ticker := time.NewTicker(spliceIdleTimeout / 4)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-stop:
+				return
+			case <-ticker.C:
+				if time.Since(time.Unix(0, lastActivity.Load())) > spliceIdleTimeout {
+					_ = a.Close()
+					_ = b.Close()
+					return
+				}
+			}
+		}
+	}()
+
 	go func() {
 		cp(a, b)
 		done <- struct{}{}
 	}()
 	cp(b, a)
 	<-done
+	close(stop)
 	_ = a.Close()
 	_ = b.Close()
+}
+
+// activityReader stamps the shared last-activity clock on every successful
+// read, so traffic in either direction pushes the idle deadline out.
+type activityReader struct {
+	conn net.Conn
+	last *atomic.Int64
+}
+
+func (r *activityReader) Read(p []byte) (int, error) {
+	n, err := r.conn.Read(p)
+	if n > 0 {
+		r.last.Store(time.Now().UnixNano())
+	}
+	return n, err
 }

@@ -29,6 +29,19 @@ import (
 // here than a tenant will take just converts the refusal into a relay error.
 const mxMaxMessageBytes = 25 << 20
 
+// mxMaxRecipients bounds one transaction's RCPT list. 100 is RFC 5321's
+// required minimum, and a legitimate MTA splits beyond it; unbounded, every
+// extra recipient is another buffered replay this frontend owes.
+const mxMaxRecipients = 100
+
+// mxMaxTargetOrgs bounds how many DISTINCT orgs one transaction may deliver
+// to. Each new org can be a cold start (relayTimeout each), so without a cap
+// a single crafted message with RCPTs across every enumerable hosted domain
+// cold-starts the whole fleet from one DATA. Real cross-org mail names a
+// couple of customers, not dozens; excess is refused 452 so a legitimate
+// sender retries the rest in a new transaction.
+const mxMaxTargetOrgs = 8
+
 // relayTimeout bounds one org's relay, including a cold spawn (the manager's
 // 45s spawnTimeout) plus the SMTP round-trips.
 const relayTimeout = 90 * time.Second
@@ -47,6 +60,7 @@ func startMX(r *Router) (*mxServer, error) {
 	srv := smtp.NewServer(&mxBackend{r: r})
 	srv.Domain = r.cfg.MXHostname
 	srv.MaxMessageBytes = mxMaxMessageBytes
+	srv.MaxRecipients = mxMaxRecipients
 	srv.EnableSMTPUTF8 = true
 	srv.ReadTimeout = 60 * time.Second
 	srv.WriteTimeout = 60 * time.Second
@@ -111,6 +125,13 @@ func (s *mxSession) Rcpt(to string, _ *smtp.RcptOptions) error {
 		// at RCPT time (not after DATA) is what lets the sender bounce
 		// per-recipient instead of per-message.
 		return &smtp.SMTPError{Code: 550, EnhancedCode: smtp.EnhancedCode{5, 1, 1}, Message: "recipient domain not hosted here"}
+	}
+	if _, admitted := s.rcpts[slug]; !admitted && len(s.rcpts) >= mxMaxTargetOrgs {
+		// Transient and per-recipient: a legitimate sender retries the excess
+		// in a fresh transaction; a fleet-wide cold-start probe does not get
+		// its fan-out. The cap is on DISTINCT orgs (each a potential cold
+		// start) — more recipients in an admitted org cost nothing extra.
+		return &smtp.SMTPError{Code: 452, EnhancedCode: smtp.EnhancedCode{4, 5, 3}, Message: "too many recipient organizations in one transaction"}
 	}
 	s.rcpts[slug] = append(s.rcpts[slug], to)
 	return nil

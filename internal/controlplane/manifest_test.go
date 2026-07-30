@@ -133,6 +133,41 @@ func TestEvalManifest_InterruptsRunawayScript(t *testing.T) {
 	}
 }
 
+// M7 (partial): the interrupt bounds TIME, not MEMORY — a doubling-string
+// bomb allocates gigabytes in microseconds and takes the router (and every
+// tenant it fronts) down with it. Size caps close the cheap paths: an
+// oversized manifest source is refused before eval, and an eval that
+// materializes an oversized export is refused before it is stored. A small
+// script can still allocate transiently inside the window — full isolation
+// needs a subprocess with rlimits — but publish is superuser-only, so the
+// caps bound the accident, and the review records the residual.
+func TestEmitManifestJSON_RefusesOversizedSource(t *testing.T) {
+	huge := make([]byte, manifestSourceMaxBytes+1)
+	for i := range huge {
+		huge[i] = ' '
+	}
+	copy(huge, []byte("export default {name: 'x'}"))
+
+	_, err := emitManifestJSON(map[string][]byte{"manifest.ts": huge})
+	if err == nil {
+		t.Fatal("oversized manifest source accepted")
+	}
+}
+
+func TestEmitManifestJSON_RefusesOversizedExport(t *testing.T) {
+	// ~64 MiB string from a few bytes of source: the classic doubling bomb,
+	// small enough to stay allocated briefly in a test.
+	src := `
+let s = 'xxxxxxxxxxxxxxxx'
+for (let i = 0; i < 22; i++) s += s
+export default { name: 'bomb', blob: s }
+`
+	_, err := emitManifestJSON(map[string][]byte{"manifest.ts": []byte(src)})
+	if err == nil {
+		t.Fatal("a manifest exporting tens of megabytes was accepted into the store")
+	}
+}
+
 func TestEmitManifestJSON_NoManifestIsNoop(t *testing.T) {
 	files := map[string][]byte{"pb-migrations/x.js": []byte("migrate(()=>{})")}
 	out, err := emitManifestJSON(files)
@@ -286,6 +321,30 @@ export default manifest
 	}
 	if got := sources[0].Prefix; got != "/dav/files" {
 		t.Errorf("prefix = %q, want the reserved-namespace default /dav/files", got)
+	}
+}
+
+// M8: a manifest claiming a reserved namespace shadows infrastructure — /api
+// puts a Basic-Auth DAV handler in front of PocketBase's entire REST API, /_
+// in front of its dashboard, /.well-known in front of protocol discovery. A
+// hostile or sloppy package must not be able to intercept those.
+func TestWebDAVSources_RejectsReservedNamespaces(t *testing.T) {
+	for _, bad := range []string{"/api", "/api/v2", "/_", "/_/x", "/.well-known", "/.well-known/caldav"} {
+		dir := writeManifestPkg(t, `
+const manifest = {
+    name: 'Files', slug: 'files', version: '1.0.0', description: 'files',
+    webdav: { prefix: '`+bad+`', collection: 'file_items', fields: { name: 'name' } },
+}
+export default manifest
+`)
+		_, err := WebDAVSources([]lockfile.ResolvedPackage{{Name: "files", Dir: dir}})
+		if err == nil {
+			t.Errorf("prefix %q accepted — it shadows a reserved namespace", bad)
+			continue
+		}
+		if !strings.Contains(err.Error(), "files") {
+			t.Errorf("prefix %q: error %q does not name the package", bad, err)
+		}
 	}
 }
 

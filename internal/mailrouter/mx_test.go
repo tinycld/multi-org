@@ -236,3 +236,67 @@ func TestMX_TenantFailureYieldsTransient451(t *testing.T) {
 func smtpErrAs(err error, target **smtp.SMTPError) bool {
 	return errors.As(err, target)
 }
+
+// M10: one SMTP transaction can fan out to N orgs, and each relay may be a
+// 90s cold start. Unbounded, a single crafted message with RCPTs across every
+// enumerable hosted domain cold-starts the whole fleet inside one DATA.
+// Recipients are capped (go-smtp's MaxRecipients) and so is the number of
+// DISTINCT target orgs one transaction may name.
+func TestMX_CapsRecipientsAndTargetOrgs(t *testing.T) {
+	r := startRouter(t, Config{
+		MXAddr: "127.0.0.1:0",
+		GetOrg: func(_ context.Context, slug string) (Tenant, error) {
+			return nil, fmt.Errorf("never reached: the cap refuses at RCPT time")
+		},
+		// Every domain maps to its own org.
+		LookupDomain: func(domain string) (string, bool) {
+			slug, _, _ := strings.Cut(domain, ".")
+			return slug, true
+		},
+	})
+
+	c := mxClient(t, r.MXListenerAddr())
+	if err := c.Mail("sender@elsewhere.example", nil); err != nil {
+		t.Fatal(err)
+	}
+	refused := -1
+	for i := 0; i < mxMaxTargetOrgs+1; i++ {
+		if err := c.Rcpt(fmt.Sprintf("user@org%d.example", i), nil); err != nil {
+			refused = i
+			break
+		}
+	}
+	if refused != mxMaxTargetOrgs {
+		t.Fatalf("recipient for org #%d was refused, want the cap to trip at %d distinct orgs",
+			refused, mxMaxTargetOrgs)
+	}
+
+	// More recipients in an ALREADY-ADMITTED org stay fine — the cap is on
+	// cold-startable orgs, not on teammates sharing one domain.
+	if err := c.Rcpt("second-user@org0.example", nil); err != nil {
+		t.Fatalf("additional recipient in an admitted org refused: %v", err)
+	}
+}
+
+func TestMX_ServerCapsTotalRecipients(t *testing.T) {
+	r := startRouter(t, Config{
+		MXAddr:       "127.0.0.1:0",
+		GetOrg:       func(_ context.Context, slug string) (Tenant, error) { return nil, fmt.Errorf("x") },
+		LookupDomain: func(string) (string, bool) { return "one-org", true },
+	})
+
+	c := mxClient(t, r.MXListenerAddr())
+	if err := c.Mail("sender@elsewhere.example", nil); err != nil {
+		t.Fatal(err)
+	}
+	refused := false
+	for i := 0; i < mxMaxRecipients+1; i++ {
+		if err := c.Rcpt(fmt.Sprintf("u%d@hosted.example", i), nil); err != nil {
+			refused = true
+			break
+		}
+	}
+	if !refused {
+		t.Fatalf("%d recipients accepted in one transaction — nothing bounds the buffer fan-out", mxMaxRecipients+1)
+	}
+}

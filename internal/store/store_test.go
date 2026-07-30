@@ -121,3 +121,60 @@ func TestStore_AcceptsOrdinaryNames(t *testing.T) {
 		}
 	}
 }
+
+// M6: a failed publish must leave NOTHING behind. Before staging, a partial
+// write left a half-populated version directory that every retry refused as
+// "already published (immutable)" — the only recourse was rm -rf inside the
+// store by hand.
+func TestStore_FailedPublishIsRepairable(t *testing.T) {
+	s := New(t.TempDir())
+
+	// One good file, one that escapes the version dir: the write fails midway.
+	err := s.Publish("@tinycld/mail", "1.0.0", map[string][]byte{
+		"manifest.json": []byte(`{}`),
+		"../escape":     []byte("nope"),
+	})
+	if err == nil {
+		t.Fatal("expected the escaping path to fail the publish")
+	}
+
+	// The retry with a fixed payload must succeed — no manual cleanup.
+	if err := s.Publish("@tinycld/mail", "1.0.0", map[string][]byte{
+		"manifest.json": []byte(`{"name":"@tinycld/mail"}`),
+	}); err != nil {
+		t.Fatalf("retry after failed publish = %v — the store is not repairable", err)
+	}
+
+	dir, err := s.VersionDir("@tinycld/mail", "1.0.0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "manifest.json")); err != nil {
+		t.Fatalf("published file missing: %v", err)
+	}
+}
+
+// A version directory must appear atomically: never in a state where a
+// concurrent resolve sees some files but not others.
+func TestStore_PublishStagesThenRenames(t *testing.T) {
+	root := t.TempDir()
+	s := New(root)
+	if err := s.Publish("pkg", "2.0.0", map[string][]byte{
+		"a.txt": []byte("a"),
+		"b.txt": []byte("b"),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// No staging leftovers next to the published version.
+	entries, err := os.ReadDir(filepath.Join(root, "packages", "pkg"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 || entries[0].Name() != "2.0.0" {
+		names := make([]string, 0, len(entries))
+		for _, e := range entries {
+			names = append(names, e.Name())
+		}
+		t.Fatalf("package dir holds %v, want exactly [2.0.0]", names)
+	}
+}

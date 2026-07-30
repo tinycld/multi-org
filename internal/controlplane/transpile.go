@@ -5,6 +5,7 @@ import (
 	"strings"
 
 	"github.com/evanw/esbuild/pkg/api"
+	"github.com/grafana/sobek"
 )
 
 // transpileForStore converts TypeScript entries in a package's file map to JS
@@ -36,7 +37,40 @@ func transpileForStore(files map[string][]byte) (map[string][]byte, error) {
 			}
 			return nil, fmt.Errorf("transpile %s: %s", name, strings.Join(msgs, "; "))
 		}
+		if isScriptExecuted(name) {
+			if err := rejectModuleSyntax(name, res.Code); err != nil {
+				return nil, err
+			}
+		}
 		out[strings.TrimSuffix(name, ".ts")+".js"] = res.Code
 	}
 	return out, nil
+}
+
+// isScriptExecuted reports whether the tenant runs this file as a plain
+// script (RunScript / script-mode compile) — the only files module syntax
+// breaks. manifest.ts is deliberately NOT one: it is evaluated as a
+// CommonJS module (evalManifest) and legitimately uses `export default`.
+func isScriptExecuted(name string) bool {
+	return strings.HasPrefix(name, "pb-hooks/") || strings.HasPrefix(name, "pb-migrations/")
+}
+
+// rejectModuleSyntax refuses transpiled output that still carries ES-module
+// syntax, with an error naming the author's file and the fix. Mirrors the
+// fork's jsvm transformSource check (the two transpiles must stay
+// behaviorally identical — see the shared golden test): hook files run as
+// plain scripts in the tenant, so accepting a module-syntax file into the
+// store would defer the failure to every tenant's boot instead of the
+// publisher's terminal. A script-mode parse is the authoritative test — a
+// string merely containing export-looking text parses fine.
+func rejectModuleSyntax(name string, code []byte) error {
+	_, err := sobek.Compile(name, string(code), false)
+	if err != nil && strings.Contains(err.Error(), "not supported in script") {
+		return fmt.Errorf("%s uses import/export: hook and migration files run as plain "+
+			"scripts, not ES modules — remove the top-level import/export statements "+
+			"(the PocketBase APIs are provided as globals)", name)
+	}
+	// Any other parse failure is left for the tenant's real compile, whose
+	// error already names the file.
+	return nil
 }

@@ -86,3 +86,33 @@ func keys(m map[string][]byte) []string {
 	}
 	return out
 }
+
+// A hook file using import/export must be refused AT PUBLISH with an error
+// naming the file and the fix. Hook files run as plain scripts in the tenant
+// (the fork's jsvm rejects module syntax at load with the same message);
+// letting the store accept one would defer the failure to every tenant's
+// boot instead of the publisher's terminal.
+func TestTranspileForStore_RejectsModuleSyntax(t *testing.T) {
+	_, err := transpileForStore(map[string][]byte{
+		"pb-hooks/exports.pb.ts": []byte("export const answer = 42\n"),
+	})
+	if err == nil {
+		t.Fatal("a module-syntax hook file was accepted into the store")
+	}
+	if !strings.Contains(err.Error(), "exports.pb.ts") {
+		t.Fatalf("error %q does not name the author's file", err)
+	}
+	if !strings.Contains(err.Error(), "import/export") {
+		t.Fatalf("error %q does not say what to change", err)
+	}
+}
+
+// A string that merely contains export-looking text is not module syntax.
+func TestTranspileForStore_ExportInsideStringAccepted(t *testing.T) {
+	_, err := transpileForStore(map[string][]byte{
+		"pb-hooks/strings.pb.ts": []byte("const doc = `\nexport const x = 1\n`\nconsole.log(doc)\n"),
+	})
+	if err != nil {
+		t.Fatalf("a script whose string mentions export was refused: %v", err)
+	}
+}

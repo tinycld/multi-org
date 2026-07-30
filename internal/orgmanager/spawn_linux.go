@@ -191,13 +191,36 @@ func (s *linuxSpawner) Spawn(ctx context.Context, req SpawnRequest, log *slog.Lo
 // modes are narrowed to owner-only as we go. Symlinks are skipped — the mode
 // on a symlink is meaningless and chmod would follow it into the shared
 // package store.
+//
+// Entries the tenant uid already owns are pruned from the walk. Only the
+// tenant itself creates files under its uid, so an owned subtree needs no
+// re-processing — and re-walking pb_data/storage (hundreds of thousands of
+// files for a big org) on every cold start burns the whole spawnTimeout
+// before cmd.Start is even reached, crash-looping an org that can never
+// finish a boot. Everything the host (re)writes per load — materialized
+// symlinks, fresh .runtime configs — is root-owned and still gets processed.
+// A pruned subtree stays unreadable to sibling tenants regardless of its
+// inner modes because the root's owner-only gate below is re-enforced on
+// every spawn, and Walk visits the root first.
 func chownTree(root string, uid int) error {
 	return filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			return err
 		}
-		if err := os.Lchown(path, uid, uid); err != nil {
-			return err
+		owned := false
+		if sys, ok := info.Sys().(*syscall.Stat_t); ok {
+			owned = int(sys.Uid) == uid
+		}
+		if owned && path != root {
+			if info.IsDir() && info.Mode()&os.ModeSymlink == 0 {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if !owned {
+			if err := os.Lchown(path, uid, uid); err != nil {
+				return err
+			}
 		}
 		if info.Mode()&os.ModeSymlink != 0 {
 			return nil

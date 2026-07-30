@@ -207,17 +207,20 @@ func run(orgDir, socketPath, slug string, hooksPool int, davConfigPath, caldavCo
 	defer sentry.Flush(2 * time.Second)
 
 	// Cross-org switcher cookie: on every successful users auth, upsert this
-	// org's {slug, name, url} into the parent-domain tinycld_orgs cookie so
+	// org's {slug, name} into the parent-domain tinycld_orgs cookie so
 	// sibling orgs' switcher UIs can offer this one. Requires the router to
-	// have materialized both the base domain and the org URL; a standalone
-	// serve-org (no baseDomain) sets nothing. Navigation hint only — the
-	// cookie authorizes nothing, and each org authenticates independently.
-	if appCfg.BaseDomain != "" && appCfg.AppURL != "" {
+	// have materialized the base domain; a standalone serve-org (no
+	// baseDomain) sets nothing. Navigation hint only — the cookie authorizes
+	// nothing, and each org authenticates independently. No URL is stored:
+	// the cookie is writable by JS on sibling tenants, so the client derives
+	// each org's URL from the slug and its own origin's parent domain
+	// (see internal/orgcookie).
+	if appCfg.BaseDomain != "" {
 		orgName := appCfg.OrgName
 		if orgName == "" {
 			orgName = slug
 		}
-		entry := orgcookie.Entry{Slug: slug, Name: orgName, URL: appCfg.AppURL}
+		entry := orgcookie.Entry{Slug: slug, Name: orgName}
 		app.OnRecordAuthRequest("users").BindFunc(func(e *core.RecordAuthRequestEvent) error {
 			existing := ""
 			if c, err := e.Request.Cookie(orgcookie.Name); err == nil {

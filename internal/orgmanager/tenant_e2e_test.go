@@ -206,10 +206,16 @@ func TestTenant_SetsSwitcherCookieOnAuth(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unescape cookie: %v", err)
 	}
-	for _, want := range []string{`"slug":"acme"`, `"name":"Acme Incorporated"`, `"url":"https://acme.tenants.example.test"`} {
+	for _, want := range []string{`"slug":"acme"`, `"name":"Acme Incorporated"`} {
 		if !strings.Contains(decoded, want) {
 			t.Fatalf("cookie %s missing %s", decoded, want)
 		}
+	}
+	// No URL: the cookie is writable by JS on sibling tenants, so a stored URL
+	// is an attacker-controlled navigation target. The client derives the URL
+	// from the slug and its own origin's parent domain instead.
+	if strings.Contains(decoded, `"url"`) {
+		t.Fatalf("cookie %s carries a url — the switcher target must be derived from the slug, never stored", decoded)
 	}
 
 	bad := auth("wrong-password")

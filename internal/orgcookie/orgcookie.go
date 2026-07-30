@@ -1,22 +1,30 @@
 // Package orgcookie maintains the cross-org switcher cookie.
 //
-// Each tenant upserts its own {slug, name, url} entry into a `tinycld_orgs`
-// cookie scoped to the parent domain (Domain=.<MT_BASE_DOMAIN>) whenever a
-// user authenticates, so the browser accumulates the orgs its user has
-// actually signed into. The app shell's switcher UI (core/lib/org-cookie.ts —
-// the two must agree on the wire shape) reads it back with document.cookie,
-// which is why the cookie is deliberately NOT HttpOnly.
+// Each tenant upserts its own {slug, name} entry into a `tinycld_orgs` cookie
+// scoped to the parent domain (Domain=.<MT_BASE_DOMAIN>) whenever a user
+// authenticates, so the browser accumulates the orgs its user has actually
+// signed into. The app shell's switcher UI (core/lib/org-cookie.ts — the two
+// must agree on the wire shape) reads it back with document.cookie, which is
+// why the cookie is deliberately NOT HttpOnly.
 //
 // It is a NAVIGATION HINT, not an authorization claim: the value is
 // client-writable, and every org a user navigates to still authenticates them
 // itself. Nothing reads it server-side.
+//
+// The entry deliberately carries NO URL. The cookie is writable by JS on any
+// sibling tenant, so a stored URL is an attacker-controlled navigation target:
+// one hostile org could rewrite another org's entry to point the switcher at
+// a login clone. The client derives each org's URL from its slug and the
+// parent domain of the origin it is running on — data the cookie cannot
+// influence. Slugs are validated as single DNS labels on both sides for the
+// same reason: a slug like "evil.example/x" must never survive into a URL.
 package orgcookie
 
 import (
 	"encoding/json"
 	"net/http"
 	"net/url"
-	"strings"
+	"regexp"
 )
 
 // Name is the cookie name; must match ORGS_COOKIE_NAME in core's
@@ -27,11 +35,16 @@ const Name = "tinycld_orgs"
 // matches the client parser's cap. Oldest entries fall off first.
 const maxEntries = 20
 
-// Entry is one org the browser knows about.
+// slugPattern accepts exactly one lowercase DNS label — what the front
+// router's subdomain dispatch produces. Anything else (dots, slashes,
+// uppercase) is a planted entry and is dropped.
+var slugPattern = regexp.MustCompile(`^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$`)
+
+// Entry is one org the browser knows about. The org's URL is deliberately not
+// stored — see the package comment.
 type Entry struct {
 	Slug string `json:"slug"`
 	Name string `json:"name"`
-	URL  string `json:"url"`
 }
 
 // Merge upserts entry into an existing cookie value (URL-encoded JSON array)
@@ -76,7 +89,7 @@ func decode(value string) []Entry {
 	}
 	valid := entries[:0]
 	for _, e := range entries {
-		if e.Slug == "" || !strings.HasPrefix(e.URL, "http") {
+		if !slugPattern.MatchString(e.Slug) {
 			continue
 		}
 		valid = append(valid, e)

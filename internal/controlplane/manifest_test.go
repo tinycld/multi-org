@@ -11,6 +11,7 @@ import (
 
 	"tinycld.org/multi-org/internal/davconfig"
 	"tinycld.org/multi-org/internal/lockfile"
+	"tinycld.org/multi-org/internal/manifesteval"
 )
 
 // assertFullyPopulated walks v's exported fields recursively and fails for any
@@ -111,15 +112,17 @@ func TestEmitManifestJSON_ParsesTSDefaultExport(t *testing.T) {
 // A manifest is untrusted package JS. Without an interrupt, `while(true){}`
 // spins the POST /api/store/packages goroutine forever and nothing can
 // recover it — the "pure object literal" the evaluator expects is an
-// assumption about input, not an enforced property.
+// assumption about input, not an enforced property. (The evaluator itself
+// lives in internal/manifesteval; this exercises it through the same
+// entry emitManifestJSON uses.)
 func TestEvalManifest_InterruptsRunawayScript(t *testing.T) {
-	orig := manifestEvalTimeout
-	manifestEvalTimeout = 200 * time.Millisecond
-	t.Cleanup(func() { manifestEvalTimeout = orig })
+	orig := manifesteval.Timeout
+	manifesteval.Timeout = 200 * time.Millisecond
+	t.Cleanup(func() { manifesteval.Timeout = orig })
 
 	errCh := make(chan error, 1)
 	go func() {
-		_, err := evalManifest("const manifest = {}\nwhile (true) {}\nexport default manifest", "manifest.ts")
+		_, err := manifesteval.EvalJSON("const manifest = {}\nwhile (true) {}\nexport default manifest", "manifest.ts")
 		errCh <- err
 	}()
 
@@ -128,19 +131,15 @@ func TestEvalManifest_InterruptsRunawayScript(t *testing.T) {
 		if err == nil {
 			t.Fatal("expected a timeout error for a runaway manifest")
 		}
-	case <-time.After(manifestEvalTimeout + 5*time.Second):
-		t.Fatal("evalManifest never returned for a runaway script")
+	case <-time.After(manifesteval.Timeout + 5*time.Second):
+		t.Fatal("EvalJSON never returned for a runaway script")
 	}
 }
 
-// M7 (partial): the interrupt bounds TIME, not MEMORY — a doubling-string
-// bomb allocates gigabytes in microseconds and takes the router (and every
-// tenant it fronts) down with it. Size caps close the cheap paths: an
-// oversized manifest source is refused before eval, and an eval that
-// materializes an oversized export is refused before it is stored. A small
-// script can still allocate transiently inside the window — full isolation
-// needs a subprocess with rlimits — but publish is superuser-only, so the
-// caps bound the accident, and the review records the residual.
+// Size caps close the cheap paths regardless of evaluator: an oversized
+// manifest source is refused before eval, and an eval that materializes an
+// oversized export is refused before it is stored. (Memory isolation proper
+// is the subprocess evaluator serve-multi wires — internal/manifesteval.)
 func TestEmitManifestJSON_RefusesOversizedSource(t *testing.T) {
 	huge := make([]byte, manifestSourceMaxBytes+1)
 	for i := range huge {

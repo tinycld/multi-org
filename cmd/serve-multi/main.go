@@ -21,12 +21,21 @@ import (
 	"tinycld.org/core/mailproto"
 	"tinycld.org/multi-org/internal/controlplane"
 	"tinycld.org/multi-org/internal/mailrouter"
+	"tinycld.org/multi-org/internal/manifesteval"
 	"tinycld.org/multi-org/internal/orgmanager"
 	"tinycld.org/multi-org/internal/server"
 	"tinycld.org/multi-org/internal/store"
 )
 
 func main() {
+	// The hidden manifest-eval subcommand: this same binary re-exec'd as a
+	// short-lived, memory-limited evaluator child (see internal/manifesteval).
+	// Dispatched before ANY other init — the child must not boot a control
+	// plane to run 5ms of JS.
+	if len(os.Args) > 1 && os.Args[1] == manifesteval.Subcommand {
+		os.Exit(manifesteval.ServeStdio())
+	}
+
 	// run() owns every deferred cleanup, including reaping tenant processes.
 	// main must therefore not call log.Fatal/os.Exit for anything that happens
 	// after a tenant could exist — those skip defers and orphan the children.
@@ -46,6 +55,18 @@ func run() error {
 	// The tenant binary defaults to a sibling of this one, so a deployed pair
 	// stays together without configuration.
 	tenantBinary := getenv("MT_TENANT_BINARY", defaultTenantBinary())
+
+	// Manifest JS from published packages evaluates in a re-exec'd,
+	// memory-limited child of this binary: an allocation bomb kills the
+	// child, never the router and the tenants it fronts.
+	if selfExe, err := os.Executable(); err == nil {
+		controlplane.SetManifestEvaluator(func(src, name string) ([]byte, error) {
+			return manifesteval.EvalSubprocess(context.Background(),
+				[]string{selfExe, manifesteval.Subcommand}, src, name)
+		})
+	} else {
+		log.Printf("cannot resolve own executable (%v); manifest eval stays in-process", err)
+	}
 
 	cp, err := controlplane.New(filepath.Join(root, "pb_control", "pb_data"))
 	if err != nil {

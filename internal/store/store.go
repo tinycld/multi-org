@@ -93,6 +93,13 @@ func (s *PackageStore) Publish(name, version string, files map[string][]byte) er
 	}
 	defer os.RemoveAll(stage) // no-op after a successful rename
 
+	// MkdirTemp creates 0700, and the mode survives the rename — but tenants
+	// run under their own uids and must traverse the published dir to read
+	// materialized symlinks, so it needs the store's normal 0755.
+	if err := os.Chmod(stage, 0o755); err != nil {
+		return err
+	}
+
 	for rel, content := range files {
 		// The file paths inside the archive are the same escape one level
 		// down. Resolve and confirm the result is still under the stage rather

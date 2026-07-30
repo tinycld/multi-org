@@ -177,4 +177,18 @@ func TestStore_PublishStagesThenRenames(t *testing.T) {
 		}
 		t.Fatalf("package dir holds %v, want exactly [2.0.0]", names)
 	}
+
+	// The published dir must be world-traversable: tenants run under their own
+	// uids and read materialized symlinks THROUGH this directory. os.MkdirTemp
+	// creates the stage 0700, which — carried through the rename — makes every
+	// hook file in the version unreadable to a confined tenant (the CI
+	// root-confinement suite caught exactly that as `registerHooks: permission
+	// denied`).
+	info, err := os.Stat(filepath.Join(root, "packages", "pkg", "2.0.0"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if perm := info.Mode().Perm(); perm != 0o755 {
+		t.Fatalf("version dir mode = %o, want 755 (tenant uids must traverse it)", perm)
+	}
 }

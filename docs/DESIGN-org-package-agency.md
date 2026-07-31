@@ -325,6 +325,14 @@ idle sweep, and the readiness protocol are untouched.
 4. **Tenant-side**: hosted-mode wiring for the existing Packages UI
    (propose instead of exit-75), in-tenant downs against the control-socket
    flow, `pkg_registry` reconciliation from the built-in set.
+   **Acceptance test:** the single-tenant install suite
+   (`tinycld/tests/install/todo-install.spec.ts`) run against an org
+   subdomain — same spec, both hosts, per goal 2's "same UX". Until then,
+   `tinycld/tests/install/multiorg-deploy.spec.ts` (runner
+   `run-multiorg-deploy.sh`) covers the hosted flow that exists today —
+   superuser publish → create org → deploy → respawned tenant serves the
+   new version — over real HTTP, the only over-the-wire coverage of the
+   provisioning routes.
 5. **Deletions** (§5) + hostile-child audit + kernel quotas + docs
    (append-only migration rule).
 

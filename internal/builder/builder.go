@@ -92,6 +92,14 @@ type Config struct {
 	// spec would pack arbitrary host paths into an org-readable artifact.
 	AllowDirSpecs bool
 
+	// NpmRegistry overrides the registry `npm pack` fetches specs from
+	// (e2e/operator seam: the hosted-deploy e2e serves sibling checkouts from
+	// a local registry). It applies ONLY to member-spec fetches — the build
+	// workspace's own pnpm install keeps its normal registry resolution, so a
+	// test registry that carries just the members doesn't break the
+	// third-party dependency graph. Empty = npm's default resolution.
+	NpmRegistry string
+
 	// pack fetches one spec (test seam; nil means `npm pack`).
 	pack packFn
 }
@@ -138,7 +146,7 @@ func New(cfg Config) (*Builder, error) {
 		cfg.EvalManifest = manifesteval.EvalJSON
 	}
 	if cfg.pack == nil {
-		cfg.pack = npmPack
+		cfg.pack = npmPackWith(cfg.NpmRegistry)
 	}
 	return &Builder{
 		cfg:   cfg,

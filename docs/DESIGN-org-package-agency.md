@@ -5,7 +5,10 @@ extraction + `RecipeHash` with the cross-repo golden) landed 2026-07-30 —
 see `tinycld.org/core/pkgbuild` and `internal/recipeparity/` here. Step 2
 (builder worker + dual-mode binary) landed 2026-07-31 — see `internal/builder`
 here and `tinycld.org/core/tenantmain`. Step 3 (router deploy protocol +
-builder wiring) landed 2026-07-31 — see §7. Steps 4–5 are not started.
+builder wiring) landed 2026-07-31 — see §7. Step 4 (tenant-side hosted
+Packages UI: propose instead of exit-75, in-tenant downs, registry
+reconcile from the built-in set) landed 2026-07-31 — see §7. Step 5 is not
+started.
 **Motivates:** letting a tenant's own admin manage that org's packages —
 install, uninstall, upgrade, including third-party packages the operator has
 never heard of — while a new org can still be spun up from a default set in
@@ -392,14 +395,82 @@ idle sweep, and the readiness protocol are untouched.
 4. **Tenant-side**: hosted-mode wiring for the existing Packages UI
    (propose instead of exit-75), in-tenant downs against the control-socket
    flow, `pkg_registry` reconciliation from the built-in set.
-   **Acceptance test:** the single-tenant install suite
-   (`tinycld/tests/install/todo-install.spec.ts`) run against an org
-   subdomain — same spec, both hosts, per goal 2's "same UX". Until then,
-   `tinycld/tests/install/multiorg-deploy.spec.ts` (runner
-   `run-multiorg-deploy.sh`) covers the hosted flow that exists today —
-   superuser publish → create org → deploy → respawned tenant serves the
-   new version — over real HTTP, the only over-the-wire coverage of the
-   provisioning routes.
+   **DONE 2026-07-31** — the HTTP surface is byte-identical to the
+   single-tenant `/api/admin/packages` group (same paths, shapes, auth, SSE
+   + `pkg_install_log`), so the client needed no hosted mode; everything
+   behind the handlers changed (`coreserver/pkg_hosted.go`):
+   - **Metadata moved router-side.** A confined tenant has no npm/node/git
+     (allowlist env), so the control socket grew `POST /v1/resolve`
+     (trusted-side single-spec resolve: npm pack + tarball hash + rlimited
+     manifest eval + the version's migration basenames —
+     `builder.ResolveSpec`), `POST /v1/versions` (npm view / git tags,
+     shared via `pkgbuild/versions.go` — the version-discovery code moved
+     out of coreserver per D5), and `GET /v1/state` (the org row's
+     authoritative lockfile + recipe hash; the tenant cannot reconstruct
+     the base entry from its recipe — the lockfile records the shell's npm
+     version, the recipe records @tinycld/core at CORE's version).
+     `/v1/build` now returns the artifact's `pb_migrations` basenames — the
+     "new set" side of D6's down/up delta.
+   - **Hosted pipeline** (all three operations): ctl resolve → advisory
+     compat from `pkg_registry` manifests (same gates as the host; the
+     builder's peer gate re-checks authoritatively during the warm build) →
+     next lockfile = `/v1/state` ± delta → warm `/v1/build` (the org keeps
+     serving; the §6 build-latency answer, surfaced in the progress
+     stream) → `VACUUM INTO .deploy/backup.db` on a DEDICATED trusted
+     connection (no sqlite3 CLI in a tenant, and the app's own pool is
+     `NoAttachDBConnect` — the jsvm ATTACH guard also refuses VACUUM
+     INTO's internal attach; the e2e caught this) → in-tenant DOWNs via the
+     shared `syncMigrations(applied, artifact set)` → `/v1/deploy` → wait
+     to be killed. A refused proposal restores the snapshot if downs ran,
+     and DISCARDS it otherwise — a stale `.deploy/backup.db` would be
+     restored by a later failed operator deploy over newer data.
+   - **Boot + lazy reconcile** (`coreserver/tenant_pkg_state.go`, bound by
+     `RegisterTenant` for artifact-booted tenants): consumes
+     `.runtime/deploy-result.json` exactly once — committed → the
+     `pkg_install_log` row (by job id) finalizes "success", reverted →
+     "rolled_back" with the router's reason (the UI's job-status poll
+     already understood all three terminal states, so the restart
+     discontinuity needed no client change). It runs at boot AND lazily
+     from the hosted status/job-status handlers, because the COMMIT
+     outcome is written only after the respawned tenant's readiness
+     settled (readiness IS the commit decision) — the boot reconcile
+     cannot see it; the UI's own poll is the consume trigger. (The e2e
+     caught this: without the lazy path the row stayed "running" until
+     the following boot.) It also mirrors the artifact's
+     built-in set into `pkg_registry` from `recipe.json` +
+     `manifests/<slug>/manifest.json` beside its own binary: features
+     "installed" (org admin may uninstall — never "bundled"), the base a
+     "bundled" `core` row at CORE's version, a committed uninstall's row
+     deleted, other absentees disabled. The recipe/manifests shapes moved
+     to `tenantcfg` (ArtifactRecipe) — router↔tenant ABI, one definition.
+   - **`ResolvedMember.Name` fix (both hosts):** the field's contract says
+     npm name, but both `readBuildMembers` and the builder's
+     `identifyMember` recorded the manifest's DISPLAY name ("Mail") — the
+     builder's own fixtures masked it by writing npm names into manifest
+     `name`. Now read from the member's `package.json` in both hosts (same
+     bytes → same facts; fixtures write the two names differently so
+     reading the wrong one fails tests). Recipe hashes change once, cache
+     entries re-key; step-4 lockfile/registry logic depends on the fix.
+   - **Recorded limitation:** hosted installs/version changes require
+     npm-published packages — a flat `{name: version}` lockfile has
+     nowhere to carry git provenance (§5's per-entry provenance extension
+     is the future home), and git-spec resolution runs prepare scripts, so
+     it belongs inside job confinement before the router will resolve it.
+   **Acceptance:** `TestHostedDeployE2E` (`internal/controlplane/
+   hosted_e2e_test.go`, `RUN_HOSTED_E2E=1`) drives the whole loop with real
+   builds and a real tenant process: a local npm registry serves the
+   sibling checkouts (`builder.Config.NpmRegistry` — member fetches only,
+   the workspace pnpm install keeps normal resolution), the org provisions
+   from the base+contacts artifact, the tenant's superuser drives the
+   hosted uninstall over the org socket, and the test asserts the DOWNs
+   ran, the respawn committed, job-status reads "success", and the
+   registry row is gone. The browser-level goal — the single-tenant
+   install suite (`tinycld/tests/install/todo-install.spec.ts`) verbatim
+   against an org subdomain — additionally needs an npm-published todo
+   fixture (or a registry-fronting runner) plus hosted org onboarding in
+   the runner; it remains the step-5-era finish line for goal 2's "same
+   UX". `multiorg-deploy.spec.ts` (runner `run-multiorg-deploy.sh`) keeps
+   covering the store-path provisioning routes over real HTTP.
 5. **Deletions** (§5) + hostile-child audit + kernel quotas + docs
    (append-only migration rule).
 

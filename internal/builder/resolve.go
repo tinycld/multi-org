@@ -60,15 +60,26 @@ func (r *resolvedInput) cleanup() {
 // implementation cannot vouch for its own bytes.
 type packFn func(spec, workDir string) (extractedDir, tarball string, err error)
 
-// npmPack runs `npm pack <spec>` in workDir, untars the result there, and
-// returns the extracted package/ dir plus the tarball path. For a registry
-// spec this executes nothing of the package's own (npm downloads the published
-// tarball); git and directory specs run the package's prepare/prepack scripts,
-// which is why production resolution of those belongs inside the per-job
-// confinement (see the confined runner) — the router only passes registry
-// specs today.
-func npmPack(spec, workDir string) (string, string, error) {
-	if _, err := pkgbuild.RunCmd(workDir, "npm", "pack", spec); err != nil {
+// npmPackWith returns the production packFn: `npm pack <spec>` in workDir,
+// untarring the result there and returning the extracted package/ dir plus
+// the tarball path. registry (Config.NpmRegistry) overrides the fetch
+// registry for the spec when non-empty. For a registry spec this executes
+// nothing of the package's own (npm downloads the published tarball); git and
+// directory specs run the package's prepare/prepack scripts, which is why
+// production resolution of those belongs inside the per-job confinement (see
+// the confined runner) — the router only passes registry specs today.
+func npmPackWith(registry string) packFn {
+	return func(spec, workDir string) (string, string, error) {
+		args := []string{"pack", spec}
+		if registry != "" {
+			args = append(args, "--registry", registry)
+		}
+		return npmPackArgs(spec, workDir, args)
+	}
+}
+
+func npmPackArgs(spec, workDir string, args []string) (string, string, error) {
+	if _, err := pkgbuild.RunCmd(workDir, "npm", args...); err != nil {
 		return "", "", fmt.Errorf("npm pack %s: %w", spec, err)
 	}
 	entries, err := os.ReadDir(workDir)
@@ -229,9 +240,19 @@ func (b *Builder) identifyMember(dir string) (pkgbuild.ResolvedMember, map[strin
 	case facts.Name == "" || facts.Version == "":
 		return pkgbuild.ResolvedMember{}, nil, nil, fmt.Errorf("%s declares no name/version", name)
 	}
+	// Name is the member's NPM identity from its package.json — the manifest's
+	// `name` is a display string ("Mail"). An earlier revision recorded the
+	// display name here, silently breaking ResolvedMember.Name's stated
+	// contract (the lockfile key, the tenant's version-discovery source);
+	// pkgbuild.readBuildMembers makes the same read so the two hosts' recipe
+	// facts cannot diverge for the same bytes.
+	npmName := pkgbuild.PackageJSONName(filepath.Join(dir, "package.json"))
+	if npmName == "" {
+		return pkgbuild.ResolvedMember{}, nil, nil, fmt.Errorf("member %s has no readable package.json name — cannot establish its npm identity", facts.Slug)
+	}
 	return pkgbuild.ResolvedMember{
 		Slug:    facts.Slug,
-		Name:    facts.Name,
+		Name:    npmName,
 		Version: facts.Version,
 	}, facts.PeerVersions, json.RawMessage(data), nil
 }

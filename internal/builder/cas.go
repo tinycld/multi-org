@@ -10,7 +10,7 @@ import (
 	"strings"
 	"time"
 
-	"tinycld.org/core/pkgbuild"
+	"tinycld.org/core/tenantcfg"
 )
 
 // RecipeFile is the provenance record the builder writes into every committed
@@ -18,27 +18,24 @@ import (
 // the TRUSTED parent during resolve — never copied from anything the confined
 // build job reported — so an entry's directory name can be believed. See the
 // package doc's trust argument.
-const RecipeFile = "recipe.json"
+//
+// The file's SHAPE lives in core (tenantcfg) since §7 step 4: an
+// artifact-booted tenant reads its own recipe to learn its built-in set, so
+// the shape is router↔tenant ABI — one definition for this writer and the
+// tenant's loader, like tenantcfg.DeployResult.
+const RecipeFile = tenantcfg.ArtifactRecipeFile
 
 // MemberManifestsDir is the artifact subdirectory holding each feature
 // member's evaluated manifest as manifests/<slug>/manifest.json — the same
 // shape the package store materializes, so the router's capability wiring
 // (controlplane.CardDAVSources etc.) reads an artifact member exactly like a
 // store package. Written by the trusted parent from resolve-time evaluation,
-// never by the confined job. The base member ships no manifest.
-const MemberManifestsDir = "manifests"
+// never by the confined job. The base member ships no manifest. ABI, like
+// RecipeFile: the tenant's registry reconcile reads these.
+const MemberManifestsDir = tenantcfg.ArtifactManifestsDir
 
-// Recipe is the parsed shape of RecipeFile.
-type Recipe struct {
-	RecipeHash     string                    `json:"recipeHash"`
-	BuildID        string                    `json:"buildId"`
-	BuiltAt        time.Time                 `json:"builtAt"`
-	Toolchain      pkgbuild.Toolchain        `json:"toolchain"`
-	Members        []pkgbuild.ResolvedMember `json:"members"`
-	Overrides      map[string]string         `json:"overrides"`
-	ReleaseID      string                    `json:"releaseId"`
-	RuntimeVersion string                    `json:"runtimeVersion"`
-}
+// Recipe is the parsed shape of RecipeFile (ABI-owned by tenantcfg).
+type Recipe = tenantcfg.ArtifactRecipe
 
 // Store is the content-addressed build-artifact cache: one immutable directory
 // per recipe hash under <dir>/<hex>, holding the runtime tree a tenant boots

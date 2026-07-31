@@ -32,9 +32,12 @@ import (
 // respawn settles) and rate-limited: tenants can propose churn the load
 // singleflight does not cover.
 // ArtifactBuilder is the builder surface the deployer consumes
-// (*builder.Builder satisfies it; tests inject fakes).
+// (*builder.Builder satisfies it; tests inject fakes). ResolveSpec backs the
+// control socket's /v1/resolve — the hosted tenant has no toolchain, so spec
+// metadata resolution happens on the router's trusted side.
 type ArtifactBuilder interface {
 	Build(ctx context.Context, refs []builder.PackageRef, sink pkgbuild.ProgressSink) (builder.Result, error)
+	ResolveSpec(spec string) (builder.ResolvedSpec, error)
 }
 
 type Deployer struct {
@@ -458,17 +461,45 @@ var jobIDPattern = regexp.MustCompile(`^[A-Za-z0-9_.-]{0,64}$`)
 // the slug it was constructed for, so a compromised tenant can only propose
 // changes to itself — precisely the authority being delegated.
 //
-// The surface is a versioned two-call protocol (§6's router↔tenant ABI):
+// The surface is a versioned protocol (§6's router↔tenant ABI):
 //
 //	POST /v1/build  {"lockfile": {...}}
 //	    Build or cache-hit the artifact and wait for it. The org keeps
 //	    serving its old build; novel sets pay their minutes here, so the
-//	    later deploy is a cache hit. → 200 {"recipeHash", "cached"}.
+//	    later deploy is a cache hit.
+//	    → 200 {"recipeHash", "cached", "migrations"} — migrations is the
+//	    artifact's pb_migrations basenames, the "new set" side of the
+//	    tenant's down/up delta (D6: the delta between two resolved sets is
+//	    the down/up list).
 //
 //	POST /v1/deploy {"lockfile": {...}, "jobId": "..."}
 //	    Propose the set (D6 step 2's "sends {next lockfile} and waits to be
 //	    killed"). → 202 {"recipeHash"} once the proposal is recorded and the
 //	    org row repointed; the eviction follows asynchronously.
+//
+//	POST /v1/resolve {"spec": "..."}
+//	    Trusted-side metadata resolution of one fetch spec (npm pack +
+//	    tarball hash + rlimited manifest eval): slug, npm name, version,
+//	    peerVersions, evaluated manifest, migration basenames. The hosted
+//	    Packages UI's pre-flight — a confined tenant has no toolchain.
+//	    → 200 builder.ResolvedSpec.
+//
+//	POST /v1/versions {"spec": "..."}
+//	    Available-version discovery for a stored source spec (npm view /
+//	    git tags, 60s-cached). → 200 {"source", "versions", "error"}.
+//
+//	GET /v1/state
+//	    The org's current lockfile + recipe hash from the org row — the
+//	    authoritative current set a proposal is computed against. The tenant
+//	    cannot reconstruct this from its recipe alone: the base lockfile
+//	    entry is the app shell's npm version, while the recipe records the
+//	    base under @tinycld/core at CORE's version (the key peer ranges
+//	    constrain). → 200 {"lockfile", "recipeHash"}.
+//
+// Resolution authority note: a tenant may resolve/install arbitrary specs by
+// design — that is exactly the agency being delegated (D1) — so these calls
+// need no authorization beyond the socket itself; spec shape is validated
+// before any subprocess sees it.
 func (d *Deployer) Handler(slug string) http.Handler {
 	type proposal struct {
 		Lockfile map[string]string `json:"lockfile"`
@@ -491,6 +522,24 @@ func (d *Deployer) Handler(slug string) http.Handler {
 		return p, true
 	}
 
+	// decodeSpec bounds and shape-validates a single fetch spec before any
+	// subprocess (npm/git) sees it — same stance as refsFor: constrain the
+	// token, don't sanitize.
+	decodeSpec := func(w http.ResponseWriter, r *http.Request) (string, bool) {
+		var body struct {
+			Spec string `json:"spec"`
+		}
+		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4<<10)).Decode(&body); err != nil {
+			writeCtlJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid body: " + err.Error()})
+			return "", false
+		}
+		if err := pkgbuild.ValidatePackageSpec(body.Spec); err != nil {
+			writeCtlJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+			return "", false
+		}
+		return body.Spec, true
+	}
+
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /v1/build", func(w http.ResponseWriter, r *http.Request) {
 		p, ok := decode(w, r)
@@ -505,7 +554,67 @@ func (d *Deployer) Handler(slug string) http.Handler {
 			writeCtlJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
 			return
 		}
-		writeCtlJSON(w, http.StatusOK, map[string]any{"recipeHash": res.RecipeHash, "cached": res.Cached})
+		migrations, err := builder.ArtifactMigrationBasenames(res.Dir)
+		if err != nil {
+			// The artifact committed; failing to enumerate its migrations must
+			// not report the build as failed, but the tenant CANNOT compute its
+			// down delta without the list — surface that explicitly.
+			writeCtlJSON(w, http.StatusInternalServerError, map[string]any{
+				"error": fmt.Sprintf("artifact built (%s) but its migrations could not be listed: %v", res.RecipeHash, err),
+			})
+			return
+		}
+		writeCtlJSON(w, http.StatusOK, map[string]any{
+			"recipeHash": res.RecipeHash,
+			"cached":     res.Cached,
+			"migrations": migrations,
+		})
+	})
+	mux.HandleFunc("POST /v1/resolve", func(w http.ResponseWriter, r *http.Request) {
+		spec, ok := decodeSpec(w, r)
+		if !ok {
+			return
+		}
+		res, err := d.builds.ResolveSpec(spec)
+		if err != nil {
+			writeCtlJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+			return
+		}
+		writeCtlJSON(w, http.StatusOK, res)
+	})
+	mux.HandleFunc("GET /v1/state", func(w http.ResponseWriter, r *http.Request) {
+		rec, err := d.app.FindFirstRecordByData("orgs", "slug", slug)
+		if err != nil || rec == nil {
+			writeCtlJSON(w, http.StatusNotFound, map[string]any{"error": "org not found"})
+			return
+		}
+		lock := lockfile.OrgLockfile{}
+		if raw := rec.GetString("lockfile"); raw != "" {
+			lock, err = lockfile.Parse([]byte(raw))
+			if err != nil {
+				writeCtlJSON(w, http.StatusInternalServerError, map[string]any{"error": "org lockfile unreadable: " + err.Error()})
+				return
+			}
+		}
+		writeCtlJSON(w, http.StatusOK, map[string]any{
+			"lockfile":   lock,
+			"recipeHash": rec.GetString("recipe_hash"),
+		})
+	})
+	mux.HandleFunc("POST /v1/versions", func(w http.ResponseWriter, r *http.Request) {
+		spec, ok := decodeSpec(w, r)
+		if !ok {
+			return
+		}
+		source, versions, fetchErr := pkgbuild.VersionsForSpec(spec)
+		if versions == nil {
+			versions = []string{}
+		}
+		writeCtlJSON(w, http.StatusOK, map[string]any{
+			"source":   source,
+			"versions": versions,
+			"error":    fetchErr,
+		})
 	})
 	mux.HandleFunc("POST /v1/deploy", func(w http.ResponseWriter, r *http.Request) {
 		p, ok := decode(w, r)

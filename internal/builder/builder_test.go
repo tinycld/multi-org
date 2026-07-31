@@ -49,7 +49,10 @@ func fakePackFor(t *testing.T, fixtures map[string]fixture) packFn {
 				return "", "", err
 			}
 		} else {
-			manifest := fmt.Sprintf("const manifest = {\n    name: %q,\n    slug: %q,\n    version: %q,\n", fx.name, fx.slug, fx.version)
+			// The manifest's name is a DISPLAY string; the npm identity comes
+			// from package.json. Write them differently so any code that reads
+			// the wrong one fails these tests.
+			manifest := fmt.Sprintf("const manifest = {\n    name: %q,\n    slug: %q,\n    version: %q,\n", "Display "+fx.slug, fx.slug, fx.version)
 			if len(fx.peers) > 0 {
 				manifest += "    peerVersions: {"
 				for k, v := range fx.peers {
@@ -59,6 +62,10 @@ func fakePackFor(t *testing.T, fixtures map[string]fixture) packFn {
 			}
 			manifest += "}\nexport default manifest\n"
 			if err := os.WriteFile(filepath.Join(dir, "manifest.ts"), []byte(manifest), 0o644); err != nil {
+				return "", "", err
+			}
+			pkgJSON := fmt.Sprintf(`{"name": %q, "version": %q}`+"\n", fx.name, fx.version)
+			if err := os.WriteFile(filepath.Join(dir, "package.json"), []byte(pkgJSON), 0o644); err != nil {
 				return "", "", err
 			}
 		}

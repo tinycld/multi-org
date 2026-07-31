@@ -45,6 +45,16 @@ func (f *fakeArtifactBuilder) Build(_ context.Context, refs []builder.PackageRef
 	return builder.Result{RecipeHash: f.hash, Dir: "/builds/x", Cached: true}, nil
 }
 
+func (f *fakeArtifactBuilder) ResolveSpec(spec string) (builder.ResolvedSpec, error) {
+	if f.err != nil {
+		return builder.ResolvedSpec{}, f.err
+	}
+	return builder.ResolvedSpec{
+		Slug: "todo", Name: "@tinycld/todo", Version: "1.0.0",
+		Integrity: "sha256:ff", Migrations: []string{"1751000000_todo.js"},
+	}, nil
+}
+
 // deployHarness is a control plane with one active artifact-backed org.
 type deployHarness struct {
 	cp     *ControlPlane
@@ -369,6 +379,73 @@ func TestControlHandler_DeployProtocol(t *testing.T) {
 	})
 	if rec := post("/v1/deploy", `{"lockfile":{"tinycld":"1.1.0"}}`); rec.Code != http.StatusTooManyRequests {
 		t.Fatalf("rate-limited deploy = %d", rec.Code)
+	}
+}
+
+// The step-4 metadata surface: /v1/resolve, /v1/versions input validation,
+// /v1/state, and /v1/build's migrations list.
+func TestControlHandler_MetadataSurface(t *testing.T) {
+	h := newDeployHarness(t)
+	d := newDeployer(h.cp.App, h.root, &fakeArtifactBuilder{hash: hashNew},
+		func(string) {}, nil, quietTestLogger())
+	handler := d.Handler("acme")
+
+	post := func(path, body string) *httptest.ResponseRecorder {
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodPost, path, strings.NewReader(body))
+		handler.ServeHTTP(rec, req)
+		return rec
+	}
+
+	// /v1/resolve returns the builder's trusted-side facts.
+	rec := post("/v1/resolve", `{"spec":"@tinycld/todo@1.0.0"}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("resolve = %d: %s", rec.Code, rec.Body)
+	}
+	var resolved builder.ResolvedSpec
+	if err := json.Unmarshal(rec.Body.Bytes(), &resolved); err != nil {
+		t.Fatal(err)
+	}
+	if resolved.Slug != "todo" || resolved.Name != "@tinycld/todo" || len(resolved.Migrations) != 1 {
+		t.Fatalf("resolved = %+v", resolved)
+	}
+
+	// Spec shape is validated before any subprocess sees it.
+	if rec := post("/v1/resolve", `{"spec":"; rm -rf /"}`); rec.Code != http.StatusBadRequest {
+		t.Fatalf("hostile resolve spec = %d", rec.Code)
+	}
+	if rec := post("/v1/versions", `{"spec":"--flag-smuggle"}`); rec.Code != http.StatusBadRequest {
+		t.Fatalf("hostile versions spec = %d", rec.Code)
+	}
+
+	// /v1/build carries the artifact's migration basenames (the fake's dir has
+	// none — an empty, non-null list).
+	rec = post("/v1/build", `{"lockfile":{"tinycld":"1.1.0"}}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("build = %d: %s", rec.Code, rec.Body)
+	}
+	var buildResp struct {
+		Migrations []string `json:"migrations"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &buildResp); err != nil || buildResp.Migrations == nil {
+		t.Fatalf("build response migrations missing/null: %s (err=%v)", rec.Body, err)
+	}
+
+	// /v1/state serves the org row's lockfile + recipe hash.
+	stateRec := httptest.NewRecorder()
+	handler.ServeHTTP(stateRec, httptest.NewRequest(http.MethodGet, "/v1/state", nil))
+	if stateRec.Code != http.StatusOK {
+		t.Fatalf("state = %d: %s", stateRec.Code, stateRec.Body)
+	}
+	var state struct {
+		Lockfile   map[string]string `json:"lockfile"`
+		RecipeHash string            `json:"recipeHash"`
+	}
+	if err := json.Unmarshal(stateRec.Body.Bytes(), &state); err != nil {
+		t.Fatal(err)
+	}
+	if state.Lockfile["tinycld"] != "1.0.0" || state.RecipeHash != hashOld {
+		t.Fatalf("state = %+v", state)
 	}
 }
 

@@ -429,6 +429,16 @@ cd tinycld/server && go build -o /tmp/tinycld-server .
 cd multi-org && go build ./... && go vet ./... && go test ./... -count=1
 go test ./internal/controlplane/ -run TestIntegration_MultiOrgCardDAV -v
 
+# Gated, minutes-long e2es (need node/pnpm/npm/go; reuse a warm pnpm store):
+#   builder: full default set builds + a tenant boots from the artifact
+RUN_BUILDER_E2E=1 BUILDER_E2E_PNPM_STORE=$(pnpm store path) \
+  go test ./internal/builder/ -run TestBuilderE2E -v -timeout 45m
+#   hosted deploy loop (§7 step 4): local npm registry over the sibling
+#   checkouts → real base+contacts build → tenant boots → hosted uninstall
+#   over the org socket → downs → deploy → respawn commits
+RUN_HOSTED_E2E=1 BUILDER_E2E_PNPM_STORE=$(pnpm store path) \
+  go test ./internal/controlplane/ -run TestHostedDeployE2E -v -timeout 60m
+
 # Tenant-process tests build and spawn the real serve-org binary; -short skips them.
 go test ./internal/orgmanager/ -run TestTenant -v
 

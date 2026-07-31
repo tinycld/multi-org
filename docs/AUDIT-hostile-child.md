@@ -77,8 +77,9 @@ are immutable to the job uid. Status: **FIXED**.
 ## MEDIUM / LOW
 
 - **M1** — ready→exit resets crash backoff to 1s forever (`clearCrash` on the
-  readiness handshake, not on sustained health). Status: **FIXED** (clear only
-  after a sustained-health interval).
+  readiness handshake, not on sustained health). Status: **OPEN** — the fix
+  needs a per-slug delayed-clear timer with cancellation on crash/evict (a
+  timer restructure, not a small edit); left as a follow-up.
 - **M2** — readiness is a self-report; the router never probes the socket, so a
   ready-but-not-serving build forges a deploy commit. Status: **OPEN**
   (follow-up: dial + health-check before treating a spawn as ready).
@@ -93,8 +94,9 @@ are immutable to the job uid. Status: **FIXED**.
 - **L1** — `--confine-packages` remount is child-enforced / post-`init()`;
   sound as defense-in-depth only (the binary can't be swapped by the tenant).
 - **L2** — degraded (non-root) mode collapses the ctl.sock boundary → cross-org
-  deploy authority. Status: **FIXED** (refuse to bind control sockets when
-  confinement is absent).
+  deploy authority. Status: **FIXED** — the manager binds control sockets only
+  when the spawner reports it confines (`Spawner.Confines()`); degraded mode =
+  no tenant-proposed deploys (operator-API deploys unaffected).
 - **L3** — `manifesteval` child only `RLIMIT_AS`; low risk (sobek, no bindings).
   Env scrubbing lands with C3.
 - **L4** — cgroup path built from a slug; re-assert `SlugPattern` at the

@@ -58,13 +58,32 @@ type Deployer struct {
 	busy     map[string]bool
 	last     map[string]time.Time
 	inflight map[string]int // recipe hash → deploys between Build and settle
+
+	// readMin is the per-org floor between accepted /v1/build, /v1/resolve and
+	// /v1/versions calls. These are read-ish (a build is a cache hit or shares
+	// the builder's singleflight; resolve/versions shell out to npm/git), so
+	// they are NOT serialized behind the deploy mutex — doing so would break the
+	// warm-build-while-serving flow (a tenant builds its next set while the org
+	// keeps serving). A short min-interval is enough to stop a tenant hammering
+	// the router's inline toolchain into disk/fd/process exhaustion; the
+	// builder's own MaxConcurrent semaphore caps genuine build concurrency.
+	readMin  time.Duration
+	lastRead map[string]time.Time
 }
 
 // Typed refusals the control-socket handler maps onto status codes.
 var (
 	errDeployBusy        = errors.New("a deploy is already in progress for this org")
 	errDeployRateLimited = errors.New("deploys are rate-limited for this org; retry shortly")
+	errReadRateLimited   = errors.New("too many requests for this org; retry shortly")
 )
+
+// maxLockfileEntries caps how many packages one lockfile may name. A 1 MiB body
+// (the control-socket read limit) admits ~10^5 minimal entries; refsFor then
+// runs a regexp per entry and the builder resolves each, so an unbounded set is
+// a cheap way to burn router CPU. No real org set approaches this — the base
+// shell plus every shipped feature is well under 256.
+const maxLockfileEntries = 256
 
 func newDeployer(app core.App, root string, b ArtifactBuilder, evict EvictFunc, verify VerifyFunc, log *slog.Logger) *Deployer {
 	if log == nil {
@@ -78,10 +97,27 @@ func newDeployer(app core.App, root string, b ArtifactBuilder, evict EvictFunc, 
 		verify:      verify,
 		log:         log,
 		minInterval: 30 * time.Second,
+		readMin:     time.Second,
 		busy:        map[string]bool{},
 		last:        map[string]time.Time{},
 		inflight:    map[string]int{},
+		lastRead:    map[string]time.Time{},
 	}
+}
+
+// beginRead throttles the read-ish control endpoints (/v1/build, /v1/resolve,
+// /v1/versions) per-org: at most one accepted call per readMin. Separate from
+// begin (the deploy slot) on purpose — these must NOT serialize behind the
+// deploy mutex, or a tenant warming its next build while serving would deadlock
+// against its own in-flight deploy.
+func (d *Deployer) beginRead(slug string) error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if since := time.Since(d.lastRead[slug]); since < d.readMin {
+		return errReadRateLimited
+	}
+	d.lastRead[slug] = time.Now()
+	return nil
 }
 
 // begin claims the org's deploy slot: one at a time, not too often.
@@ -165,6 +201,9 @@ func IsArtifactSet(lock map[string]string) bool {
 func refsFor(lock map[string]string) ([]builder.PackageRef, error) {
 	if len(lock) == 0 {
 		return nil, fmt.Errorf("empty package set")
+	}
+	if len(lock) > maxLockfileEntries {
+		return nil, fmt.Errorf("package set too large: %d entries (max %d)", len(lock), maxLockfileEntries)
 	}
 	names := make([]string, 0, len(lock))
 	for name := range lock {
@@ -552,8 +591,22 @@ func (d *Deployer) Handler(slug string) http.Handler {
 		return body.Spec, true
 	}
 
+	// throttle applies the per-org read-endpoint rate limit, answering 429 when
+	// the caller is inside the floor. Returns false when the request should not
+	// proceed.
+	throttle := func(w http.ResponseWriter) bool {
+		if err := d.beginRead(slug); err != nil {
+			writeCtlJSON(w, http.StatusTooManyRequests, map[string]any{"error": err.Error()})
+			return false
+		}
+		return true
+	}
+
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /v1/build", func(w http.ResponseWriter, r *http.Request) {
+		if !throttle(w) {
+			return
+		}
 		p, ok := decode(w, r)
 		if !ok {
 			return
@@ -583,6 +636,9 @@ func (d *Deployer) Handler(slug string) http.Handler {
 		})
 	})
 	mux.HandleFunc("POST /v1/resolve", func(w http.ResponseWriter, r *http.Request) {
+		if !throttle(w) {
+			return
+		}
 		spec, ok := decodeSpec(w, r)
 		if !ok {
 			return
@@ -614,6 +670,9 @@ func (d *Deployer) Handler(slug string) http.Handler {
 		})
 	})
 	mux.HandleFunc("POST /v1/versions", func(w http.ResponseWriter, r *http.Request) {
+		if !throttle(w) {
+			return
+		}
 		spec, ok := decodeSpec(w, r)
 		if !ok {
 			return

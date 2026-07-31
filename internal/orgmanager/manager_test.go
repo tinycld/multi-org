@@ -243,6 +243,32 @@ func TestGet_UnknownOrgIsNotFound(t *testing.T) {
 	}
 }
 
+// L4: the manager builds filesystem paths (org dir, socket dir, cgroup group
+// "tenant-"+slug) from the slug, so it re-asserts the control-plane slug shape
+// locally and fails closed on anything malformed — before LookupOrg, before any
+// path is built, and without spawning.
+func TestGet_MalformedSlugFailsClosed(t *testing.T) {
+	for _, slug := range []string{
+		"../etc",
+		"a/b",
+		"tenant-../evil",
+		"UPPER",
+		"has space",
+		"",
+		"..",
+	} {
+		sp := &fakeSpawner{}
+		mgr := newTestManager(t, sp)
+		_, err := mgr.Get(context.Background(), slug)
+		if !errors.Is(err, orgerr.ErrOrgNotFound) {
+			t.Errorf("Get(%q) err = %v, want ErrOrgNotFound", slug, err)
+		}
+		if sp.spawnCount() != 0 {
+			t.Errorf("Get(%q) spawned %d times; a malformed slug must never reach a spawn", slug, sp.spawnCount())
+		}
+	}
+}
+
 func TestGet_SuspendedOrgIsNotActive(t *testing.T) {
 	mgr := newTestManager(t, &fakeSpawner{})
 	_, err := mgr.Get(context.Background(), "suspended")

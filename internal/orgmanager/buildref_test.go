@@ -209,3 +209,39 @@ func TestControlSocket_BoundServedAndTornDown(t *testing.T) {
 		t.Fatal("control socket file survived teardown")
 	}
 }
+
+// L2: with a Control handler wired but the spawner NOT confining tenants (a
+// non-root host, unset uid window, or the darwin dev fallback), every tenant
+// runs as the same host user, so the 0700 socket-dir identity that
+// authenticates the ctl.sock collapses. The manager must refuse to bind the
+// control socket at all — degraded mode has no tenant-proposed deploys.
+func TestControlSocket_NotBoundWhenUnconfined(t *testing.T) {
+	controlHandler := func(slug string) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusAccepted)
+		})
+	}
+
+	// Confined spawner: the control socket is bound and handed to the tenant.
+	confined := &fakeSpawner{}
+	mgr := newArtifactManager(t, confined, fakeArtifact(t))
+	mgr.cfg.Control = controlHandler
+	if _, err := mgr.Get(context.Background(), "acme"); err != nil {
+		t.Fatalf("Get(acme) confined: %v", err)
+	}
+	if confined.lastReq().ControlSocketPath == "" {
+		t.Fatal("confined spawner: no control socket bound despite a Control handler")
+	}
+
+	// Unconfined spawner: same Control handler, but no socket is bound and the
+	// tenant is handed no control path.
+	unconfined := &fakeSpawner{unconfined: true}
+	mgr2 := newArtifactManager(t, unconfined, fakeArtifact(t))
+	mgr2.cfg.Control = controlHandler
+	if _, err := mgr2.Get(context.Background(), "acme"); err != nil {
+		t.Fatalf("Get(acme) unconfined: %v", err)
+	}
+	if got := unconfined.lastReq().ControlSocketPath; got != "" {
+		t.Fatalf("unconfined spawner bound a control socket (%q); degraded mode must not accept tenant-proposed deploys", got)
+	}
+}

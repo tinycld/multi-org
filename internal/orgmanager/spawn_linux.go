@@ -91,6 +91,15 @@ func envInt(key string, def int) int {
 	return n
 }
 
+// Confines reports whether this spawner establishes the OS tenant boundary:
+// root (for namespaces + uid mapping) and a configured uid window. It is the
+// same predicate Spawn uses to decide req.ConfinePackages and the uid-mapping
+// clone flags — kept here as one method so the manager can gate the control
+// socket on the exact confinement state.
+func (s *linuxSpawner) Confines() bool {
+	return os.Geteuid() == 0 && s.conf.UIDBase > 0 && s.conf.UIDRange > 0
+}
+
 func (s *linuxSpawner) Spawn(ctx context.Context, req SpawnRequest, log *slog.Logger) (Process, error) {
 	// Every confinement mechanism below needs root: namespace creation wants
 	// CAP_SYS_ADMIN in the parent user namespace, and the uid window maps
@@ -210,6 +219,16 @@ func chownTree(root string, uid int) error {
 		owned := false
 		if sys, ok := info.Sys().(*syscall.Stat_t); ok {
 			owned = int(sys.Uid) == uid
+			// A tenant owns its .runtime tree between spawns and can plant a
+			// hardlink to any root-owned file on the same filesystem (e.g.
+			// /etc/shadow). Lchown'ing it would hand that inode to the tenant
+			// uid. A legitimate tenant tree has no multiply-linked regular
+			// files, so skip any we find — fs.protected_hardlinks is the kernel
+			// backstop, this is the belt. Directories always report Nlink>1
+			// (their subdirs' `..`), so this gate applies to regular files only.
+			if info.Mode().IsRegular() && sys.Nlink > 1 {
+				return nil
+			}
 		}
 		if owned && path != root {
 			if info.IsDir() && info.Mode()&os.ModeSymlink == 0 {

@@ -5,6 +5,7 @@ package orgmanager
 import (
 	"os"
 	"path/filepath"
+	"syscall"
 	"testing"
 )
 
@@ -56,5 +57,45 @@ func TestChownTree_PrunesTenantOwnedSubtrees(t *testing.T) {
 			t.Fatalf("%s mode = %o, want %o — chownTree descended into a tenant-owned subtree",
 				path, st.Mode().Perm(), want)
 		}
+	}
+}
+
+// M4: a tenant owns its org dir between spawns and can hardlink a root-owned
+// file on the same filesystem into it. chownTree must never Lchown such a link
+// out to the tenant uid — doing so would hand the tenant e.g. /etc/shadow. It
+// skips any multiply-linked regular file. Root-only (creating a root-owned
+// target the tenant uid does not own is the whole point); skips on darwin.
+func TestChownTree_SkipsHardlinkedRootFile(t *testing.T) {
+	requireConfinementEnv(t)
+
+	root := t.TempDir()
+	// A root-owned "secret" living on the same fs as the org dir. Its inode
+	// stays root's; the tenant plants a second link to it inside the org tree.
+	secret := filepath.Join(root, "secret")
+	if err := os.WriteFile(secret, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	orgDir := filepath.Join(root, "org")
+	if err := os.MkdirAll(orgDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	planted := filepath.Join(orgDir, "planted")
+	if err := os.Link(secret, planted); err != nil {
+		t.Fatal(err)
+	}
+
+	const tenantUID = 60000
+	if err := chownTree(orgDir, tenantUID); err != nil {
+		t.Fatal(err)
+	}
+
+	// The shared inode must still be root's — reading either link's owner shows
+	// it, since they are the same inode.
+	var st syscall.Stat_t
+	if err := syscall.Lstat(secret, &st); err != nil {
+		t.Fatal(err)
+	}
+	if st.Uid == tenantUID {
+		t.Fatalf("hardlinked root file was chowned to the tenant uid (%d) — the shadow-file escape", tenantUID)
 	}
 }

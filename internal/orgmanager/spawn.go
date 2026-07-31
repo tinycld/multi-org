@@ -92,4 +92,13 @@ type SpawnRequest struct {
 // are shared (see spawn_exec.go).
 type Spawner interface {
 	Spawn(ctx context.Context, req SpawnRequest, log *slog.Logger) (Process, error)
+
+	// Confines reports whether tenants are OS-isolated (distinct uids + mount/PID
+	// namespaces). When false — a non-root host, an unset uid window, or the
+	// darwin dev fallback — every tenant runs as the same host user, so the
+	// 0700 per-org socket-dir identity collapses: any tenant can dial any org's
+	// ctl.sock and deploy to it. The manager refuses to bind control sockets in
+	// that case, so degraded mode = no tenant-proposed deploys (operator-driven
+	// deploys through the control-plane API still work).
+	Confines() bool
 }

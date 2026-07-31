@@ -388,6 +388,7 @@ func TestControlHandler_MetadataSurface(t *testing.T) {
 	h := newDeployHarness(t)
 	d := newDeployer(h.cp.App, h.root, &fakeArtifactBuilder{hash: hashNew},
 		func(string) {}, nil, quietTestLogger())
+	d.readMin = 0 // exercise several read endpoints back-to-back
 	handler := d.Handler("acme")
 
 	post := func(path, body string) *httptest.ResponseRecorder {
@@ -459,6 +460,7 @@ func TestControlHandler_MetadataSurfaceRefusesNonRegistrySpecs(t *testing.T) {
 	h := newDeployHarness(t)
 	d := newDeployer(h.cp.App, h.root, &fakeArtifactBuilder{hash: hashNew},
 		func(string) {}, nil, quietTestLogger())
+	d.readMin = 0 // exercise several read endpoints back-to-back
 	handler := d.Handler("acme")
 
 	post := func(path, body string) int {
@@ -493,6 +495,62 @@ func TestControlHandler_MetadataSurfaceRefusesNonRegistrySpecs(t *testing.T) {
 func jsonString(s string) string {
 	b, _ := json.Marshal(s)
 	return string(b)
+}
+
+// H1: an over-cap lockfile is refused before the builder resolves it, and the
+// read-ish endpoints (/v1/resolve here) are per-org rate-limited so a tenant
+// cannot hammer the router's inline toolchain.
+func TestControlHandler_ReadEndpointsBounded(t *testing.T) {
+	h := newDeployHarness(t)
+	d := newDeployer(h.cp.App, h.root, &fakeArtifactBuilder{hash: hashNew},
+		func(string) {}, nil, quietTestLogger())
+	handler := d.Handler("acme")
+
+	post := func(path, body string) int {
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, path, strings.NewReader(body)))
+		return rec.Code
+	}
+
+	// An over-cap lockfile is refused (the first read call in this test, so the
+	// rate limiter admits it — the 400 is the size cap, not the throttle).
+	var b strings.Builder
+	b.WriteString(`{"lockfile":{`)
+	for i := 0; i <= maxLockfileEntries; i++ {
+		if i > 0 {
+			b.WriteByte(',')
+		}
+		fmt.Fprintf(&b, `"pkg%d":"1.0.0"`, i)
+	}
+	b.WriteString(`}}`)
+	if code := post("/v1/build", b.String()); code != http.StatusBadRequest {
+		t.Fatalf("over-cap lockfile = %d, want 400", code)
+	}
+
+	// Hammering /v1/resolve: the first call in the readMin window is admitted
+	// (400 here — the fake resolves fine, but this exercises the throttle, not
+	// the resolver), subsequent ones inside the window are throttled to 429.
+	d.lastRead["acme"] = time.Time{} // reset the window the build call consumed
+	throttled := 0
+	for i := 0; i < 20; i++ {
+		if post("/v1/resolve", `{"spec":"@tinycld/todo@1.0.0"}`) == http.StatusTooManyRequests {
+			throttled++
+		}
+	}
+	if throttled == 0 {
+		t.Fatalf("no /v1/resolve call was throttled; the per-org rate limit is not enforced")
+	}
+}
+
+// refsFor rejects an over-cap set directly, before the builder ever runs.
+func TestRefsFor_RejectsOverCapLockfile(t *testing.T) {
+	lock := make(map[string]string, maxLockfileEntries+1)
+	for i := 0; i <= maxLockfileEntries; i++ {
+		lock[fmt.Sprintf("pkg%d", i)] = "1.0.0"
+	}
+	if _, err := refsFor(lock); err == nil || !strings.Contains(err.Error(), "too large") {
+		t.Fatalf("refsFor(over-cap) = %v, want a size-cap refusal", err)
+	}
 }
 
 func TestLiveRecipeHashes_CoversRowsAndInflight(t *testing.T) {

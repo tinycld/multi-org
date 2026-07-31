@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"regexp"
 	"slices"
 	"sync"
 	"syscall"
@@ -232,6 +233,16 @@ type OrgManager struct {
 	spawnSem chan struct{}
 }
 
+// slugPattern re-asserts the control-plane's slug shape locally at the
+// orgmanager load boundary (L4). The manager builds filesystem paths from a
+// slug — the per-org dir, socket dir, and the cgroup group "tenant-"+slug — off
+// whatever its LookupFunc returns, and re-validates nothing from the control
+// plane. A defensive local check keeps the "slug is a safe path component"
+// invariant true where the paths are actually built, so a bug or a compromised
+// lookup upstream cannot traverse via a crafted slug. Same expression as the
+// control plane's provisioning.go slugRe.
+var slugPattern = regexp.MustCompile(`^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$`)
+
 func nowNanos() int64 { return time.Now().UnixNano() }
 
 func New(cfg Config) *OrgManager {
@@ -331,6 +342,14 @@ func (m *OrgManager) noteLoadFailure(slug string, err error) error {
 }
 
 func (m *OrgManager) load(ctx context.Context, slug string) (*OrgInstance, error) {
+	// Fail closed on a malformed slug before any filesystem path is built from
+	// it (L4): the org dir, socket dir, and cgroup group name all embed the
+	// slug. A slug that does not match names no provisionable org, so treat it
+	// as not-found.
+	if !slugPattern.MatchString(slug) {
+		return nil, fmt.Errorf("%w: %q is not a valid org slug", orgerr.ErrOrgNotFound, slug)
+	}
+
 	// Captured before any work: anything this load observes about the org
 	// (status, lockfile, materialized packages) is only valid so long as no
 	// Evict has intervened by the time we publish.
@@ -509,7 +528,7 @@ func (m *OrgManager) spawn(ctx context.Context, slug, orgDir string, src bootSou
 	// every other per-org socket — so it is bound before the child exists and
 	// its lifecycle belongs to the instance teardown, not the child.
 	var ctl *controlServer
-	if m.cfg.Control != nil {
+	if m.controlEnabled() {
 		ctl, err = startControl(socks.ctl, m.cfg.Control(slug), log)
 		if err != nil {
 			return nil, fmt.Errorf("%w: control socket for %s: %v", orgerr.ErrOrgUnavailable, slug, err)
@@ -671,8 +690,19 @@ func (s orgSockets) all() []string {
 // decision is therefore made once per org, on the longest basename needed —
 // splitting an org's sockets across directories would leave some in a dir the
 // spawner never chowned.
+// controlEnabled reports whether the manager should bind per-org control
+// sockets: a Control handler must be wired AND the spawner must actually confine
+// tenants. Without confinement every tenant runs as the same host user, so the
+// 0700 socket-dir identity that authenticates the ctl.sock collapses — any
+// tenant could dial any org's socket and deploy to it. Refusing the bind in
+// that case means degraded mode has no tenant-proposed deploys (L2); the
+// control-plane API's operator-driven deploys are unaffected.
+func (m *OrgManager) controlEnabled() bool {
+	return m.cfg.Control != nil && m.cfg.Spawner != nil && m.cfg.Spawner.Confines()
+}
+
 func (m *OrgManager) socketPaths(slug string, withMail bool) (orgSockets, error) {
-	withControl := m.cfg.Control != nil
+	withControl := m.controlEnabled()
 	longestBase := func(httpBase string) string {
 		longest := httpBase
 		if withMail {

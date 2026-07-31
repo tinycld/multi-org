@@ -36,6 +36,8 @@ func (c *countingSpawner) Spawn(ctx context.Context, req orgmanager.SpawnRequest
 	return c.inner.Spawn(ctx, req, log)
 }
 
+func (c *countingSpawner) Confines() bool { return c.inner.Confines() }
+
 // baseMember is the app-shell entry every recipe carries. BuildResolver skips
 // it when deriving the resolved feature list (it ships no manifest).
 func baseMember() pkgbuild.ResolvedMember {

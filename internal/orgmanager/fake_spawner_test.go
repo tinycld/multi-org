@@ -32,6 +32,12 @@ type fakeSpawner struct {
 	// ignoreSIGTERM makes the child refuse to stop politely, forcing the kill.
 	ignoreSIGTERM bool
 
+	// unconfined makes Spawner.Confines report false — degraded mode, where the
+	// manager must refuse to bind control sockets (L2). The zero value is
+	// "confined" so existing tests that exercise the deploy channel keep binding
+	// control sockets without change.
+	unconfined bool
+
 	// gate, when non-nil, blocks inside Spawn until it is closed. It opens the
 	// window between "load has started" and "load publishes" so a test can
 	// land an Evict inside it. spawnEntered is closed once Spawn is reached.
@@ -68,6 +74,8 @@ func (f *fakeSpawner) lastProc() *fakeProcess {
 	}
 	return f.procs[len(f.procs)-1]
 }
+
+func (f *fakeSpawner) Confines() bool { return !f.unconfined }
 
 func (f *fakeSpawner) Spawn(ctx context.Context, req SpawnRequest, log *slog.Logger) (Process, error) {
 	f.mu.Lock()

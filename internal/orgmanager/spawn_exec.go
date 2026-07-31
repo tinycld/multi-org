@@ -176,6 +176,11 @@ func pipeToLog(r io.Reader, log *slog.Logger, slug string, level slog.Level) {
 // It is the darwin implementation and the base the Linux one builds on.
 type execSpawner struct{}
 
+// Confines is always false: a plain subprocess shares the host user with every
+// other tenant, so it establishes no boundary. The manager will not bind
+// control sockets under it — degraded mode has no tenant-proposed deploys.
+func (execSpawner) Confines() bool { return false }
+
 func (execSpawner) Spawn(ctx context.Context, req SpawnRequest, log *slog.Logger) (Process, error) {
 	cmd := buildCmd(req, log)
 	if err := cmd.Start(); err != nil {

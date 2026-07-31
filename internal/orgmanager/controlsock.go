@@ -6,6 +6,28 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"time"
+
+	"golang.org/x/net/netutil"
+)
+
+// Control-socket server hardening. The socket is dialed only by the org's own
+// tenant (a single confined process), so the traffic is tiny and bursty — but
+// the tenant is attacker-controlled, so an unbounded server is a slowloris /
+// fd-exhaustion lever against the ROUTER. These mirror the front server's
+// slow-loris profile (internal/server/serve.go) with tighter budgets, since a
+// control request is a small JSON body, never a long-lived SSE stream.
+const (
+	ctlReadHeaderTimeout = 5 * time.Second
+	ctlReadTimeout       = 30 * time.Second
+	ctlWriteTimeout      = 30 * time.Second
+	ctlIdleTimeout       = 30 * time.Second
+	ctlMaxHeaderBytes    = 16 << 10 // 16 KiB
+	// ctlMaxConns caps simultaneous connections one tenant can hold open. The
+	// legitimate client makes one request at a time; a small cap turns a
+	// connection flood into the tenant's own back-pressure instead of the
+	// router's fd exhaustion.
+	ctlMaxConns = 8
 )
 
 // controlServer serves the router-side control API on one org's ctl.sock —
@@ -44,9 +66,16 @@ func startControl(path string, h http.Handler, log *slog.Logger) (*controlServer
 		_ = os.Remove(path)
 		return nil, err
 	}
-	c := &controlServer{path: path, ino: socketInode(path), srv: &http.Server{Handler: h}}
+	c := &controlServer{path: path, ino: socketInode(path), srv: &http.Server{
+		Handler:           h,
+		ReadHeaderTimeout: ctlReadHeaderTimeout,
+		ReadTimeout:       ctlReadTimeout,
+		WriteTimeout:      ctlWriteTimeout,
+		IdleTimeout:       ctlIdleTimeout,
+		MaxHeaderBytes:    ctlMaxHeaderBytes,
+	}}
 	go func() {
-		if err := c.srv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		if err := c.srv.Serve(netutil.LimitListener(ln, ctlMaxConns)); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			log.Debug("control socket server stopped", "path", path, "error", err)
 		}
 	}()

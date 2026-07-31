@@ -121,8 +121,9 @@ type manifestCapabilities struct {
 		OwnerField string `json:"ownerField"`
 	} `json:"quota"`
 	// PeerVersions declares enforced semver ranges on other packages in the
-	// same lockfile, keyed by package name (e.g. "@tinycld/core"). Read by
-	// CheckPeerVersions before an org's set is materialized.
+	// same lockfile, keyed by package name (e.g. "@tinycld/core"). Enforced
+	// authoritatively by the peer gate inside builder.Build before an org's
+	// set is committed to an artifact.
 	PeerVersions map[string]string `json:"peerVersions"`
 }
 

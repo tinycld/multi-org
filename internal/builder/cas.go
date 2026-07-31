@@ -49,9 +49,9 @@ type Store struct {
 // NewStore returns a Store rooted at dir (canonically <MT_ROOT>/builds).
 func NewStore(dir string) *Store { return &Store{dir: dir} }
 
-// hashHexRe is the only directory-name shape the store accepts. Validating the
-// full 64-hex form (rather than sanitizing) makes path escape impossible by
-// construction, the same stance internal/store takes with pkgNameRe.
+// hashHexRe is the only directory-name shape the artifact store accepts.
+// Validating the full 64-hex form (rather than sanitizing) makes path escape
+// impossible by construction — the recipe hash is always a sha256 hex digest.
 var hashHexRe = regexp.MustCompile(`^[a-f0-9]{64}$`)
 
 // hashHex converts a RecipeHash ("sha256:<hex>") into the store directory

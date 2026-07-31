@@ -8,8 +8,6 @@ import (
 	"net/http/httptest"
 	"os"
 	"testing"
-
-	"tinycld.org/multi-org/internal/store"
 )
 
 // The degraded mode NewSpawner promises: on a non-root Linux host, tenants
@@ -26,22 +24,20 @@ func TestSpawner_NonRootSpawnsUnconfined(t *testing.T) {
 	bin := buildTenantBinary(t)
 	root := t.TempDir()
 
-	s := store.New(root)
-	if err := s.Publish("@tinycld/core", "1.0.0", map[string][]byte{
-		"client/dist/index.html": []byte("<html></html>"),
-	}); err != nil {
-		t.Fatal(err)
-	}
+	ref := buildArtifact(t, buildsRootFor(root), artifactSpec{
+		Hash:   "core1",
+		Binary: bin,
+		Files:  map[string]string{"pb_public/index.html": "<html></html>"},
+	})
 
 	mgr := New(Config{
 		Root:         root,
-		Store:        s,
 		Spawner:      NewSpawner(quietLogger()),
-		TenantBinary: bin,
 		Logger:       quietLogger(),
 		HooksPool:    2,
+		ResolveBuild: resolveBuilds(map[string]BuildRef{"core1": ref}),
 		LookupOrg: stubLookup(map[string]OrgRecord{
-			"acme": {Slug: "acme", Status: "active", Lockfile: []byte(`{"@tinycld/core":"1.0.0"}`)},
+			"acme": {Slug: "acme", Status: "active", RecipeHash: "core1"},
 		}),
 	})
 	t.Cleanup(mgr.Shutdown)

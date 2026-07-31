@@ -339,11 +339,15 @@ func QuotaSources(resolved []lockfile.ResolvedPackage) ([]quota.Source, error) {
 	return sources, nil
 }
 
+// manifestJSONFile is the filename holding a member's evaluated manifest —
+// staged by the builder into the artifact's manifests/<slug>/ directory so the
+// host can read the member's host-side capability config (carddav/quota/…)
+// without a TS loader.
+const manifestJSONFile = "manifest.json"
+
 // PackageSlugs returns the manifest slug of every resolved package (falling
-// back to the store name when a package ships no manifest.json or no slug).
-// This is the orgmanager.Config.PackageSlugs hook: serve-org reads the result
-// from .runtime/packages.json to gate feature Go registration against the
-// pinned menu the tenant binary links (internal/tenantpkgs).
+// back to the package name when a member ships no manifest.json or no slug).
+// This is the orgmanager.Config.PackageSlugs hook.
 func PackageSlugs(resolved []lockfile.ResolvedPackage) ([]string, error) {
 	slugs := make([]string, 0, len(resolved))
 	for _, pkg := range resolved {

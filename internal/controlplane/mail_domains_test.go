@@ -5,8 +5,6 @@ import (
 	"testing"
 
 	"github.com/pocketbase/pocketbase/core"
-
-	"tinycld.org/multi-org/internal/store"
 )
 
 // The MX routing registry these tests pin: org_mail_domains is the control
@@ -16,11 +14,33 @@ import (
 // stealing its mail), the shape must be a canonical lowercase FQDN (the relay
 // compares case-insensitively against it), and only superusers may write it.
 
+// createActiveOrg writes an artifact-backed org row directly: mail-domain
+// routing reads only orgs rows, so the fixture needs no builder or artifact.
+func createActiveOrg(t *testing.T, app core.App, slug string) {
+	t.Helper()
+	col, err := app.FindCollectionByNameOrId("orgs")
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec := core.NewRecord(col)
+	rec.Set("slug", slug)
+	rec.Set("status", "active")
+	rec.Set("data_dir", "pb_orgs/"+slug)
+	rec.Set("lockfile", `{"tinycld":"1.0.0"}`)
+	rec.Set("recipe_hash", hashOld)
+	if err := app.Save(rec); err != nil {
+		t.Fatal(err)
+	}
+}
+
 // mailDomainFixture builds an initialized control plane with one active org.
-func mailDomainFixture(t *testing.T) (*ControlPlane, string) {
+func mailDomainFixture(t *testing.T) *ControlPlane {
 	t.Helper()
 	root := t.TempDir()
-	cp, _ := New(filepath.Join(root, "pb_control", "pb_data"))
+	cp, err := New(filepath.Join(root, "pb_control", "pb_data"))
+	if err != nil {
+		t.Fatal(err)
+	}
 	if err := cp.App.Bootstrap(); err != nil {
 		t.Fatal(err)
 	}
@@ -28,13 +48,8 @@ func mailDomainFixture(t *testing.T) (*ControlPlane, string) {
 	if err := cpInitForTest(cp); err != nil {
 		t.Fatal(err)
 	}
-	s := store.New(root)
-	_ = s.Publish("@tinycld/core", "1.0.0", map[string][]byte{"server/a.pb.js": []byte("1")})
-	p := NewProvisioner(cp.App, root, s, func(string) {}, nil)
-	if _, err := p.CreateOrg("acme", "Acme", map[string]string{"@tinycld/core": "1.0.0"}); err != nil {
-		t.Fatal(err)
-	}
-	return cp, root
+	createActiveOrg(t, cp.App, "acme")
+	return cp
 }
 
 func addMailDomain(t *testing.T, app core.App, slug, domain string) error {
@@ -54,7 +69,7 @@ func addMailDomain(t *testing.T, app core.App, slug, domain string) error {
 }
 
 func TestMailDomainLookup_ResolvesOwnerOrgCaseInsensitively(t *testing.T) {
-	cp, _ := mailDomainFixture(t)
+	cp := mailDomainFixture(t)
 	if err := addMailDomain(t, cp.App, "acme", "mail.acme-corp.com"); err != nil {
 		t.Fatalf("register domain: %v", err)
 	}
@@ -70,12 +85,8 @@ func TestMailDomainLookup_ResolvesOwnerOrgCaseInsensitively(t *testing.T) {
 }
 
 func TestOrgMailDomains_DomainUniqueAcrossOrgs(t *testing.T) {
-	cp, root := mailDomainFixture(t)
-	s := store.New(root)
-	p := NewProvisioner(cp.App, root, s, func(string) {}, nil)
-	if _, err := p.CreateOrg("rival", "Rival", map[string]string{"@tinycld/core": "1.0.0"}); err != nil {
-		t.Fatal(err)
-	}
+	cp := mailDomainFixture(t)
+	createActiveOrg(t, cp.App, "rival")
 
 	if err := addMailDomain(t, cp.App, "acme", "shared.example.com"); err != nil {
 		t.Fatalf("first claim: %v", err)
@@ -86,7 +97,7 @@ func TestOrgMailDomains_DomainUniqueAcrossOrgs(t *testing.T) {
 }
 
 func TestOrgMailDomains_RejectsNonCanonicalDomains(t *testing.T) {
-	cp, _ := mailDomainFixture(t)
+	cp := mailDomainFixture(t)
 	for _, bad := range []string{
 		"UPPER.example.com", // the relay matches lowercase; storage must be canonical
 		"no-dot",

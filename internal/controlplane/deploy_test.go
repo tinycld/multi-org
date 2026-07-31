@@ -472,7 +472,9 @@ func TestLiveRecipeHashes_CoversRowsAndInflight(t *testing.T) {
 }
 
 // D7: CreateOrg with no lockfile copies the template and provisions from the
-// (cache-hit) artifact; an explicit empty map stays a zero-package legacy org.
+// (cache-hit) artifact. The zero-package escape hatch is gone with the store:
+// every org boots from a built artifact, so an explicit empty set is refused
+// rather than provisioned bare.
 func TestCreateOrg_DefaultTemplateBuildsArtifact(t *testing.T) {
 	root := t.TempDir()
 	cp, err := New(filepath.Join(root, "pb_control", "pb_data"))
@@ -491,7 +493,7 @@ func TestCreateOrg_DefaultTemplateBuildsArtifact(t *testing.T) {
 	}
 
 	fake := &fakeArtifactBuilder{hash: hashNew}
-	p := NewProvisioner(cp.App, root, nil, func(string) {}, nil)
+	p := NewProvisioner(cp.App, root, func(string) {}, nil)
 	p.deployer = newDeployer(cp.App, root, fake, func(string) {}, nil, quietTestLogger())
 
 	rec, err := p.CreateOrg("acme", "Acme", nil)
@@ -508,16 +510,13 @@ func TestCreateOrg_DefaultTemplateBuildsArtifact(t *testing.T) {
 		t.Fatalf("builder ran %d times, want 1", fake.calls.Load())
 	}
 
-	// Explicit empty map: zero packages, no build, no recipe hash.
-	rec2, err := p.CreateOrg("lean", "Lean", map[string]string{})
-	if err != nil {
-		t.Fatalf("CreateOrg(lean): %v", err)
-	}
-	if rec2.GetString("recipe_hash") != "" {
-		t.Fatalf("zero-package org got recipe_hash %q", rec2.GetString("recipe_hash"))
+	// An explicit empty map is not buildable (no app shell) — refused, and the
+	// builder never runs for it.
+	if _, err := p.CreateOrg("lean", "Lean", map[string]string{}); err == nil || !strings.Contains(err.Error(), "app shell") {
+		t.Fatalf("CreateOrg(lean) = %v, want the app-shell refusal", err)
 	}
 	if fake.calls.Load() != 1 {
-		t.Fatalf("builder ran for a zero-package org")
+		t.Fatalf("builder ran for a refused empty set")
 	}
 }
 
@@ -535,7 +534,7 @@ func TestCreateOrg_ArtifactSetWithoutBuilderRefuses(t *testing.T) {
 	if err := cpInitForTest(cp); err != nil {
 		t.Fatal(err)
 	}
-	p := NewProvisioner(cp.App, root, nil, func(string) {}, nil)
+	p := NewProvisioner(cp.App, root, func(string) {}, nil)
 	if _, err := p.CreateOrg("acme", "Acme", map[string]string{"tinycld": "1.0.0"}); err == nil || !strings.Contains(err.Error(), "no builder") {
 		t.Fatalf("CreateOrg = %v, want no-builder refusal", err)
 	}

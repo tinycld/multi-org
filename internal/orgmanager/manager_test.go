@@ -13,7 +13,6 @@ import (
 	"time"
 
 	"tinycld.org/multi-org/internal/orgerr"
-	"tinycld.org/multi-org/internal/store"
 )
 
 func stubLookup(m map[string]OrgRecord) LookupFunc {
@@ -24,8 +23,8 @@ func quietLogger() *slog.Logger {
 	return slog.New(slog.NewTextHandler(io.Discard, nil))
 }
 
-// newTestManager wires a manager over a fake spawner and a store holding one
-// trivial package.
+// newTestManager wires a manager over a fake spawner and one committed build
+// artifact carrying a trivial hook and client tree.
 func newTestManager(t *testing.T, sp *fakeSpawner) *OrgManager {
 	return newTestManagerForwarded(t, sp, ForwardedConfig{})
 }
@@ -36,24 +35,24 @@ func newTestManagerForwarded(t *testing.T, sp *fakeSpawner, fw ForwardedConfig) 
 	t.Helper()
 	root := t.TempDir()
 
-	s := store.New(root)
-	if err := s.Publish("@tinycld/core", "1.0.0", map[string][]byte{
-		"server/main.pb.js":      []byte("routerAdd('GET','/ping',(e)=>e.json(200,{ok:true}))"),
-		"client/dist/index.html": []byte("<html></html>"),
-	}); err != nil {
-		t.Fatal(err)
-	}
+	ref := buildArtifact(t, buildsRootFor(root), artifactSpec{
+		Hash: "core1",
+		Files: map[string]string{
+			"pb_hooks/main.pb.js":  "routerAdd('GET','/ping',(e)=>e.json(200,{ok:true}))",
+			"pb_public/index.html": "<html></html>",
+		},
+	})
 
 	mgr := New(Config{
-		Root:      root,
-		Store:     s,
-		Spawner:   sp,
-		Logger:    quietLogger(),
-		HooksPool: 2,
-		Forwarded: fw,
+		Root:         root,
+		Spawner:      sp,
+		Logger:       quietLogger(),
+		HooksPool:    2,
+		Forwarded:    fw,
+		ResolveBuild: resolveBuilds(map[string]BuildRef{"core1": ref}),
 		LookupOrg: stubLookup(map[string]OrgRecord{
-			"acme":      {Slug: "acme", Status: "active", Lockfile: []byte(`{"@tinycld/core":"1.0.0"}`)},
-			"suspended": {Slug: "suspended", Status: "suspended", Lockfile: []byte(`{"@tinycld/core":"1.0.0"}`)},
+			"acme":      {Slug: "acme", Status: "active", RecipeHash: "core1"},
+			"suspended": {Slug: "suspended", Status: "suspended", RecipeHash: "core1"},
 		}),
 	})
 	t.Cleanup(mgr.Shutdown)
@@ -511,19 +510,17 @@ func TestBackoff_FailedSpawnCountsOnce(t *testing.T) {
 	sp := &fakeSpawner{dieBeforeReady: true}
 	root := t.TempDir()
 
-	s := store.New(root)
-	if err := s.Publish("@tinycld/core", "1.0.0", map[string][]byte{
-		"client/dist/index.html": []byte("<html></html>"),
-	}); err != nil {
-		t.Fatal(err)
-	}
+	ref := buildArtifact(t, buildsRootFor(root), artifactSpec{
+		Hash:  "core1",
+		Files: map[string]string{"pb_public/index.html": "<html></html>"},
+	})
 	mgr := New(Config{
-		Root:    root,
-		Store:   s,
-		Spawner: sp,
-		Logger:  slog.New(slog.NewTextHandler(&logs, nil)),
+		Root:         root,
+		Spawner:      sp,
+		Logger:       slog.New(slog.NewTextHandler(&logs, nil)),
+		ResolveBuild: resolveBuilds(map[string]BuildRef{"core1": ref}),
 		LookupOrg: stubLookup(map[string]OrgRecord{
-			"acme": {Slug: "acme", Status: "active", Lockfile: []byte(`{"@tinycld/core":"1.0.0"}`)},
+			"acme": {Slug: "acme", Status: "active", RecipeHash: "core1"},
 		}),
 	})
 	t.Cleanup(mgr.Shutdown)
@@ -578,10 +575,8 @@ func TestBackoff_ClearedOnSuccessfulBoot(t *testing.T) {
 // sweeper goroutine — which takes down the whole process, not just the sweep.
 func TestSweep_TinyMaxIdleDoesNotPanic(t *testing.T) {
 	sp := &fakeSpawner{}
-	root := t.TempDir()
 	mgr := New(Config{
-		Root:      root,
-		Store:     store.New(root),
+		Root:      t.TempDir(),
 		Spawner:   sp,
 		Logger:    quietLogger(),
 		MaxIdle:   time.Nanosecond,
@@ -594,10 +589,8 @@ func TestSweep_TinyMaxIdleDoesNotPanic(t *testing.T) {
 
 func TestShutdown_IsIdempotent(t *testing.T) {
 	sp := &fakeSpawner{}
-	root := t.TempDir()
 	mgr := New(Config{
-		Root:      root,
-		Store:     store.New(root),
+		Root:      t.TempDir(),
 		Spawner:   sp,
 		Logger:    quietLogger(),
 		LookupOrg: stubLookup(nil),
@@ -646,25 +639,24 @@ func TestInstance_LastUsedSeededAndAdvancedByRequests(t *testing.T) {
 	}
 }
 
-// A host-side load failure — a pruned package version, a broken store, a full
-// disk — must classify as ErrOrgUnavailable (503 + Retry-After) and log its
-// cause. Unwrapped it falls into the front router's default case: the
+// A host-side load failure — a pruned build artifact, a broken builds volume,
+// a full disk — must classify as ErrOrgUnavailable (503 + Retry-After) and log
+// its cause. Unwrapped it falls into the front router's default case: the
 // customer sees 404 "no such organization", the operator sees nothing, and
 // the control plane still says active.
 func TestLoad_HostSideFailureIsUnavailableAndLogged(t *testing.T) {
 	var logs syncBuffer
 	sp := &fakeSpawner{}
-	root := t.TempDir()
 
-	// The store has no packages at all, so the org's pinned version resolves
-	// to nothing — the "pruned package version" case.
+	// The builds root holds no artifacts at all, so the org's recipe hash
+	// resolves to nothing — the "pruned build" case.
 	mgr := New(Config{
-		Root:    root,
-		Store:   store.New(root),
-		Spawner: sp,
-		Logger:  slog.New(slog.NewTextHandler(&logs, nil)),
+		Root:         t.TempDir(),
+		Spawner:      sp,
+		Logger:       slog.New(slog.NewTextHandler(&logs, nil)),
+		ResolveBuild: resolveBuilds(nil),
 		LookupOrg: stubLookup(map[string]OrgRecord{
-			"acme": {Slug: "acme", Status: "active", Lockfile: []byte(`{"@tinycld/core":"9.9.9"}`)},
+			"acme": {Slug: "acme", Status: "active", RecipeHash: "gone"},
 		}),
 	})
 	t.Cleanup(mgr.Shutdown)
@@ -674,7 +666,7 @@ func TestLoad_HostSideFailureIsUnavailableAndLogged(t *testing.T) {
 		t.Fatal("expected the load to fail")
 	}
 	if !errors.Is(err, orgerr.ErrOrgUnavailable) {
-		t.Fatalf("err = %v, want ErrOrgUnavailable — a broken store must answer 503, not the 404 reserved for unknown slugs", err)
+		t.Fatalf("err = %v, want ErrOrgUnavailable — a missing build must answer 503, not the 404 reserved for unknown slugs", err)
 	}
 	if !strings.Contains(logs.String(), "org load failed") {
 		t.Fatalf("logs = %q, want the load failure logged with its cause", logs.String())
@@ -686,10 +678,8 @@ func TestLoad_HostSideFailureIsUnavailableAndLogged(t *testing.T) {
 func TestLoad_UnknownSlugIsNotLoggedAsError(t *testing.T) {
 	var logs syncBuffer
 	sp := &fakeSpawner{}
-	root := t.TempDir()
 	mgr := New(Config{
-		Root:      root,
-		Store:     store.New(root),
+		Root:      t.TempDir(),
 		Spawner:   sp,
 		Logger:    slog.New(slog.NewTextHandler(&logs, nil)),
 		LookupOrg: stubLookup(nil),

@@ -25,7 +25,6 @@ import (
 	"tinycld.org/multi-org/internal/manifesteval"
 	"tinycld.org/multi-org/internal/orgmanager"
 	"tinycld.org/multi-org/internal/server"
-	"tinycld.org/multi-org/internal/store"
 )
 
 func main() {
@@ -61,11 +60,7 @@ func run() error {
 	tlsCert := os.Getenv("MT_TLS_CERT")
 	tlsKey := os.Getenv("MT_TLS_KEY")
 
-	// The tenant binary defaults to a sibling of this one, so a deployed pair
-	// stays together without configuration.
-	tenantBinary := getenv("MT_TENANT_BINARY", defaultTenantBinary())
-
-	// Manifest JS from published packages evaluates in a re-exec'd,
+	// Manifest JS from fetched packages evaluates in a re-exec'd,
 	// memory-limited child of this binary: an allocation bomb kills the
 	// child, never the router and the tenants it fronts.
 	var evalManifest func(src, name string) ([]byte, error)
@@ -75,7 +70,6 @@ func run() error {
 			return manifesteval.EvalSubprocess(context.Background(),
 				[]string{selfExe, manifesteval.Subcommand}, src, name)
 		}
-		controlplane.SetManifestEvaluator(evalManifest)
 	} else {
 		log.Printf("cannot resolve own executable (%v); manifest eval stays in-process", selfErr)
 	}
@@ -83,9 +77,9 @@ func run() error {
 	// The trusted builder (design D3): package sets become shared
 	// content-addressed artifacts under <root>/builds. Enabled by
 	// MT_SCAFFOLD_ROOT — an operator-provisioned workspace scaffold; without
-	// it the router keeps the legacy store/materialize path only. Jobs run as
-	// a re-exec'd, confined `builder-job` child of this binary (build jobs
-	// execute package-author code by design).
+	// it the router can still serve already-built orgs but refuses to
+	// provision or deploy. Jobs run as a re-exec'd, confined `builder-job`
+	// child of this binary (build jobs execute package-author code by design).
 	var bld *builder.Builder
 	if scaffoldRoot := os.Getenv("MT_SCAFFOLD_ROOT"); scaffoldRoot != "" {
 		var runner builder.Runner = builder.InProcessRunner{}
@@ -125,8 +119,6 @@ func run() error {
 		return fmt.Errorf("bootstrap superuser: %w", err)
 	}
 
-	pkgStore := store.New(root)
-
 	// The provisioner and the deploy orchestrator reach the manager only
 	// through these closures; the manager is constructed just below, after
 	// the provisioner exists, because artifact-backed orgs need the
@@ -144,7 +136,7 @@ func run() error {
 		return err
 	}
 
-	prov := controlplane.NewProvisioner(cp.App, root, pkgStore, evictOrg, verifyOrg)
+	prov := controlplane.NewProvisioner(cp.App, root, evictOrg, verifyOrg)
 	if bld != nil {
 		prov.EnableBuilds(bld, slog.Default())
 	}
@@ -152,7 +144,6 @@ func run() error {
 
 	mgrCfg := orgmanager.Config{
 		Root:      root,
-		Store:     pkgStore,
 		LookupOrg: controlplane.OrgLookup(cp.App),
 		HooksPool: 15,
 		MaxIdle:   30 * time.Minute,
@@ -162,7 +153,6 @@ func run() error {
 		// 0 residents = unlimited; 0 spawns = the manager's default.
 		MaxResident:         getenvInt("MT_MAX_RESIDENT_ORGS", 0),
 		MaxConcurrentSpawns: getenvInt("MT_MAX_CONCURRENT_SPAWNS", 0),
-		TenantBinary:        tenantBinary,
 		Logger:              slog.Default(),
 		CardDAVSources:      controlplane.CardDAVSources,
 		WebDAVSources:       controlplane.WebDAVSources,
@@ -182,8 +172,15 @@ func run() error {
 			PeerIsClient: tlsMode != server.TLSProxy,
 		},
 	}
+	// Build resolution needs only the artifact store on disk, not a live
+	// builder — a router without MT_SCAFFOLD_ROOT still serves orgs whose
+	// artifacts were built earlier (it just cannot provision or deploy).
+	buildStore := builder.NewStore(filepath.Join(root, "builds"))
 	if bld != nil {
-		mgrCfg.ResolveBuild = controlplane.BuildResolver(bld.Store(), "tinycld")
+		buildStore = bld.Store()
+	}
+	mgrCfg.ResolveBuild = controlplane.BuildResolver(buildStore, "tinycld")
+	if bld != nil {
 		mgrCfg.Control = prov.ControlHandler()
 	}
 	mgr = orgmanager.New(mgrCfg)
@@ -326,15 +323,6 @@ func sweepBuilds(ctx context.Context, bld *builder.Builder, dep *controlplane.De
 			log.Printf("build GC: removed %d unreferenced artifact(s)", len(removed))
 		}
 	}
-}
-
-// defaultTenantBinary resolves serve-org next to this executable.
-func defaultTenantBinary() string {
-	exe, err := os.Executable()
-	if err != nil {
-		return "serve-org"
-	}
-	return filepath.Join(filepath.Dir(exe), "serve-org")
 }
 
 func getenv(k, def string) string {

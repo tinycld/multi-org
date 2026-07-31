@@ -87,6 +87,23 @@ func controlPlaneMigrations() core.MigrationsList {
 			return nil
 		},
 	})
+	// The package store is gone (design §7 step 5): packages are fetched and
+	// validated by the trusted builder, and orgs boot from committed
+	// artifacts. The `packages` registry only the publish endpoint wrote —
+	// and nothing ever read — is dropped. Appended rather than edited into
+	// the init migration: an already-provisioned control plane recorded init
+	// as applied and would never re-run it.
+	list.Add(&core.Migration{
+		File: "1900000003_drop_packages.go",
+		Up: func(txApp core.App) error {
+			c, err := txApp.FindCollectionByNameOrId("packages")
+			if err != nil {
+				return nil // already gone
+			}
+			return txApp.Delete(c)
+		},
+		Down: createPackages,
+	})
 	return list
 }
 

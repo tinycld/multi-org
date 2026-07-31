@@ -26,10 +26,13 @@ func TestControlPlane_BootstrapsWithOrgsCollection(t *testing.T) {
 	if err != nil {
 		t.Fatalf("expected orgs collection: %v", err)
 	}
-	for _, name := range []string{"packages", "deployments"} {
-		if _, err := cp.App.FindCollectionByNameOrId(name); err != nil {
-			t.Fatalf("expected %s collection: %v", name, err)
-		}
+	if _, err := cp.App.FindCollectionByNameOrId("deployments"); err != nil {
+		t.Fatalf("expected deployments collection: %v", err)
+	}
+	// The store-era `packages` registry is dropped by 1900000003 — only the
+	// publish endpoint ever wrote it, and that endpoint is gone with the store.
+	if _, err := cp.App.FindCollectionByNameOrId("packages"); err == nil {
+		t.Fatal("packages collection must be dropped after migrations")
 	}
 
 	// assert the schema shape landed, not just the collection.

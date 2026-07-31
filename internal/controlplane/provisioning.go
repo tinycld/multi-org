@@ -2,7 +2,6 @@ package controlplane
 
 import (
 	"context"
-	"encoding/base64"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -17,8 +16,6 @@ import (
 	"tinycld.org/core/pkgbuild"
 	"tinycld.org/multi-org/internal/builder"
 	"tinycld.org/multi-org/internal/lockfile"
-	"tinycld.org/multi-org/internal/materialize"
-	"tinycld.org/multi-org/internal/store"
 )
 
 // EvictFunc lets provisioning invalidate a cached org instance in the manager.
@@ -34,17 +31,16 @@ type EvictFunc func(slug string)
 type VerifyFunc func(ctx context.Context, slug string) error
 
 // Provisioner performs control-plane provisioning operations against the orgs/
-// packages/deployments collections and the package store.
+// deployments collections.
 type Provisioner struct {
 	app    core.App
 	root   string
-	store  *store.PackageStore
 	evict  EvictFunc
 	verify VerifyFunc
 
 	// deployer executes artifact-backed provisioning and the D6 deploy
-	// protocol. Nil until EnableBuilds — a router without a builder keeps the
-	// legacy store path only.
+	// protocol. Nil until EnableBuilds — a router without a builder can serve
+	// existing orgs but refuses to provision or deploy.
 	deployer *Deployer
 }
 
@@ -52,8 +48,8 @@ type Provisioner struct {
 // CreateOrg activates the org without booting it and the org's migrations run
 // at its first spawn instead — that trades the synchronous failure report for
 // a 502 on first request, so production wiring should always pass one.
-func NewProvisioner(app core.App, root string, s *store.PackageStore, evict EvictFunc, verify VerifyFunc) *Provisioner {
-	return &Provisioner{app: app, root: root, store: s, evict: evict, verify: verify}
+func NewProvisioner(app core.App, root string, evict EvictFunc, verify VerifyFunc) *Provisioner {
+	return &Provisioner{app: app, root: root, evict: evict, verify: verify}
 }
 
 // EnableBuilds attaches the trusted builder: CreateOrg and Deploy gain the
@@ -89,7 +85,8 @@ func validSlug(s string) bool { return slugRe.MatchString(s) && !reservedSlugs[s
 // CreateOrg provisions a new org, or resumes a previously half-provisioned one.
 // If an org row for the slug already exists and is still active, it errors; if
 // the existing row is in a non-active (e.g. stranded "provisioning") state, it
-// resumes: re-materializes, re-verifies the tenant boot, and flips to active.
+// resumes: re-builds the set (a cache hit), re-verifies the tenant boot, and
+// flips to active.
 func (p *Provisioner) CreateOrg(slug, displayName string, lock map[string]string) (*core.Record, error) {
 	if !validSlug(slug) {
 		return nil, fmt.Errorf("invalid slug %q", slug)
@@ -115,11 +112,21 @@ func (p *Provisioner) CreateOrg(slug, displayName string, lock map[string]string
 		}
 	}
 
+	// Every org boots from a committed build artifact, so the set must be
+	// buildable: it names the app shell (the builder refuses a set without
+	// it), and a builder must be configured. The org's live trees come from
+	// the artifact at load — nothing is materialized here. A base-bearing
+	// default set is a cache hit, so provisioning costs seconds (D4).
+	if !IsArtifactSet(lock) {
+		return nil, fmt.Errorf("lockfile must include the app shell (%q): every org boots from a built artifact", pkgbuild.BaseMemberSlug)
+	}
+	if p.deployer == nil {
+		return nil, fmt.Errorf("no builder is configured (MT_SCAFFOLD_ROOT); cannot provision orgs")
+	}
+
 	orgDir := filepath.Join(p.root, "pb_orgs", slug)
-	for _, sub := range []string{"pb_data", "pb_hooks", "pb_public", "pb_migrations"} {
-		if err := os.MkdirAll(filepath.Join(orgDir, sub), 0o755); err != nil {
-			return nil, fmt.Errorf("create org dir: %w", err)
-		}
+	if err := os.MkdirAll(filepath.Join(orgDir, "pb_data"), 0o755); err != nil {
+		return nil, fmt.Errorf("create org dir: %w", err)
 	}
 
 	lfBytes, err := lockfile.OrgLockfile(lock).Marshal()
@@ -127,38 +134,13 @@ func (p *Provisioner) CreateOrg(slug, displayName string, lock map[string]string
 		return nil, fmt.Errorf("marshal lockfile: %w", err)
 	}
 
-	// A base-bearing set is built into a shared artifact (a cache hit for the
-	// default set — provisioning then costs seconds, D4); the org's live
-	// trees come from the artifact at load, so nothing is materialized here.
-	// A store set keeps the legacy resolve/materialize path.
-	recipeHash := ""
-	if IsArtifactSet(lock) {
-		if p.deployer == nil {
-			return nil, fmt.Errorf("lockfile includes the app shell (%q) but no builder is configured (MT_SCAFFOLD_ROOT)", pkgbuild.BaseMemberSlug)
-		}
-		res, err := p.deployer.BuildSet(context.Background(), lock)
-		if err != nil {
-			return nil, fmt.Errorf("build package set: %w", err)
-		}
-		recipeHash = res.RecipeHash
-		p.deployer.trackHash(recipeHash)
-		defer p.deployer.untrackHash(recipeHash)
-	} else {
-		lf, err := lockfile.Parse(lfBytes)
-		if err != nil {
-			return nil, fmt.Errorf("parse lockfile: %w", err)
-		}
-		resolved, err := lf.Resolve(p.store)
-		if err != nil {
-			return nil, fmt.Errorf("resolve lockfile: %w", err)
-		}
-		if err := CheckPeerVersions(resolved); err != nil {
-			return nil, fmt.Errorf("lockfile compatibility: %w", err)
-		}
-		if err := materialize.Materialize(orgDir, resolved); err != nil {
-			return nil, fmt.Errorf("materialize: %w", err)
-		}
+	res, err := p.deployer.BuildSet(context.Background(), lock)
+	if err != nil {
+		return nil, fmt.Errorf("build package set: %w", err)
 	}
+	recipeHash := res.RecipeHash
+	p.deployer.trackHash(recipeHash)
+	defer p.deployer.untrackHash(recipeHash)
 
 	rec := existing
 	if rec == nil {
@@ -207,53 +189,6 @@ func (p *Provisioner) CreateOrg(slug, displayName string, lock map[string]string
 // itself wedges.
 const tenantVerifyTimeout = 60 * time.Second
 
-// Deploy re-resolves a new lockfile, re-materializes, records a deployment, and
-// evicts the running instance so the next request loads fresh.
-func (p *Provisioner) Deploy(slug string, lock map[string]string) error {
-	rec, err := p.app.FindFirstRecordByData("orgs", "slug", slug)
-	if err != nil || rec == nil {
-		return fmt.Errorf("org %q not found", slug)
-	}
-	if s := rec.GetString("status"); s != "active" {
-		return fmt.Errorf("cannot deploy to org %q in status %q", slug, s)
-	}
-	lfBytes, err := lockfile.OrgLockfile(lock).Marshal()
-	if err != nil {
-		return err
-	}
-	lf, err := lockfile.Parse(lfBytes)
-	if err != nil {
-		return err
-	}
-	resolved, err := lf.Resolve(p.store)
-	if err != nil {
-		return err
-	}
-	if err := CheckPeerVersions(resolved); err != nil {
-		return fmt.Errorf("lockfile compatibility: %w", err)
-	}
-	orgDir := filepath.Join(p.root, "pb_orgs", slug)
-	if err := materialize.Materialize(orgDir, resolved); err != nil {
-		return err
-	}
-	rec.Set("lockfile", string(lfBytes))
-	if err := p.app.Save(rec); err != nil {
-		return err
-	}
-	dcol, err := p.app.FindCollectionByNameOrId("deployments")
-	if err != nil {
-		return fmt.Errorf("find deployments collection: %w", err)
-	}
-	d := core.NewRecord(dcol)
-	d.Set("org", rec.Id)
-	d.Set("lockfile", string(lfBytes))
-	if err := p.app.Save(d); err != nil {
-		return fmt.Errorf("record deployment: %w", err)
-	}
-	p.evict(slug)
-	return nil
-}
-
 func (p *Provisioner) setStatus(slug, status string) error {
 	rec, err := p.app.FindFirstRecordByData("orgs", "slug", slug)
 	if err != nil || rec == nil {
@@ -270,34 +205,6 @@ func (p *Provisioner) setStatus(slug, status string) error {
 func (p *Provisioner) Suspend(slug string) error { return p.setStatus(slug, "suspended") }
 func (p *Provisioner) Resume(slug string) error  { return p.setStatus(slug, "active") }
 func (p *Provisioner) Archive(slug string) error { return p.setStatus(slug, "archived") }
-
-// PublishPackage writes a package version into the store and registers it in the
-// packages collection.
-func (p *Provisioner) PublishPackage(name, version string, files map[string][]byte, kind string) error {
-	files, err := transpileForStore(files)
-	if err != nil {
-		return fmt.Errorf("transpile package %s@%s: %w", name, version, err)
-	}
-	// Emit a parsed manifest.json so the host can read the package's host-side
-	// capability config (carddav/fts/audit) without a TS loader at load time.
-	files, err = emitManifestJSON(files)
-	if err != nil {
-		return fmt.Errorf("manifest json for %s@%s: %w", name, version, err)
-	}
-	if err := p.store.Publish(name, version, files); err != nil {
-		return err
-	}
-	col, err := p.app.FindCollectionByNameOrId("packages")
-	if err != nil {
-		return err
-	}
-	rec := core.NewRecord(col)
-	rec.Set("name", name)
-	rec.Set("version", version)
-	rec.Set("store_path", filepath.Join("packages", name, version))
-	rec.Set("kind", kind)
-	return p.app.Save(rec)
-}
 
 // RegisterRoutes binds the provisioning API onto the control-plane app's OnServe.
 // All routes require a superuser (control-plane admin) auth.
@@ -329,20 +236,21 @@ func (p *Provisioner) RegisterRoutes() {
 				return re.BadRequestError("invalid body", err)
 			}
 			slug := re.Request.PathValue("slug")
-			// A base-bearing set deploys through the D6 orchestrator (build →
-			// repoint → respawn with commit/revert); a store set keeps the
-			// legacy rematerialize path until step 5 removes it.
-			if IsArtifactSet(body.Lockfile) && p.deployer != nil {
-				recipeHash, err := p.deployer.Deploy(context.Background(), slug, body.Lockfile, "")
-				if err != nil {
-					return re.BadRequestError(err.Error(), err)
-				}
-				return re.JSON(202, map[string]any{"recipeHash": recipeHash})
-			}
-			if err := p.Deploy(slug, body.Lockfile); err != nil {
+			// Every deploy runs through the D6 orchestrator: build →
+			// repoint → respawn with commit/revert.
+			if !IsArtifactSet(body.Lockfile) {
+				err := fmt.Errorf("lockfile must include the app shell (%q): every org boots from a built artifact", pkgbuild.BaseMemberSlug)
 				return re.BadRequestError(err.Error(), err)
 			}
-			return re.NoContent(204)
+			if p.deployer == nil {
+				err := fmt.Errorf("no builder is configured (MT_SCAFFOLD_ROOT); cannot deploy")
+				return re.BadRequestError(err.Error(), err)
+			}
+			recipeHash, err := p.deployer.Deploy(context.Background(), slug, body.Lockfile, "")
+			if err != nil {
+				return re.BadRequestError(err.Error(), err)
+			}
+			return re.JSON(202, map[string]any{"recipeHash": recipeHash})
 		}).Bind(apis.RequireSuperuserAuth())
 
 		// The D7 template: the package set new orgs copy when POST /api/orgs
@@ -398,30 +306,6 @@ func (p *Provisioner) RegisterRoutes() {
 				return re.BadRequestError(err.Error(), err)
 			}
 			return re.NoContent(204)
-		}).Bind(apis.RequireSuperuserAuth())
-
-		g.POST("/store/packages", func(re *core.RequestEvent) error {
-			var body struct {
-				Name    string            `json:"name"`
-				Version string            `json:"version"`
-				Kind    string            `json:"kind"`
-				Files   map[string]string `json:"files"` // path -> base64 content
-			}
-			if err := re.BindBody(&body); err != nil {
-				return re.BadRequestError("invalid body", err)
-			}
-			files := make(map[string][]byte, len(body.Files))
-			for path, b64 := range body.Files {
-				raw, err := base64.StdEncoding.DecodeString(b64)
-				if err != nil {
-					return re.BadRequestError("invalid base64 for "+path, err)
-				}
-				files[path] = raw
-			}
-			if err := p.PublishPackage(body.Name, body.Version, files, body.Kind); err != nil {
-				return re.BadRequestError(err.Error(), err)
-			}
-			return re.JSON(200, map[string]any{"name": body.Name, "version": body.Version})
 		}).Bind(apis.RequireSuperuserAuth())
 
 		return e.Next()

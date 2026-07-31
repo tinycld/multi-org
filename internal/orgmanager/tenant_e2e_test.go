@@ -2,7 +2,6 @@ package orgmanager
 
 import (
 	"context"
-	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -12,7 +11,6 @@ import (
 	"testing"
 	"time"
 
-	"tinycld.org/multi-org/internal/store"
 	"tinycld.org/multi-org/internal/testsupport"
 )
 
@@ -30,31 +28,32 @@ func buildTenantBinary(t *testing.T) string {
 	return testsupport.BuildTenantBinary(t)
 }
 
-// newRealManager wires a manager over the real exec spawner and the real
-// tenant binary, with one package whose hook source is given by the caller.
+// newRealManager wires a manager over the real exec spawner and one committed
+// artifact carrying the real tenant binary, with a hook tree given by the
+// caller.
 func newRealManager(t *testing.T, hookSource string) *OrgManager {
 	t.Helper()
 	bin := buildTenantBinary(t)
 	root := t.TempDir()
 
-	s := store.New(root)
-	files := map[string][]byte{"client/dist/index.html": []byte("<html></html>")}
+	files := map[string]string{"pb_public/index.html": "<html></html>"}
 	if hookSource != "" {
-		files["server/main.pb.js"] = []byte(hookSource)
+		files["pb_hooks/main.pb.js"] = hookSource
 	}
-	if err := s.Publish("@tinycld/core", "1.0.0", files); err != nil {
-		t.Fatal(err)
-	}
+	ref := buildArtifact(t, buildsRootFor(root), artifactSpec{
+		Hash:   "core1",
+		Binary: bin,
+		Files:  files,
+	})
 
 	mgr := New(Config{
 		Root:         root,
-		Store:        s,
 		Spawner:      execSpawner{},
-		TenantBinary: bin,
 		Logger:       quietLogger(),
 		HooksPool:    2,
+		ResolveBuild: resolveBuilds(map[string]BuildRef{"core1": ref}),
 		LookupOrg: stubLookup(map[string]OrgRecord{
-			"acme": {Slug: "acme", Status: "active", DisplayName: "Acme Incorporated", Lockfile: []byte(`{"@tinycld/core":"1.0.0"}`)},
+			"acme": {Slug: "acme", Status: "active", DisplayName: "Acme Incorporated", RecipeHash: "core1"},
 		}),
 		OrgURL:     func(slug string) string { return "https://" + slug + ".tenants.example.test" },
 		BaseDomain: "tenants.example.test",
@@ -74,30 +73,32 @@ func newRealMultiOrgManager(t *testing.T, orgs map[string]string) *OrgManager {
 	bin := buildTenantBinary(t)
 	root := t.TempDir()
 
-	s := store.New(root)
+	// Each org gets its own committed artifact — different hook trees mean
+	// different recipes, exactly as the builder would commit them.
+	refs := map[string]BuildRef{}
 	lookup := map[string]OrgRecord{}
 	for slug, hook := range orgs {
-		pkg := "@tinycld/" + slug
-		if err := s.Publish(pkg, "1.0.0", map[string][]byte{
-			"server/main.pb.js":      []byte(hook),
-			"client/dist/index.html": []byte("<html></html>"),
-		}); err != nil {
-			t.Fatal(err)
-		}
+		refs[slug] = buildArtifact(t, buildsRootFor(root), artifactSpec{
+			Hash:   slug,
+			Binary: bin,
+			Files: map[string]string{
+				"pb_hooks/main.pb.js":  hook,
+				"pb_public/index.html": "<html></html>",
+			},
+		})
 		lookup[slug] = OrgRecord{
-			Slug:     slug,
-			Status:   "active",
-			Lockfile: []byte(fmt.Sprintf(`{%q:"1.0.0"}`, pkg)),
+			Slug:       slug,
+			Status:     "active",
+			RecipeHash: slug,
 		}
 	}
 
 	mgr := New(Config{
 		Root:         root,
-		Store:        s,
 		Spawner:      execSpawner{},
-		TenantBinary: bin,
 		Logger:       quietLogger(),
 		HooksPool:    2,
+		ResolveBuild: resolveBuilds(refs),
 		LookupOrg:    stubLookup(lookup),
 	})
 	t.Cleanup(mgr.Shutdown)
@@ -345,27 +346,30 @@ func TestTenant_EvictThenImmediateTrafficStaysReachable(t *testing.T) {
 }
 
 // Each org must get its own process; that separation is the whole deliverable.
+// The two orgs deliberately share ONE artifact (same recipe hash), mirroring
+// production's by-hash sharing — the process boundary, not the tree, is what
+// separates them.
 func TestTenant_OrgsRunInSeparateProcesses(t *testing.T) {
 	bin := buildTenantBinary(t)
 	root := t.TempDir()
 
-	s := store.New(root)
-	if err := s.Publish("@tinycld/core", "1.0.0", map[string][]byte{
-		"server/main.pb.js": []byte(`routerAdd('GET','/ping',(e)=>e.json(200,{ok:true}))`),
-	}); err != nil {
-		t.Fatal(err)
-	}
+	ref := buildArtifact(t, buildsRootFor(root), artifactSpec{
+		Hash:   "core1",
+		Binary: bin,
+		Files: map[string]string{
+			"pb_hooks/main.pb.js": `routerAdd('GET','/ping',(e)=>e.json(200,{ok:true}))`,
+		},
+	})
 
 	mgr := New(Config{
 		Root:         root,
-		Store:        s,
 		Spawner:      execSpawner{},
-		TenantBinary: bin,
 		Logger:       quietLogger(),
 		HooksPool:    2,
+		ResolveBuild: resolveBuilds(map[string]BuildRef{"core1": ref}),
 		LookupOrg: stubLookup(map[string]OrgRecord{
-			"acme": {Slug: "acme", Status: "active", Lockfile: []byte(`{"@tinycld/core":"1.0.0"}`)},
-			"beta": {Slug: "beta", Status: "active", Lockfile: []byte(`{"@tinycld/core":"1.0.0"}`)},
+			"acme": {Slug: "acme", Status: "active", RecipeHash: "core1"},
+			"beta": {Slug: "beta", Status: "active", RecipeHash: "core1"},
 		}),
 	})
 	defer mgr.Shutdown()

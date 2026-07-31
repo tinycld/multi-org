@@ -7,8 +7,16 @@ see `tinycld.org/core/pkgbuild` and `internal/recipeparity/` here. Step 2
 here and `tinycld.org/core/tenantmain`. Step 3 (router deploy protocol +
 builder wiring) landed 2026-07-31 — see §7. Step 4 (tenant-side hosted
 Packages UI: propose instead of exit-75, in-tenant downs, registry
-reconcile from the built-in set) landed 2026-07-31 — see §7. Step 5 is not
-started.
+reconcile from the built-in set) landed 2026-07-31 — see §7. Step 5 is IN
+PROGRESS (2026-07-31): the legacy store/materialize provisioning path is
+deleted — every org is artifact-backed, `internal/store` /
+`transpileForStore` / publish-time manifest eval / `POST /api/store/packages`
+/ `CheckPeerVersions` are gone, `internal/materialize` is reduced to
+`MaterializeBuild`, and the `packages` collection is dropped by an appended
+control-plane migration. Remaining: delete `cmd/serve-org` +
+`internal/tenantpkgs` (fold into the dual-mode binary), retire
+`.runtime/packages.json`, the hostile-child audit, kernel quotas, and the
+append-only-migration docs (landed in the workspace CLAUDE.md).
 **Motivates:** letting a tenant's own admin manage that org's packages —
 install, uninstall, upgrade, including third-party packages the operator has
 never heard of — while a new org can still be spun up from a default set in

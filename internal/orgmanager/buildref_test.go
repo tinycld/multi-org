@@ -69,7 +69,6 @@ func newArtifactManager(t *testing.T, sp *fakeSpawner, artifactDir string) *OrgM
 		Spawner:      sp,
 		Logger:       quietLogger(),
 		HooksPool:    2,
-		TenantBinary: "/usr/local/bin/serve-org",
 		PackageSlugs: slugsFromManifests,
 		ResolveBuild: func(recipeHash string) (BuildRef, error) {
 			if recipeHash != "sha256:abc123" {

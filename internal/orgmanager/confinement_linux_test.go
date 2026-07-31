@@ -14,8 +14,6 @@ import (
 	"strings"
 	"syscall"
 	"testing"
-
-	"tinycld.org/multi-org/internal/store"
 )
 
 // These tests assert the OS-level boundary this whole architecture exists to
@@ -75,32 +73,33 @@ func newConfinedManager(t *testing.T, orgs map[string]string) *OrgManager {
 		}
 	}
 
-	s := store.New(root)
+	// One committed artifact per org (hash = slug), each carrying its own hook
+	// tree and the real tenant binary. The builds root is what confinement
+	// exposes read-only inside every tenant's mount namespace.
+	refs := map[string]BuildRef{}
 	lookup := map[string]OrgRecord{}
 	for slug, hook := range orgs {
-		pkg := "@tinycld/" + slug
-		if err := s.Publish(pkg, "1.0.0", map[string][]byte{
-			"server/main.pb.js": []byte(hook),
-		}); err != nil {
-			t.Fatal(err)
-		}
+		refs[slug] = buildArtifact(t, buildsRootFor(root), artifactSpec{
+			Hash:   slug,
+			Binary: bin,
+			Files:  map[string]string{"pb_hooks/main.pb.js": hook},
+		})
 		lookup[slug] = OrgRecord{
-			Slug:     slug,
-			Status:   "active",
-			Lockfile: []byte(fmt.Sprintf(`{%q:"1.0.0"}`, pkg)),
+			Slug:       slug,
+			Status:     "active",
+			RecipeHash: slug,
 		}
 	}
 
 	mgr := New(Config{
-		Root:  root,
-		Store: s,
+		Root: root,
 		Spawner: newTestLinuxSpawner(LinuxConfinement{
 			UIDBase:  60000,
 			UIDRange: 500,
 		}),
-		TenantBinary: bin,
 		Logger:       quietLogger(),
 		HooksPool:    2,
+		ResolveBuild: resolveBuilds(refs),
 		LookupOrg:    stubLookup(lookup),
 	})
 	t.Cleanup(mgr.Shutdown)
@@ -168,7 +167,7 @@ func TestConfinement_TenantsRunAsDistinctNonRootUIDs(t *testing.T) {
 	}
 
 	// The child runs in its own user namespace, where it is uid 0 so it can
-	// mount its package store read-only. What matters is the uid the HOST
+	// mount its builds root read-only. What matters is the uid the HOST
 	// kernel checks file access against, which is what stat on /proc/<pid>
 	// reports — /proc/<pid>/status's Uid: line is namespace-relative and would
 	// read 0 even when confinement is working perfectly.
@@ -185,22 +184,24 @@ func TestConfinement_TenantsRunAsDistinctNonRootUIDs(t *testing.T) {
 	}
 }
 
-// The package store is shared and immutable; a tenant must not be able to
-// rewrite code another org will execute.
+// The builds root holds every org's committed artifacts, shared by hash and
+// immutable; a tenant must not be able to rewrite code another org will
+// execute.
 //
-// The probe targets a real store file — the hook source another org would load
-// — from inside the tenant's own mount namespace, and asserts BOTH layers that
-// are supposed to stop it:
+// The probe targets a real artifact file — the hook source the tenant itself
+// boots from — from inside the tenant's own mount namespace, and asserts BOTH
+// layers that are supposed to stop it:
 //
-//   - ownership: the store is root's, the tenant is not;
-//   - the read-only bind mount confinePackages establishes, which is the layer
-//     that still holds against a process that has defeated the first.
+//   - ownership: the builds root is root's, the tenant is not;
+//   - the read-only bind mount confinePackages establishes over the builds
+//     root, which is the layer that still holds against a process that has
+//     defeated the first.
 //
 // The second probe runs as root deliberately. As the tenant uid the write is
 // refused on ownership alone, so that assertion stays green with the mount
 // removed — which is exactly how the old version of this test certified a
 // confinement it never exercised.
-func TestConfinement_PackageStoreIsReadOnly(t *testing.T) {
+func TestConfinement_BuildsRootIsReadOnly(t *testing.T) {
 	requireConfinementEnv(t)
 
 	mgr := newConfinedManager(t, map[string]string{
@@ -212,20 +213,20 @@ func TestConfinement_PackageStoreIsReadOnly(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	target := filepath.Join(mgr.cfg.Root, "packages", "@tinycld", "writer", "1.0.0", "server", "main.pb.js")
+	target := filepath.Join(buildsRootFor(mgr.cfg.Root), "writer", "pb_hooks", "main.pb.js")
 	original, err := os.ReadFile(target)
 	if err != nil {
-		t.Fatalf("package store layout changed; probe target missing: %v", err)
+		t.Fatalf("artifact layout changed; probe target missing: %v", err)
 	}
 
 	uid := assignedUID(t, "writer")
 	script := fmt.Sprintf("echo pwned > %s", target)
 
 	if err := runInMountNS(t, inst.proc.Pid(), uid, script); err == nil {
-		t.Error("tenant uid rewrote a package-store file that other orgs execute")
+		t.Error("tenant uid rewrote a committed artifact file that orgs execute")
 	}
 	if err := runInMountNS(t, inst.proc.Pid(), 0, script); err == nil {
-		t.Error("the package store is writable inside the tenant's mount namespace: " +
+		t.Error("the builds root is writable inside the tenant's mount namespace: " +
 			"the read-only bind mount is not in effect")
 	}
 
@@ -234,7 +235,7 @@ func TestConfinement_PackageStoreIsReadOnly(t *testing.T) {
 		t.Fatal(err)
 	}
 	if string(body) != string(original) {
-		t.Fatalf("package store file was modified: %s", body)
+		t.Fatalf("committed artifact file was modified: %s", body)
 	}
 }
 

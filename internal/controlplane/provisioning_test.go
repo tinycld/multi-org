@@ -5,12 +5,18 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
+	"sync/atomic"
 	"testing"
-
-	"tinycld.org/multi-org/internal/store"
 )
 
-func TestProvision_CreatesOrgRowAndDirs(t *testing.T) {
+// baseLock is the minimal buildable package set: every org boots from a built
+// artifact, so a lockfile must name the app shell (pkgbuild.BaseMemberSlug).
+var baseLock = map[string]string{"tinycld": "1.0.0"}
+
+// newProvCP boots an initialized control plane under a fresh root.
+func newProvCP(t *testing.T) (*ControlPlane, string) {
+	t.Helper()
 	root := t.TempDir()
 	cp, err := New(filepath.Join(root, "pb_control", "pb_data"))
 	if err != nil {
@@ -19,29 +25,62 @@ func TestProvision_CreatesOrgRowAndDirs(t *testing.T) {
 	if err := cp.App.Bootstrap(); err != nil {
 		t.Fatal(err)
 	}
-	defer cp.App.ResetBootstrapState()
+	t.Cleanup(func() { _ = cp.App.ResetBootstrapState() })
 	if err := cpInitForTest(cp); err != nil {
 		t.Fatal(err)
 	}
+	return cp, root
+}
 
-	s := store.New(root)
-	if err := s.Publish("@tinycld/core", "1.0.0", map[string][]byte{"server/a.pb.js": []byte("1")}); err != nil {
-		t.Fatal(err)
-	}
+// newFakeProvisioner wires a Provisioner whose deployer is backed by a fake
+// artifact builder — the test-side analogue of EnableBuilds, which requires a
+// real *builder.Builder. Store-era fixtures published packages; artifact-era
+// fixtures fake the builder instead, and CreateOrg records the hash it returns.
+func newFakeProvisioner(cp *ControlPlane, root string, evict EvictFunc, verify VerifyFunc) *Provisioner {
+	p := NewProvisioner(cp.App, root, evict, verify)
+	p.deployer = newDeployer(cp.App, root, &fakeArtifactBuilder{hash: hashOld}, evict, verify, quietTestLogger())
+	return p
+}
 
-	p := NewProvisioner(cp.App, root, s, func(slug string) {}, nil) // evict no-op
-	rec, err := p.CreateOrg("acme", "Acme Inc", map[string]string{"@tinycld/core": "1.0.0"})
+func TestProvision_CreatesOrgRowAndDirs(t *testing.T) {
+	cp, root := newProvCP(t)
+	p := newFakeProvisioner(cp, root, func(string) {}, nil)
+
+	rec, err := p.CreateOrg("acme", "Acme Inc", baseLock)
 	if err != nil {
 		t.Fatalf("CreateOrg: %v", err)
 	}
 	if rec.GetString("slug") != "acme" || rec.GetString("status") != "active" {
 		t.Fatalf("unexpected org record: slug=%s status=%s", rec.GetString("slug"), rec.GetString("status"))
 	}
-	for _, sub := range []string{"pb_data", "pb_hooks", "pb_public"} {
-		fi, err := os.Stat(filepath.Join(root, "pb_orgs", "acme", sub))
-		if err != nil || !fi.IsDir() {
-			t.Fatalf("expected %s dir: %v", sub, err)
+	if rec.GetString("recipe_hash") != hashOld {
+		t.Fatalf("recipe_hash = %q, want the built artifact %s", rec.GetString("recipe_hash"), hashOld)
+	}
+	fi, err := os.Stat(filepath.Join(root, "pb_orgs", "acme", "pb_data"))
+	if err != nil || !fi.IsDir() {
+		t.Fatalf("expected pb_data dir: %v", err)
+	}
+	// The live pb_hooks/pb_public/pb_migrations names come from the committed
+	// artifact at load (materialize), so CreateOrg pre-creates nothing else.
+	for _, sub := range []string{"pb_hooks", "pb_public", "pb_migrations"} {
+		if _, err := os.Stat(filepath.Join(root, "pb_orgs", "acme", sub)); !os.IsNotExist(err) {
+			t.Fatalf("CreateOrg should not pre-create %s (err=%v)", sub, err)
 		}
+	}
+}
+
+// TestCreateOrg_RefusesNonBaseLockfile pins the artifact-set gate: a lockfile
+// without the app shell cannot build an artifact, so CreateOrg must refuse it
+// up front instead of leaving a bare org that no load path could ever boot.
+func TestCreateOrg_RefusesNonBaseLockfile(t *testing.T) {
+	cp, root := newProvCP(t)
+	p := newFakeProvisioner(cp, root, func(string) {}, nil)
+
+	if _, err := p.CreateOrg("acme", "Acme", map[string]string{"@tinycld/core": "1.0.0"}); err == nil || !strings.Contains(err.Error(), "app shell") {
+		t.Fatalf("CreateOrg = %v, want the app-shell refusal", err)
+	}
+	if rec, _ := cp.App.FindFirstRecordByData("orgs", "slug", "acme"); rec != nil {
+		t.Fatal("refused CreateOrg must leave no org row behind")
 	}
 }
 
@@ -51,17 +90,7 @@ func TestProvision_CreatesOrgRowAndDirs(t *testing.T) {
 // verify observes the org already active, since the manager refuses to load a
 // non-active org.
 func TestCreateOrg_VerifiesTenantBootBeforeReturning(t *testing.T) {
-	root := t.TempDir()
-	cp, _ := New(filepath.Join(root, "pb_control", "pb_data"))
-	if err := cp.App.Bootstrap(); err != nil {
-		t.Fatal(err)
-	}
-	defer cp.App.ResetBootstrapState()
-	if err := cpInitForTest(cp); err != nil {
-		t.Fatal(err)
-	}
-	s := store.New(root)
-	_ = s.Publish("@tinycld/core", "1.0.0", map[string][]byte{"server/a.pb.js": []byte("1")})
+	cp, root := newProvCP(t)
 
 	var calls []string
 	statusAtVerify := ""
@@ -72,8 +101,8 @@ func TestCreateOrg_VerifiesTenantBootBeforeReturning(t *testing.T) {
 		}
 		return nil
 	}
-	p := NewProvisioner(cp.App, root, s, func(string) {}, verify)
-	rec, err := p.CreateOrg("acme", "Acme", map[string]string{"@tinycld/core": "1.0.0"})
+	p := newFakeProvisioner(cp, root, func(string) {}, verify)
+	rec, err := p.CreateOrg("acme", "Acme", baseLock)
 	if err != nil {
 		t.Fatalf("CreateOrg: %v", err)
 	}
@@ -95,23 +124,13 @@ func TestCreateOrg_VerifiesTenantBootBeforeReturning(t *testing.T) {
 // provisioning with the child's reason and leaves the org resumable — never
 // active.
 func TestCreateOrg_VerifyFailureRollsBackActivation(t *testing.T) {
-	root := t.TempDir()
-	cp, _ := New(filepath.Join(root, "pb_control", "pb_data"))
-	if err := cp.App.Bootstrap(); err != nil {
-		t.Fatal(err)
-	}
-	defer cp.App.ResetBootstrapState()
-	if err := cpInitForTest(cp); err != nil {
-		t.Fatal(err)
-	}
-	s := store.New(root)
-	_ = s.Publish("@tinycld/core", "1.0.0", map[string][]byte{"server/a.pb.js": []byte("1")})
+	cp, root := newProvCP(t)
 
 	bootErr := errors.New("acme failed to start: migration 1700_bad.js: boom")
 	failing := func(ctx context.Context, slug string) error { return bootErr }
-	p := NewProvisioner(cp.App, root, s, func(string) {}, failing)
+	p := newFakeProvisioner(cp, root, func(string) {}, failing)
 
-	if _, err := p.CreateOrg("acme", "Acme", map[string]string{"@tinycld/core": "1.0.0"}); err == nil {
+	if _, err := p.CreateOrg("acme", "Acme", baseLock); err == nil {
 		t.Fatal("expected CreateOrg to fail when the tenant never became ready")
 	} else if !errors.Is(err, bootErr) {
 		t.Fatalf("expected the child's boot failure as the cause, got: %v", err)
@@ -125,10 +144,10 @@ func TestCreateOrg_VerifyFailureRollsBackActivation(t *testing.T) {
 		t.Fatalf("expected failed org rolled back to provisioning, got %q", got)
 	}
 
-	// Once the boot succeeds (fixed package deployed), the same CreateOrg
-	// resumes the stranded row to active.
-	p2 := NewProvisioner(cp.App, root, s, func(string) {}, func(context.Context, string) error { return nil })
-	rec2, err := p2.CreateOrg("acme", "Acme", map[string]string{"@tinycld/core": "1.0.0"})
+	// Once the boot succeeds (fixed artifact), the same CreateOrg resumes the
+	// stranded row to active.
+	p2 := newFakeProvisioner(cp, root, func(string) {}, func(context.Context, string) error { return nil })
+	rec2, err := p2.CreateOrg("acme", "Acme", baseLock)
 	if err != nil {
 		t.Fatalf("expected resume after fixed boot, got: %v", err)
 	}
@@ -137,41 +156,33 @@ func TestCreateOrg_VerifyFailureRollsBackActivation(t *testing.T) {
 	}
 }
 
+// TestProvision_DeployEvicts proves a deploy through the D6 orchestrator
+// evicts the org's cached instance so the next request respawns on the new
+// build. The eviction is the async tail of Deploy (finish), so the test waits
+// for it.
 func TestProvision_DeployEvicts(t *testing.T) {
-	root := t.TempDir()
-	cp, _ := New(filepath.Join(root, "pb_control", "pb_data"))
-	_ = cp.App.Bootstrap()
-	defer cp.App.ResetBootstrapState()
-	_ = cpInitForTest(cp)
-
-	s := store.New(root)
-	_ = s.Publish("@tinycld/core", "1.0.0", map[string][]byte{"server/a.pb.js": []byte("1")})
-	_ = s.Publish("@tinycld/core", "1.1.0", map[string][]byte{"server/a.pb.js": []byte("2")})
-
-	evicted := ""
-	p := NewProvisioner(cp.App, root, s, func(slug string) { evicted = slug }, nil)
-	if _, err := p.CreateOrg("acme", "Acme", map[string]string{"@tinycld/core": "1.0.0"}); err != nil {
+	cp, root := newProvCP(t)
+	p := newFakeProvisioner(cp, root, func(string) {}, nil)
+	if _, err := p.CreateOrg("acme", "Acme", baseLock); err != nil {
 		t.Fatal(err)
 	}
-	if err := p.Deploy("acme", map[string]string{"@tinycld/core": "1.1.0"}); err != nil {
+
+	var evicted atomic.Value
+	d := newDeployer(cp.App, root, &fakeArtifactBuilder{hash: hashNew},
+		func(slug string) { evicted.Store(slug) }, nil, quietTestLogger())
+	if _, err := d.Deploy(context.Background(), "acme", map[string]string{"tinycld": "1.1.0"}, ""); err != nil {
 		t.Fatal(err)
 	}
-	if evicted != "acme" {
-		t.Fatalf("expected deploy to evict acme, got %q", evicted)
-	}
+	waitUntil(t, "deploy evicted acme", func() bool {
+		slug, _ := evicted.Load().(string)
+		return slug == "acme"
+	})
 }
 
 func TestProvision_SuspendResumeArchive(t *testing.T) {
-	root := t.TempDir()
-	cp, _ := New(filepath.Join(root, "pb_control", "pb_data"))
-	_ = cp.App.Bootstrap()
-	defer cp.App.ResetBootstrapState()
-	_ = cpInitForTest(cp)
-	s := store.New(root)
-	_ = s.Publish("@tinycld/core", "1.0.0", map[string][]byte{"server/a.pb.js": []byte("1")})
-
-	p := NewProvisioner(cp.App, root, s, func(string) {}, nil)
-	if _, err := p.CreateOrg("acme", "Acme", map[string]string{"@tinycld/core": "1.0.0"}); err != nil {
+	cp, root := newProvCP(t)
+	p := newFakeProvisioner(cp, root, func(string) {}, nil)
+	if _, err := p.CreateOrg("acme", "Acme", baseLock); err != nil {
 		t.Fatal(err)
 	}
 	for _, tc := range []struct {
@@ -195,77 +206,29 @@ func TestProvision_SuspendResumeArchive(t *testing.T) {
 	}
 }
 
-func TestProvision_PublishPackageRegisters(t *testing.T) {
-	root := t.TempDir()
-	cp, _ := New(filepath.Join(root, "pb_control", "pb_data"))
-	_ = cp.App.Bootstrap()
-	defer cp.App.ResetBootstrapState()
-	_ = cpInitForTest(cp)
-	s := store.New(root)
-
-	p := NewProvisioner(cp.App, root, s, func(string) {}, nil)
-	if err := p.PublishPackage("@tinycld/mail", "1.2.0", map[string][]byte{"server/m.pb.js": []byte("x")}, "official"); err != nil {
-		t.Fatal(err)
-	}
-	rec, err := cp.App.FindFirstRecordByData("packages", "name", "@tinycld/mail")
-	if err != nil {
-		t.Fatalf("expected package row: %v", err)
-	}
-	if rec.GetString("version") != "1.2.0" || rec.GetString("kind") != "official" {
-		t.Fatalf("unexpected package: version=%s kind=%s", rec.GetString("version"), rec.GetString("kind"))
-	}
-	// store dir exists
-	if _, err := s.VersionDir("@tinycld/mail", "1.2.0"); err != nil {
-		t.Fatalf("expected published store version: %v", err)
-	}
-}
-
 func TestProvision_DuplicateSlugErrors(t *testing.T) {
-	root := t.TempDir()
-	cp, _ := New(filepath.Join(root, "pb_control", "pb_data"))
-	_ = cp.App.Bootstrap()
-	defer cp.App.ResetBootstrapState()
-	_ = cpInitForTest(cp)
-	s := store.New(root)
-	_ = s.Publish("@tinycld/core", "1.0.0", map[string][]byte{"server/a.pb.js": []byte("1")})
-	p := NewProvisioner(cp.App, root, s, func(string) {}, nil)
-	if _, err := p.CreateOrg("acme", "Acme", map[string]string{"@tinycld/core": "1.0.0"}); err != nil {
+	cp, root := newProvCP(t)
+	p := newFakeProvisioner(cp, root, func(string) {}, nil)
+	if _, err := p.CreateOrg("acme", "Acme", baseLock); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := p.CreateOrg("acme", "Acme2", map[string]string{"@tinycld/core": "1.0.0"}); err == nil {
+	if _, err := p.CreateOrg("acme", "Acme2", baseLock); err == nil {
 		t.Fatal("expected duplicate slug to error")
 	}
 }
 
 func TestProvision_InvalidSlugErrors(t *testing.T) {
-	root := t.TempDir()
-	cp, _ := New(filepath.Join(root, "pb_control", "pb_data"))
-	_ = cp.App.Bootstrap()
-	defer cp.App.ResetBootstrapState()
-	_ = cpInitForTest(cp)
-	s := store.New(root)
-	p := NewProvisioner(cp.App, root, s, func(string) {}, nil)
-	if _, err := p.CreateOrg("Acme_Bad!", "x", map[string]string{}); err == nil {
+	cp, root := newProvCP(t)
+	p := newFakeProvisioner(cp, root, func(string) {}, nil)
+	if _, err := p.CreateOrg("Acme_Bad!", "x", baseLock); err == nil {
 		t.Fatal("expected invalid slug to error")
 	}
 }
 
 func TestProvision_CreateOrgResumesStrandedRow(t *testing.T) {
-	root := t.TempDir()
-	cp, _ := New(filepath.Join(root, "pb_control", "pb_data"))
-	if err := cp.App.Bootstrap(); err != nil {
-		t.Fatal(err)
-	}
-	defer cp.App.ResetBootstrapState()
-	if err := cpInitForTest(cp); err != nil {
-		t.Fatal(err)
-	}
-	s := store.New(root)
-	if err := s.Publish("@tinycld/core", "1.0.0", map[string][]byte{"server/a.pb.js": []byte("1")}); err != nil {
-		t.Fatal(err)
-	}
-	p := NewProvisioner(cp.App, root, s, func(string) {}, nil)
-	rec, err := p.CreateOrg("acme", "Acme", map[string]string{"@tinycld/core": "1.0.0"})
+	cp, root := newProvCP(t)
+	p := newFakeProvisioner(cp, root, func(string) {}, nil)
+	rec, err := p.CreateOrg("acme", "Acme", baseLock)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -275,7 +238,7 @@ func TestProvision_CreateOrgResumesStrandedRow(t *testing.T) {
 		t.Fatal(err)
 	}
 	// re-run must RESUME (not error) and end active
-	rec2, err := p.CreateOrg("acme", "Acme", map[string]string{"@tinycld/core": "1.0.0"})
+	rec2, err := p.CreateOrg("acme", "Acme", baseLock)
 	if err != nil {
 		t.Fatalf("expected resume, got error: %v", err)
 	}
@@ -283,60 +246,53 @@ func TestProvision_CreateOrgResumesStrandedRow(t *testing.T) {
 		t.Fatalf("expected resumed org active, got %s", rec2.GetString("status"))
 	}
 	// and an ACTIVE org still rejects duplicate create
-	if _, err := p.CreateOrg("acme", "Acme", map[string]string{"@tinycld/core": "1.0.0"}); err == nil {
+	if _, err := p.CreateOrg("acme", "Acme", baseLock); err == nil {
 		t.Fatal("expected duplicate active org to error")
 	}
 }
 
+// TestProvision_DeployWritesAuditRecord proves every deploy leaves a
+// deployments row carrying the new build's recipe hash and its settled status
+// — the operator's audit trail for what an org ran, and when.
 func TestProvision_DeployWritesAuditRecord(t *testing.T) {
-	root := t.TempDir()
-	cp, _ := New(filepath.Join(root, "pb_control", "pb_data"))
-	if err := cp.App.Bootstrap(); err != nil {
+	cp, root := newProvCP(t)
+	p := newFakeProvisioner(cp, root, func(string) {}, nil)
+	if _, err := p.CreateOrg("acme", "Acme", baseLock); err != nil {
 		t.Fatal(err)
 	}
-	defer cp.App.ResetBootstrapState()
-	if err := cpInitForTest(cp); err != nil {
+
+	d := newDeployer(cp.App, root, &fakeArtifactBuilder{hash: hashNew},
+		func(string) {}, nil, quietTestLogger())
+	if _, err := d.Deploy(context.Background(), "acme", map[string]string{"tinycld": "1.1.0"}, ""); err != nil {
 		t.Fatal(err)
 	}
-	s := store.New(root)
-	_ = s.Publish("@tinycld/core", "1.0.0", map[string][]byte{"server/a.pb.js": []byte("1")})
-	_ = s.Publish("@tinycld/core", "1.1.0", map[string][]byte{"server/a.pb.js": []byte("2")})
-	p := NewProvisioner(cp.App, root, s, func(string) {}, nil)
-	if _, err := p.CreateOrg("acme", "Acme", map[string]string{"@tinycld/core": "1.0.0"}); err != nil {
-		t.Fatal(err)
-	}
-	if err := p.Deploy("acme", map[string]string{"@tinycld/core": "1.1.0"}); err != nil {
-		t.Fatal(err)
-	}
+
+	// nil verify commits without a boot check; the row settles asynchronously.
+	waitUntil(t, "deployment committed", func() bool {
+		deps, err := cp.App.FindAllRecords("deployments")
+		return err == nil && len(deps) == 1 && deps[0].GetString("status") == "committed"
+	})
 	deps, err := cp.App.FindAllRecords("deployments")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(deps) != 1 {
-		t.Fatalf("expected 1 deployment audit record, got %d", len(deps))
+	if deps[0].GetString("recipe_hash") != hashNew {
+		t.Fatalf("deployment recipe_hash = %q, want %s", deps[0].GetString("recipe_hash"), hashNew)
 	}
 }
 
 func TestProvision_DeployRejectsArchivedOrg(t *testing.T) {
-	root := t.TempDir()
-	cp, _ := New(filepath.Join(root, "pb_control", "pb_data"))
-	if err := cp.App.Bootstrap(); err != nil {
-		t.Fatal(err)
-	}
-	defer cp.App.ResetBootstrapState()
-	if err := cpInitForTest(cp); err != nil {
-		t.Fatal(err)
-	}
-	s := store.New(root)
-	_ = s.Publish("@tinycld/core", "1.0.0", map[string][]byte{"server/a.pb.js": []byte("1")})
-	p := NewProvisioner(cp.App, root, s, func(string) {}, nil)
-	if _, err := p.CreateOrg("acme", "Acme", map[string]string{"@tinycld/core": "1.0.0"}); err != nil {
+	cp, root := newProvCP(t)
+	p := newFakeProvisioner(cp, root, func(string) {}, nil)
+	if _, err := p.CreateOrg("acme", "Acme", baseLock); err != nil {
 		t.Fatal(err)
 	}
 	if err := p.Archive("acme"); err != nil {
 		t.Fatal(err)
 	}
-	if err := p.Deploy("acme", map[string]string{"@tinycld/core": "1.0.0"}); err == nil {
-		t.Fatal("expected deploy to archived org to error")
+	d := newDeployer(cp.App, root, &fakeArtifactBuilder{hash: hashNew},
+		func(string) {}, nil, quietTestLogger())
+	if _, err := d.Deploy(context.Background(), "acme", baseLock, ""); err == nil || !strings.Contains(err.Error(), "archived") {
+		t.Fatalf("Deploy to archived org = %v, want a status refusal", err)
 	}
 }

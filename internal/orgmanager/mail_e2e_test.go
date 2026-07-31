@@ -3,71 +3,56 @@ package orgmanager
 import (
 	"bufio"
 	"context"
-	"encoding/json"
 	"net"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
-
-	"tinycld.org/multi-org/internal/lockfile"
-	"tinycld.org/multi-org/internal/store"
 )
 
 // End-to-end through the REAL serve-org binary: an org whose resolved package
-// set includes mail must come up serving mail's actual IMAP session on the
-// router-managed imap.sock (in external-TLS mode: plaintext greeting, auth
-// allowed), and an org without mail must bind no mail sockets at all. This is
-// the tenant half of the demux chain the mailrouter tests fake — together
-// they cover public port → SNI/RCPT demux → per-org socket → real session.
+// set — the artifact's staged manifests — includes mail must come up serving
+// mail's actual IMAP session on the router-managed imap.sock (in external-TLS
+// mode: plaintext greeting, auth allowed), and an org without mail must bind
+// no mail sockets at all. This is the tenant half of the demux chain the
+// mailrouter tests fake — together they cover public port → SNI/RCPT demux →
+// per-org socket → real session.
 func TestTenant_ServesIMAPOnRouterManagedSocket(t *testing.T) {
 	bin := buildTenantBinary(t)
 	root := t.TempDir()
 
-	s := store.New(root)
-	if err := s.Publish("@tinycld/core", "1.0.0", map[string][]byte{
-		"client/dist/index.html": []byte("<html></html>"),
-		"server/main.pb.js":      []byte("routerAdd('GET','/ping',(e)=>e.json(200,{ok:true}))"),
-	}); err != nil {
-		t.Fatal(err)
+	files := map[string]string{
+		"pb_public/index.html": "<html></html>",
+		"pb_hooks/main.pb.js":  "routerAdd('GET','/ping',(e)=>e.json(200,{ok:true}))",
 	}
-	// Only manifest.json — mail's Go is linked into the binary; the store
-	// copy is what puts "mail" in the org's resolved set.
-	if err := s.Publish("@tinycld/mail", "1.0.0", map[string][]byte{
-		"manifest.json": []byte(`{"slug":"mail"}`),
-	}); err != nil {
-		t.Fatal(err)
-	}
+	// Mail's Go is linked into the binary; the "mail" member staged in the
+	// artifact's manifests/ is what puts it in the org's resolved set.
+	withMail := buildArtifact(t, buildsRootFor(root), artifactSpec{
+		Hash:    "withmail1",
+		Binary:  bin,
+		Files:   files,
+		Members: []artifactMember{{Slug: "mail"}},
+	})
+	noMailRef := buildArtifact(t, buildsRootFor(root), artifactSpec{
+		Hash:   "nomail1",
+		Binary: bin,
+		Files:  files,
+	})
 
 	mgr := New(Config{
 		Root:         root,
-		Store:        s,
 		Spawner:      execSpawner{},
-		TenantBinary: bin,
 		Logger:       quietLogger(),
 		HooksPool:    2,
-		PackageSlugs: func(resolved []lockfile.ResolvedPackage) ([]string, error) {
-			var slugs []string
-			for _, pkg := range resolved {
-				slug := pkg.Name
-				if body, err := os.ReadFile(filepath.Join(pkg.Dir, "manifest.json")); err == nil {
-					var m struct {
-						Slug string `json:"slug"`
-					}
-					if json.Unmarshal(body, &m) == nil && m.Slug != "" {
-						slug = m.Slug
-					}
-				}
-				slugs = append(slugs, slug)
-			}
-			return slugs, nil
-		},
+		PackageSlugs: slugsFromManifests,
+		ResolveBuild: resolveBuilds(map[string]BuildRef{
+			"withmail1": withMail,
+			"nomail1":   noMailRef,
+		}),
 		LookupOrg: stubLookup(map[string]OrgRecord{
-			"withmail": {Slug: "withmail", Status: "active",
-				Lockfile: []byte(`{"@tinycld/core":"1.0.0","@tinycld/mail":"1.0.0"}`)},
-			"nomail": {Slug: "nomail", Status: "active",
-				Lockfile: []byte(`{"@tinycld/core":"1.0.0"}`)},
+			"withmail": {Slug: "withmail", Status: "active", RecipeHash: "withmail1"},
+			"nomail":   {Slug: "nomail", Status: "active", RecipeHash: "nomail1"},
 		}),
 	})
 	t.Cleanup(mgr.Shutdown)

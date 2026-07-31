@@ -2,12 +2,14 @@
 
 A multi-tenant router for [PocketBase](https://pocketbase.io). A fronting HTTPS
 server dispatches by subdomain to either a **control-plane** PocketBase app (the
-org/package/deployment registry + provisioning API, in-process) or a lazily
-spawned **tenant process**. Each tenant is a stock PocketBase running in its own
-OS process — confined to its own uid, mount and PID namespaces, and cgroup on
-Linux — whose `pb_hooks`/`pb_public` are materialized as symlink farms from a
-version-addressed package store. The router reaches each tenant over a per-org
-unix domain socket and never holds a tenant app object.
+org/deployment registry + provisioning API, in-process) or a lazily
+spawned **tenant process**. Each tenant is a per-org build artifact (a stock
+PocketBase linking exactly the org's package set) running in its own OS
+process — confined to its own uid, mount and PID namespaces, and cgroup on
+Linux — whose `pb_hooks`/`pb_public`/`pb_migrations` are symlinks into a
+committed, content-addressed build under `<root>/builds/<recipe-hash>/`. The
+router reaches each tenant over a per-org unix domain socket and never holds a
+tenant app object.
 
 > **Private module.** This imports a local PocketBase fork (see
 > [Fork dependency](#fork-dependency)). It is not published.
@@ -27,18 +29,19 @@ unix domain socket and never holds a tenant app object.
        ┌────────▼──────┐   ┌────────▼─────────┐
        │ control-plane │   │ OrgManager       │  lazy spawn + singleflight
        │ PocketBase app│   │  map[slug]*Inst  │  + supervise + idle eviction
-       │ orgs/packages/│   └────────┬─────────┘
+       │ orgs/         │   └────────┬─────────┘
        │ deployments   │            │ ReverseProxy over
        │ + provisioning│            │ <root>/run/<slug>/<slug>.sock
-       └───────────────┘   ┌────────▼─────────┐
-                           │ serve-org process│  ← OS boundary
-        host-side, shared: │  own uid + mount │
-          • store          │  + pid ns        │
-          • materialize    │  stock PB + jsvm │
-            (symlinks      │  (Sandboxed)     │
-             pb_hooks/     │  + Card/Cal/Web  │
-             pb_public)    │    DAV           │
-                           └──────────────────┘
+       └───────┬───────┘   ┌────────▼─────────┐
+               │           │ artifact process │  ← OS boundary
+      trusted  │           │  own uid + mount │
+      builder  │ repoint   │  + pid ns        │
+    (per-recipe│  live     │  the org's own   │
+     artifacts │  trees at │  dual-mode build │
+     under      │ builds/  │  (Sandboxed jsvm │
+     builds/    │ <hash>/  │   + Card/Cal/Web │
+     <hash>/)   ▼          │    DAV)          │
+    ────────────────────── └──────────────────┘
                              one process per org
 ```
 
@@ -46,11 +49,10 @@ unix domain socket and never holds a tenant app object.
 
 | Package | Responsibility |
 |---|---|
-| `internal/store` | Immutable, version-addressed package store (`<root>/packages/<name>/<version>/`). |
-| `internal/lockfile` | Per-org `{name: version}` lockfile; parse + resolve against the store. |
-| `internal/materialize` | Symlink-farm an org's `pb_hooks` (from `server/`) and `pb_public` (from `client/dist/`) from resolved packages. |
-| `internal/controlplane` | Control-plane PocketBase app: `orgs`/`packages`/`deployments`/`control_settings` schema, `Provisioner` (create/deploy/suspend/resume/archive/publish), the `Deployer` (the D6 deploy orchestrator: per-org serialization + rate limit, build → repoint → respawn with commit/revert, `.runtime/deploy-result.json`), HTTP routes, and the DB-backed `OrgLookup`. |
-| `internal/orgmanager` | Lazy per-org process supervisor: materialize (store symlink farm, or repoint at a committed build artifact) → spawn the tenant binary (shared `serve-org`, or the artifact's own dual-mode binary) → readiness handshake → reverse proxy. Singleflight-collapsed spawns, crash supervision with backoff, drain-then-kill `Evict`, idle sweeper, and the router-bound per-org control socket (`ctl.sock`) tenants propose deploys over. |
+| `internal/lockfile` | Per-org `{name: version}` package set; parse + marshal. Always names the app shell (`tinycld`) — the set is built into an artifact. |
+| `internal/materialize` | Point an org's live `pb_hooks`/`pb_public`/`pb_migrations` names at a committed build artifact's trees (atomic symlink swap). |
+| `internal/controlplane` | Control-plane PocketBase app: `orgs`/`deployments`/`control_settings` schema, `Provisioner` (create/suspend/resume/archive), the `Deployer` (the D6 deploy orchestrator: per-org serialization + rate limit, build → repoint → respawn with commit/revert, `.runtime/deploy-result.json`), HTTP routes, and the DB-backed `OrgLookup`. |
+| `internal/orgmanager` | Lazy per-org process supervisor: repoint the live trees at the org's committed build → spawn the artifact's own dual-mode binary → readiness handshake → reverse proxy. Singleflight-collapsed spawns, crash supervision with backoff, drain-then-kill `Evict`, idle sweeper, and the router-bound per-org control socket (`ctl.sock`) tenants propose deploys over. |
 | `internal/orgerr` | The three sentinels (`ErrOrgNotFound` / `ErrOrgNotActive` / `ErrOrgUnavailable`) the front router classifies into 404 / 503. |
 | `internal/builder` | The trusted builder (DESIGN-org-package-agency §7 step 2): resolves a package set on the trusted side (tarball integrities + manifest facts → recipe hash), runs the shared `pkgbuild` pipeline in a confined re-exec'd job, and commits the runtime tree to the content-addressed cache at `<root>/builds/<recipe-hash>/` (idempotent commit, refcount-style `Sweep`). |
 | `internal/frontrouter` | Plain `http.Handler`: `Host` → subdomain → control-plane / org / apex org-finder page. |
@@ -68,12 +70,9 @@ go build -o bin/ ./cmd/serve-multi ./cmd/serve-org
 MT_ROOT=./mt_data MT_BASE_DOMAIN=tinycld.org MT_ADDR=:443 ./bin/serve-multi
 ```
 
-`serve-org` is resolved next to the `serve-multi` executable by default, so a
-deployed pair stays together without configuration.
-
 | Env | Default | Purpose |
 |---|---|---|
-| `MT_ROOT` | `./mt_data` | Data root: package store, control plane, per-org dirs. |
+| `MT_ROOT` | `./mt_data` | Data root: build-artifact cache (`builds/`), control plane, per-org dirs. |
 | `MT_BASE_DOMAIN` | `tinycld.org` | Subdomain dispatch base. |
 | `MT_ADDR` | `:443` | Listen address. |
 | `MT_TLS_MODE` | `proxy` | `proxy` / `file` / `autocert`. |
@@ -91,7 +90,7 @@ deployed pair stays together without configuration.
 | `MT_MAIL_TLS_CERT`, `MT_MAIL_TLS_KEY` | falls back to `MT_TLS_CERT`/`MT_TLS_KEY` | Wildcard cert the router terminates mail TLS with. Tenants never hold this key. |
 | `MT_IMAPS_ADDR`, `MT_SMTPS_ADDR`, `MT_MX_ADDR` | `:993`, `:465`, `:25` | Mail listener addresses; the literal value `off` disables that one listener. |
 | `MT_MX_HOSTNAME` | `MT_BASE_DOMAIN` | Identity the `:25` greeting announces and the HELO name toward tenants. |
-| `MT_SCAFFOLD_ROOT` | — | Enables the **trusted builder**: an operator-provisioned workspace scaffold root (`package-versions.json`, `scripts/link-members.ts`, …; bootstrap is its source of truth). Set, package sets whose lockfile includes the app shell (`tinycld`) are built into shared artifacts under `<root>/builds/<recipe-hash>/` and orgs boot their own per-set binary; unset, only the legacy store/materialize path exists. |
+| `MT_SCAFFOLD_ROOT` | — | Enables the **trusted builder**: an operator-provisioned workspace scaffold root (`package-versions.json`, `scripts/link-members.ts`, …; bootstrap is its source of truth). Set, package sets are built into shared artifacts under `<root>/builds/<recipe-hash>/`. **Required to provision or deploy** — unset, the router still serves orgs whose artifacts were built earlier but refuses any new build. |
 | `MT_BUILDER_MAX_CONCURRENT` | `1` | Cap on simultaneously-running build jobs; excess queue. Builds are minutes of CPU-saturating work — the queue is the capacity seam. |
 | `MT_BUILDER_UID` | — | **Linux.** Dedicated host uid build jobs run as (outside the tenant uid window). Unset ⇒ jobs run unconfined. |
 | `MT_BUILDER_CGROUP_ROOT` | — | **Linux.** cgroup v2 dir to place build jobs under. |
@@ -102,24 +101,22 @@ constructed environment (see the security section).
 
 ## Artifact-backed orgs & the deploy protocol
 
-With `MT_SCAFFOLD_ROOT` set, a lockfile that includes the app shell
-(`"tinycld": "<version>"`) is an **artifact set**: the trusted builder fetches
-every member from its registry spec, computes the recipe hash, runs the
-`pkgbuild` pipeline in a confined job, and commits the runtime tree to
-`<root>/builds/<recipe-hash>/`. The org row stores that hash
-(`orgs.recipe_hash`); at load the manager points the org's
-`pb_hooks`/`pb_migrations`/`pb_public` into the artifact (atomic symlink
-swap), boots the artifact's **own dual-mode binary** instead of the shared
-`serve-org`, and feeds the capability wiring from the artifact's staged
+Every org is artifact-backed. A lockfile always includes the app shell
+(`"tinycld": "<version>"`); the trusted builder fetches every member from its
+registry spec, computes the recipe hash, runs the `pkgbuild` pipeline in a
+confined job, and commits the runtime tree to `<root>/builds/<recipe-hash>/`.
+The org row stores that hash (`orgs.recipe_hash`); at load the manager points
+the org's `pb_hooks`/`pb_migrations`/`pb_public` into the artifact (atomic
+symlink swap), boots the artifact's **own dual-mode binary**, and feeds the
+capability wiring from the artifact's staged
 `manifests/<slug>/manifest.json`. Two orgs with the same set share the entry
 by construction; an hourly sweep removes artifacts no org's current or
 previous build references.
 
 `POST /api/orgs` with **no** lockfile copies the operator-editable template
 (`PUT /api/settings/default-lockfile`) — the default set is just a warm cache
-entry, so provisioning costs seconds. An explicit empty lockfile still means a
-zero-package lean shell (legacy path). Store-name lockfiles (no `tinycld`
-entry) keep the store/materialize path until design §7 step 5 deletes it.
+entry, so provisioning costs seconds. A lockfile that omits the app shell is
+rejected: there is no package set that isn't built.
 
 Deploys (operator `POST /api/orgs/{slug}/deploy`, or the tenant itself over
 its **control socket** — `ctl.sock` in the org's 0700 socket dir, router-bound
@@ -249,18 +246,16 @@ supply a DNS-01 solver or a pre-issued wildcard cert. The autocert cache lives a
 
 ### Minor / cleanup
 
-- **Store naming:** `store.ContentHash` / the `packages.content_hash` field / the
-  "content-addressed" wording are vestigial — the store resolves by
-  `<name>/<version>`, and `content_hash`/`manifest` are never populated by
-  `PublishPackage`. Either wire content hashing or drop the vocabulary.
 - **Reserved subdomains:** `validSlug` rejects `admin` and `www`
   (`provisioning.go`), matching what the front router claims for the control
   plane / apex org-finder page.
-- **peerVersions solver:** `lockfile.Resolve` stays a pure store lookup;
-  `controlplane.CheckPeerVersions` (compat.go) enforces every resolved
-  package's `peerVersions` ranges — `CreateOrg` and `Deploy` both refuse to
-  materialize an incompatible set. A required peer missing from the lockfile
-  and an unparsable range are violations too (fail closed).
+- **peerVersions solver:** the authoritative `peerVersions` gate runs inside
+  `builder.Build` — the confined job re-checks every resolved member's ranges
+  against the freshly-fetched manifests before it commits an artifact, so a
+  `CreateOrg`/deploy of an incompatible set fails the build. A required peer
+  missing from the set and an unparsable range are violations too (fail
+  closed). The tenant's hosted Packages UI runs an advisory pre-flight solve
+  from its `pkg_registry` manifests first (the build re-checks it).
 - **Cold start:** a tenant boot is PocketBase bootstrap + migrations + JS compile,
   i.e. hundreds of ms to seconds, paid by the first request after the 30-minute
   idle sweep evicts an org. There is no warm pool. Cross-org compiled-program

@@ -2,76 +2,60 @@ package orgmanager
 
 import (
 	"context"
-	"encoding/json"
 	"net/http"
 	"net/http/httptest"
-	"os"
-	"path/filepath"
 	"strings"
 	"testing"
-
-	"tinycld.org/multi-org/internal/lockfile"
-	"tinycld.org/multi-org/internal/store"
 )
 
 // Feature Go reaches a tenant ONLY through the pinned menu, gated by the org's
-// resolved package set (docs/SCOPE-tenant-feature-go.md). The probe is the
-// `$contacts` jsvm binding: it exists in a tenant's VMs iff contacts'
-// RegisterTenant ran in that process, so a hook that reports `typeof
-// $contacts` observes exactly "did this org get the feature's Go" — through
-// the real serve-org binary, packages.json, and --packages-config.
+// resolved package set (docs/SCOPE-tenant-feature-go.md): the members staged
+// in the org's artifact decide which slugs land in packages.json, which
+// serve-org uses to gate feature Go registration. The probe is the `$contacts`
+// jsvm binding: it exists in a tenant's VMs iff contacts' RegisterTenant ran
+// in that process, so a hook that reports `typeof $contacts` observes exactly
+// "did this org get the feature's Go" — through the real serve-org binary,
+// packages.json, and --packages-config.
 func TestTenant_FeatureGoIsGatedByPackageSet(t *testing.T) {
 	bin := buildTenantBinary(t)
 	root := t.TempDir()
 
-	s := store.New(root)
 	probe := `routerAdd('GET','/feature-probe',(e)=>e.json(200,{contacts: typeof $contacts !== 'undefined'}))`
-	if err := s.Publish("@tinycld/core", "1.0.0", map[string][]byte{
-		"client/dist/index.html": []byte("<html></html>"),
-		"server/main.pb.js":      []byte(probe),
-	}); err != nil {
-		t.Fatal(err)
+	files := map[string]string{
+		"pb_public/index.html": "<html></html>",
+		"pb_hooks/main.pb.js":  probe,
 	}
-	// The store package carries only manifest.json here — the tenant's contacts
-	// Go is linked into the binary; the store copy is what puts "contacts" in
+	// The artifact stages only contacts' manifest — the tenant's contacts Go
+	// is linked into the binary; the staged member is what puts "contacts" in
 	// the org's resolved set.
-	if err := s.Publish("@tinycld/contacts", "1.0.0", map[string][]byte{
-		"manifest.json": []byte(`{"slug":"contacts"}`),
-	}); err != nil {
-		t.Fatal(err)
-	}
+	withPkg := buildArtifact(t, buildsRootFor(root), artifactSpec{
+		Hash:    "withpkg1",
+		Binary:  bin,
+		Files:   files,
+		Members: []artifactMember{{Slug: "contacts"}},
+	})
+	withoutPkg := buildArtifact(t, buildsRootFor(root), artifactSpec{
+		Hash:   "withoutpkg1",
+		Binary: bin,
+		Files:  files,
+	})
 
 	mgr := New(Config{
-		Root:         root,
-		Store:        s,
-		Spawner:      execSpawner{},
-		TenantBinary: bin,
-		Logger:       quietLogger(),
-		HooksPool:    2,
+		Root:      root,
+		Spawner:   execSpawner{},
+		Logger:    quietLogger(),
+		HooksPool: 2,
 		// The production hook lives in controlplane (which imports this
-		// package, so it can't be imported here); this mirror reads the same
-		// manifest.json slug with the same name fallback.
-		PackageSlugs: func(resolved []lockfile.ResolvedPackage) ([]string, error) {
-			var slugs []string
-			for _, pkg := range resolved {
-				slug := pkg.Name
-				if body, err := os.ReadFile(filepath.Join(pkg.Dir, "manifest.json")); err == nil {
-					var m struct {
-						Slug string `json:"slug"`
-					}
-					if json.Unmarshal(body, &m) == nil && m.Slug != "" {
-						slug = m.Slug
-					}
-				}
-				slugs = append(slugs, slug)
-			}
-			return slugs, nil
-		},
+		// package, so it can't be imported here); slugsFromManifests reads the
+		// same manifest.json slug from the artifact's staged member dirs.
+		PackageSlugs: slugsFromManifests,
+		ResolveBuild: resolveBuilds(map[string]BuildRef{
+			"withpkg1":    withPkg,
+			"withoutpkg1": withoutPkg,
+		}),
 		LookupOrg: stubLookup(map[string]OrgRecord{
-			"withpkg": {Slug: "withpkg", Status: "active",
-				Lockfile: []byte(`{"@tinycld/core":"1.0.0","@tinycld/contacts":"1.0.0"}`)},
-			"withoutpkg": {Slug: "withoutpkg", Status: "active",
-				Lockfile: []byte(`{"@tinycld/core":"1.0.0"}`)},
+			"withpkg":    {Slug: "withpkg", Status: "active", RecipeHash: "withpkg1"},
+			"withoutpkg": {Slug: "withoutpkg", Status: "active", RecipeHash: "withoutpkg1"},
 		}),
 	})
 	t.Cleanup(mgr.Shutdown)

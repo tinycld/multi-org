@@ -3,30 +3,16 @@ package controlplane
 import (
 	"net/http"
 	"net/http/httptest"
-	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/pocketbase/pocketbase/apis"
-
-	"tinycld.org/multi-org/internal/store"
 )
 
 func TestOrgLookup_ReturnsActiveOrgRecord(t *testing.T) {
-	root := t.TempDir()
-	cp, _ := New(filepath.Join(root, "pb_control", "pb_data"))
-	if err := cp.App.Bootstrap(); err != nil {
-		t.Fatal(err)
-	}
-	defer cp.App.ResetBootstrapState()
-	if err := cpInitForTest(cp); err != nil {
-		t.Fatal(err)
-	}
-
-	s := store.New(root)
-	_ = s.Publish("@tinycld/core", "1.0.0", map[string][]byte{"server/a.pb.js": []byte("1")})
-	p := NewProvisioner(cp.App, root, s, func(string) {}, nil)
-	if _, err := p.CreateOrg("acme", "Acme", map[string]string{"@tinycld/core": "1.0.0"}); err != nil {
+	cp, root := newProvCP(t)
+	p := newFakeProvisioner(cp, root, func(string) {}, nil)
+	if _, err := p.CreateOrg("acme", "Acme", baseLock); err != nil {
 		t.Fatal(err)
 	}
 
@@ -41,23 +27,19 @@ func TestOrgLookup_ReturnsActiveOrgRecord(t *testing.T) {
 	if len(rec.Lockfile) == 0 {
 		t.Fatal("expected lockfile bytes to be populated")
 	}
+	// The manager refuses to load an org without a build reference, so the
+	// lookup must surface the recipe hash CreateOrg recorded.
+	if rec.RecipeHash != hashOld {
+		t.Fatalf("RecipeHash = %q, want %s", rec.RecipeHash, hashOld)
+	}
 	if _, ok := lookup("ghost"); ok {
 		t.Fatal("expected ghost to be absent")
 	}
 }
 
 func TestRegisterRoutes_OrgsRequiresSuperuser(t *testing.T) {
-	root := t.TempDir()
-	cp, _ := New(filepath.Join(root, "pb_control", "pb_data"))
-	if err := cp.App.Bootstrap(); err != nil {
-		t.Fatal(err)
-	}
-	defer cp.App.ResetBootstrapState()
-	if err := cpInitForTest(cp); err != nil {
-		t.Fatal(err)
-	}
-	s := store.New(root)
-	p := NewProvisioner(cp.App, root, s, func(string) {}, nil)
+	cp, root := newProvCP(t)
+	p := NewProvisioner(cp.App, root, func(string) {}, nil)
 	p.RegisterRoutes()
 
 	mux, err := apis.BuildServeMux(cp.App, apis.ServeConfig{})
@@ -73,35 +55,5 @@ func TestRegisterRoutes_OrgsRequiresSuperuser(t *testing.T) {
 	mux.ServeHTTP(rec, req)
 	if rec.Code != http.StatusUnauthorized {
 		t.Fatalf("expected 401 for unauthenticated provisioning, got %d: %s", rec.Code, rec.Body.String())
-	}
-}
-
-func TestRegisterRoutes_PublishPackageRequiresSuperuser(t *testing.T) {
-	root := t.TempDir()
-	cp, _ := New(filepath.Join(root, "pb_control", "pb_data"))
-	if err := cp.App.Bootstrap(); err != nil {
-		t.Fatal(err)
-	}
-	defer cp.App.ResetBootstrapState()
-	if err := cpInitForTest(cp); err != nil {
-		t.Fatal(err)
-	}
-	s := store.New(root)
-	p := NewProvisioner(cp.App, root, s, func(string) {}, nil)
-	p.RegisterRoutes()
-
-	mux, err := apis.BuildServeMux(cp.App, apis.ServeConfig{})
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	// Unauthenticated POST /api/store/packages must be rejected (401), proving the
-	// route is wired AND superuser-guarded.
-	rec := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodPost, "/api/store/packages", strings.NewReader(`{"name":"@x/y","version":"1.0.0","files":{}}`))
-	req.Header.Set("Content-Type", "application/json")
-	mux.ServeHTTP(rec, req)
-	if rec.Code != http.StatusUnauthorized {
-		t.Fatalf("expected 401 for unauthenticated publish, got %d: %s", rec.Code, rec.Body.String())
 	}
 }

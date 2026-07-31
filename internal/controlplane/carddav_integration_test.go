@@ -15,8 +15,10 @@ import (
 	"github.com/pocketbase/pocketbase/core"
 	"github.com/pocketbase/pocketbase/plugins/jsvm"
 
+	"tinycld.org/core/pkgbuild"
+	"tinycld.org/multi-org/internal/manifesteval"
+	"tinycld.org/multi-org/internal/materialize"
 	"tinycld.org/multi-org/internal/orgmanager"
-	"tinycld.org/multi-org/internal/store"
 	"tinycld.org/multi-org/internal/testsupport"
 )
 
@@ -74,21 +76,21 @@ func buildTenantBinary(t *testing.T) string {
 func quietLogger() *slog.Logger { return slog.New(slog.NewTextHandler(io.Discard, nil)) }
 
 // TestIntegration_MultiOrgCardDAV drives the full multi-org CardDAV path:
-// publish a contacts package (carddav manifest + schema) → provision two orgs →
-// seed each tenant DB → REPORT each org's CardDAV endpoint through its proxy
-// and confirm each serves ONLY its own contact.
+// commit a contacts-bearing artifact (evaluated carddav manifest + schema) →
+// provision two orgs from it → seed each tenant DB → REPORT each org's CardDAV
+// endpoint through its proxy and confirm each serves ONLY its own contact.
 //
 // With per-process isolation this exercises the real path end to end: the host
-// resolves sources and writes them to the org's runtime dir, the tenant process
-// reads them and mounts its own CardDAV routes against its own DB, and the
-// response travels back over the unix socket.
+// reads the artifact's staged manifest, writes the sources to the org's runtime
+// dir, the tenant process reads them and mounts its own CardDAV routes against
+// its own DB, and the response travels back over the unix socket.
 func TestIntegration_MultiOrgCardDAV(t *testing.T) {
 	root := t.TempDir()
-	mgr, p := setupCardDAVOrgs(t, root)
+	mgr, p, artifactDir := setupCardDAVOrgs(t, root)
 	defer mgr.Shutdown()
 
-	seedOrg(t, p, root, "acme", "alice@acme.test", "Alice", "Acme")
-	seedOrg(t, p, root, "globex", "bob@globex.test", "Bob", "Globex")
+	seedOrg(t, p, root, artifactDir, "acme", "alice@acme.test", "Alice", "Acme")
+	seedOrg(t, p, root, artifactDir, "globex", "bob@globex.test", "Bob", "Globex")
 
 	acmeVCF := carddavReport(t, mgr, "acme", "alice@acme.test")
 	if !strings.Contains(acmeVCF, "Alice") {
@@ -121,9 +123,15 @@ func TestIntegration_MultiOrgCardDAV(t *testing.T) {
 	}
 }
 
-// setupCardDAVOrgs boots a control plane, publishes the contacts package, and
-// returns a manager wired to spawn real tenant processes.
-func setupCardDAVOrgs(t *testing.T, root string) (*orgmanager.OrgManager, *Provisioner) {
+// setupCardDAVOrgs boots a control plane, commits a contacts artifact, and
+// returns a manager wired to spawn real tenant processes from it, plus the
+// committed artifact directory (seeding reads its trees directly).
+//
+// The manifest fixture goes through manifesteval.EvalJSON — the same evaluator
+// the builder runs when staging manifests/<slug>/manifest.json — so the test
+// covers the manifest.ts → manifest.json → CardDAVSources read path the
+// deleted publish-time emitManifestJSON used to provide.
+func setupCardDAVOrgs(t *testing.T, root string) (*orgmanager.OrgManager, *Provisioner, string) {
 	t.Helper()
 	bin := buildTenantBinary(t)
 
@@ -139,28 +147,35 @@ func setupCardDAVOrgs(t *testing.T, root string) (*orgmanager.OrgManager, *Provi
 		t.Fatal(err)
 	}
 
-	s := store.New(root)
-	p := NewProvisioner(cp.App, root, s, func(string) {}, nil)
+	manifestJSON, err := manifesteval.EvalJSON(contactsCardDAVManifest, "manifest.ts")
+	if err != nil {
+		t.Fatalf("eval contacts manifest: %v", err)
+	}
+	hash := commitArtifact(t, root, "carddav-contacts", bin, map[string]string{
+		"pb_migrations/1700000000_contacts.js":   contactsSchemaMigration,
+		"manifests/contacts/" + manifestJSONFile: string(manifestJSON),
+	}, []pkgbuild.ResolvedMember{
+		baseMember(),
+		{Slug: "contacts", Name: "@tinycld/contacts", Version: "1.0.0"},
+	})
 
-	// Publish via PublishPackage so emitManifestJSON runs (manifest.ts → manifest.json).
-	files := map[string][]byte{
-		"manifest.ts":                          []byte(contactsCardDAVManifest),
-		"pb-migrations/1700000000_contacts.js": []byte(contactsSchemaMigration),
-	}
-	if err := p.PublishPackage("contacts", "1.0.0", files, "official"); err != nil {
-		t.Fatalf("PublishPackage: %v", err)
-	}
+	p := NewProvisioner(cp.App, root, func(string) {}, nil)
+	p.deployer = newDeployer(cp.App, root, &fakeArtifactBuilder{hash: hash}, func(string) {}, nil, quietTestLogger())
 
 	mgr := orgmanager.New(orgmanager.Config{
 		Root:           root,
-		Store:          s,
-		TenantBinary:   bin,
 		Logger:         quietLogger(),
 		LookupOrg:      OrgLookup(cp.App),
 		HooksPool:      2,
+		ResolveBuild:   artifactResolver(root),
 		CardDAVSources: CardDAVSources,
 	})
-	return mgr, p
+
+	artifactDir, err := artifactResolver(root)(hash)
+	if err != nil {
+		t.Fatalf("resolve committed artifact: %v", err)
+	}
+	return mgr, p, artifactDir.Dir
 }
 
 // seedOrg provisions an org and inserts a user + one contact into its DB.
@@ -168,14 +183,21 @@ func setupCardDAVOrgs(t *testing.T, root string) (*orgmanager.OrgManager, *Provi
 // The host no longer holds a tenant app object, so seeding opens the tenant's
 // database directly — the test process is the host and has filesystem access.
 // This must happen BEFORE the tenant process spawns, since two processes must
-// not hold the same SQLite database open for writing.
-func seedOrg(t *testing.T, p *Provisioner, root, slug, email, first, orgName string) {
+// not hold the same SQLite database open for writing. CreateOrg no longer
+// materializes trees (the manager does, at load), so the seed materializes the
+// artifact itself to run its migrations — the same idempotent symlink swap the
+// manager will repeat at spawn.
+func seedOrg(t *testing.T, p *Provisioner, root, artifactDir, slug, email, first, orgName string) {
 	t.Helper()
-	if _, err := p.CreateOrg(slug, orgName, map[string]string{"contacts": "1.0.0"}); err != nil {
+	lock := map[string]string{"tinycld": "1.0.0", "@tinycld/contacts": "1.0.0"}
+	if _, err := p.CreateOrg(slug, orgName, lock); err != nil {
 		t.Fatalf("CreateOrg(%s): %v", slug, err)
 	}
 
 	orgDir := filepath.Join(root, "pb_orgs", slug)
+	if err := materialize.MaterializeBuild(orgDir, artifactDir); err != nil {
+		t.Fatalf("materialize %s: %v", slug, err)
+	}
 	app := pocketbase.NewWithConfig(pocketbase.Config{
 		DefaultDataDir:  filepath.Join(orgDir, "pb_data"),
 		HideStartBanner: true,
@@ -270,10 +292,10 @@ func basicAuth(user, pass string) string {
 // CardDAV routes from the config the host handed down, rather than 404ing.
 func TestIntegration_MultiOrgCardDAV_Challenges401(t *testing.T) {
 	root := t.TempDir()
-	mgr, p := setupCardDAVOrgs(t, root)
+	mgr, p, _ := setupCardDAVOrgs(t, root)
 	defer mgr.Shutdown()
 
-	if _, err := p.CreateOrg("acme", "Acme", map[string]string{"contacts": "1.0.0"}); err != nil {
+	if _, err := p.CreateOrg("acme", "Acme", map[string]string{"tinycld": "1.0.0", "@tinycld/contacts": "1.0.0"}); err != nil {
 		t.Fatalf("CreateOrg: %v", err)
 	}
 

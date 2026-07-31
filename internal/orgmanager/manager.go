@@ -28,7 +28,6 @@ import (
 	"tinycld.org/multi-org/internal/lockfile"
 	"tinycld.org/multi-org/internal/materialize"
 	"tinycld.org/multi-org/internal/orgerr"
-	"tinycld.org/multi-org/internal/store"
 )
 
 // Timeouts governing a tenant's lifecycle. These are package-level rather than
@@ -67,10 +66,9 @@ type OrgRecord struct {
 	Lockfile []byte
 
 	// RecipeHash names the committed build artifact this org boots from
-	// (DESIGN-org-package-agency D4). Non-empty ⇒ the org is artifact-backed:
-	// load resolves it through Config.ResolveBuild and ignores the package
-	// store entirely. Empty ⇒ the legacy store/materialize path (kept until
-	// design §7 step 5 removes it).
+	// (DESIGN-org-package-agency D4): load resolves it through
+	// Config.ResolveBuild. Every org is artifact-backed — an empty hash
+	// fails the load.
 	RecipeHash string
 
 	// DisplayName is the org's human-facing name from the control-plane
@@ -111,7 +109,6 @@ type BuildRef struct {
 
 type Config struct {
 	Root      string
-	Store     *store.PackageStore
 	LookupOrg LookupFunc
 	HooksPool int
 	MaxIdle   time.Duration // 0 => no idle eviction sweeper
@@ -135,14 +132,9 @@ type Config struct {
 	// 0 = the default of 4.
 	MaxConcurrentSpawns int
 
-	// TenantBinary is the path to the serve-org executable — the shared
-	// pinned-menu binary legacy (store-backed) orgs run. Artifact-backed orgs
-	// run their build's own binary instead (BuildRef.Binary).
-	TenantBinary string
-
-	// ResolveBuild resolves an org's RecipeHash to its committed artifact.
-	// Required for artifact-backed orgs; nil fails their load (a lockfile-only
-	// deployment never needs it).
+	// ResolveBuild resolves an org's RecipeHash to its committed artifact —
+	// every org boots from one (the artifact's own dual-mode binary,
+	// BuildRef.Binary). Required; nil fails every load.
 	ResolveBuild func(recipeHash string) (BuildRef, error)
 
 	// Control returns the handler the manager serves on the org's control
@@ -374,43 +366,24 @@ func (m *OrgManager) load(ctx context.Context, slug string) (*OrgInstance, error
 
 	orgDir := filepath.Join(m.cfg.Root, "pb_orgs", slug)
 
-	// An artifact-backed org (RecipeHash set) boots its own build: binary and
-	// live trees come from builds/<hash>/, and the read-only mount confinement
-	// applies covers the builds root instead of the package store. A legacy
-	// org keeps the store/materialize path until step 5 deletes it.
-	var (
-		resolved []lockfile.ResolvedPackage
-		src      = bootSource{
-			binary:      m.cfg.TenantBinary,
-			packagesDir: filepath.Join(m.cfg.Root, "packages"),
-		}
-	)
-	if rec.RecipeHash != "" {
-		if m.cfg.ResolveBuild == nil {
-			return nil, fmt.Errorf("org %s references build %s but no build resolver is wired", slug, rec.RecipeHash)
-		}
-		ref, err := m.cfg.ResolveBuild(rec.RecipeHash)
-		if err != nil {
-			return nil, fmt.Errorf("resolve build for %s: %w", slug, err)
-		}
-		if err := materialize.MaterializeBuild(orgDir, ref.Dir); err != nil {
-			return nil, fmt.Errorf("materialize build %s: %w", slug, err)
-		}
-		resolved = ref.Packages
-		src = bootSource{binary: ref.Binary, packagesDir: filepath.Dir(ref.Dir)}
-	} else {
-		lf, err := lockfile.Parse(rec.Lockfile)
-		if err != nil {
-			return nil, fmt.Errorf("lockfile parse for %s: %w", slug, err)
-		}
-		resolved, err = lf.Resolve(m.cfg.Store)
-		if err != nil {
-			return nil, fmt.Errorf("lockfile resolve for %s: %w", slug, err)
-		}
-		if err := materialize.Materialize(orgDir, resolved); err != nil {
-			return nil, fmt.Errorf("materialize %s: %w", slug, err)
-		}
+	// Every org boots its own committed build: binary and live trees come
+	// from builds/<hash>/, and the read-only mount confinement covers the
+	// builds root.
+	if rec.RecipeHash == "" {
+		return nil, fmt.Errorf("org %s has no build reference (recipe_hash); every org boots from a committed artifact", slug)
 	}
+	if m.cfg.ResolveBuild == nil {
+		return nil, fmt.Errorf("org %s references build %s but no build resolver is wired", slug, rec.RecipeHash)
+	}
+	ref, err := m.cfg.ResolveBuild(rec.RecipeHash)
+	if err != nil {
+		return nil, fmt.Errorf("resolve build for %s: %w", slug, err)
+	}
+	if err := materialize.MaterializeBuild(orgDir, ref.Dir); err != nil {
+		return nil, fmt.Errorf("materialize build %s: %w", slug, err)
+	}
+	resolved := ref.Packages
+	src := bootSource{binary: ref.Binary, packagesDir: filepath.Dir(ref.Dir)}
 
 	// After materialize, never before: materialize is what establishes the org
 	// directory, and creating it early (via MkdirAll on a subpath) changes what

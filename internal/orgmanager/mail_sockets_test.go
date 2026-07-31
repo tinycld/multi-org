@@ -7,9 +7,6 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
-
-	"tinycld.org/multi-org/internal/lockfile"
-	"tinycld.org/multi-org/internal/store"
 )
 
 // The per-org mail socket contract these tests pin: an org whose resolved
@@ -122,33 +119,33 @@ func TestBuildCmd_MailSocketFlags(t *testing.T) {
 }
 
 // The manager must hand mail socket paths to the spawn exactly when the org's
-// resolved package set includes mail — a socket for an org that never starts
-// the listener is a dead rendezvous point, and a mail org without one is
-// unreachable by the mail router.
+// resolved package set — read from the artifact's staged manifests — includes
+// mail. A socket for an org that never starts the listener is a dead
+// rendezvous point, and a mail org without one is unreachable by the mail
+// router.
 func TestGet_MailSocketPathsFollowResolvedPackageSet(t *testing.T) {
-	newMgr := func(slugs []string) (*OrgManager, *fakeSpawner) {
+	newMgr := func(members ...artifactMember) (*OrgManager, *fakeSpawner) {
 		sp := &fakeSpawner{handler: http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 			_, _ = w.Write([]byte("ok"))
 		})}
 		root := t.TempDir()
-		s := store.New(root)
-		if err := s.Publish("@tinycld/core", "1.0.0", map[string][]byte{
-			"server/main.pb.js": []byte("1"),
-		}); err != nil {
-			t.Fatal(err)
-		}
+		ref := buildArtifact(t, buildsRootFor(root), artifactSpec{
+			Hash:    "core1",
+			Members: members,
+		})
 		mgr := New(Config{
-			Root: root, Store: s, Spawner: sp, Logger: quietLogger(), HooksPool: 2,
-			PackageSlugs: func(_ []lockfile.ResolvedPackage) ([]string, error) { return slugs, nil },
+			Root: root, Spawner: sp, Logger: quietLogger(), HooksPool: 2,
+			PackageSlugs: slugsFromManifests,
+			ResolveBuild: resolveBuilds(map[string]BuildRef{"core1": ref}),
 			LookupOrg: stubLookup(map[string]OrgRecord{
-				"acme": {Slug: "acme", Status: "active", Lockfile: []byte(`{"@tinycld/core":"1.0.0"}`)},
+				"acme": {Slug: "acme", Status: "active", RecipeHash: "core1"},
 			}),
 		})
 		t.Cleanup(mgr.Shutdown)
 		return mgr, sp
 	}
 
-	withMail, sp := newMgr([]string{"contacts", "mail"})
+	withMail, sp := newMgr(artifactMember{Slug: "contacts"}, artifactMember{Slug: "mail"})
 	if _, err := withMail.Get(context.Background(), "acme"); err != nil {
 		t.Fatalf("Get: %v", err)
 	}
@@ -160,7 +157,7 @@ func TestGet_MailSocketPathsFollowResolvedPackageSet(t *testing.T) {
 		t.Fatalf("mail socket %q not beside http socket %q", req.IMAPSocketPath, req.SocketPath)
 	}
 
-	without, sp2 := newMgr([]string{"contacts"})
+	without, sp2 := newMgr(artifactMember{Slug: "contacts"})
 	if _, err := without.Get(context.Background(), "acme"); err != nil {
 		t.Fatalf("Get: %v", err)
 	}
@@ -174,16 +171,12 @@ func TestGet_MailSocketPathsFollowResolvedPackageSet(t *testing.T) {
 func TestSweep_SkipsInstancesWithTrackedConns(t *testing.T) {
 	sp := &fakeSpawner{}
 	root := t.TempDir()
-	s := store.New(root)
-	if err := s.Publish("@tinycld/core", "1.0.0", map[string][]byte{
-		"server/main.pb.js": []byte("1"),
-	}); err != nil {
-		t.Fatal(err)
-	}
+	ref := buildArtifact(t, buildsRootFor(root), artifactSpec{Hash: "core1"})
 	mgr := New(Config{
-		Root: root, Store: s, Spawner: sp, Logger: quietLogger(), HooksPool: 2,
+		Root: root, Spawner: sp, Logger: quietLogger(), HooksPool: 2,
+		ResolveBuild: resolveBuilds(map[string]BuildRef{"core1": ref}),
 		LookupOrg: stubLookup(map[string]OrgRecord{
-			"acme": {Slug: "acme", Status: "active", Lockfile: []byte(`{"@tinycld/core":"1.0.0"}`)},
+			"acme": {Slug: "acme", Status: "active", RecipeHash: "core1"},
 		}),
 	})
 	t.Cleanup(mgr.Shutdown)

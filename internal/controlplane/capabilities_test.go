@@ -7,7 +7,6 @@ import (
 	"reflect"
 	"strings"
 	"testing"
-	"time"
 
 	"tinycld.org/core/tenantcfg"
 	"tinycld.org/multi-org/internal/lockfile"
@@ -75,120 +74,10 @@ const manifest = {
 export default manifest
 `
 
-func TestEmitManifestJSON_ParsesTSDefaultExport(t *testing.T) {
-	files := map[string][]byte{
-		"manifest.ts":               []byte(contactsManifestTS),
-		"pb-hooks/contacts.pb.ts":   []byte(`onRecordCreate(() => {}, 'contacts')`),
-		"pb-migrations/x_create.js": []byte(`migrate(() => {})`),
-	}
-	out, err := emitManifestJSON(files)
-	if err != nil {
-		t.Fatalf("emitManifestJSON: %v", err)
-	}
-	raw, ok := out[manifestJSONFile]
-	if !ok {
-		t.Fatal("manifest.json not emitted")
-	}
-	var m map[string]any
-	if err := json.Unmarshal(raw, &m); err != nil {
-		t.Fatalf("manifest.json invalid: %v", err)
-	}
-	if m["slug"] != "contacts" {
-		t.Errorf("slug = %v", m["slug"])
-	}
-	cd, ok := m["carddav"].(map[string]any)
-	if !ok {
-		t.Fatalf("carddav block missing/typed wrong: %T", m["carddav"])
-	}
-	if cd["collection"] != "contacts" || cd["uidField"] != "vcard_uid" {
-		t.Errorf("carddav block wrong: %+v", cd)
-	}
-	// Other files pass through untouched.
-	if _, ok := out["pb-hooks/contacts.pb.ts"]; !ok {
-		t.Error("pb-hooks file dropped")
-	}
-}
-
-// A manifest is untrusted package JS. Without an interrupt, `while(true){}`
-// spins the POST /api/store/packages goroutine forever and nothing can
-// recover it — the "pure object literal" the evaluator expects is an
-// assumption about input, not an enforced property. (The evaluator itself
-// lives in internal/manifesteval; this exercises it through the same
-// entry emitManifestJSON uses.)
-func TestEvalManifest_InterruptsRunawayScript(t *testing.T) {
-	orig := manifesteval.Timeout
-	manifesteval.Timeout = 200 * time.Millisecond
-	t.Cleanup(func() { manifesteval.Timeout = orig })
-
-	errCh := make(chan error, 1)
-	go func() {
-		_, err := manifesteval.EvalJSON("const manifest = {}\nwhile (true) {}\nexport default manifest", "manifest.ts")
-		errCh <- err
-	}()
-
-	select {
-	case err := <-errCh:
-		if err == nil {
-			t.Fatal("expected a timeout error for a runaway manifest")
-		}
-	case <-time.After(manifesteval.Timeout + 5*time.Second):
-		t.Fatal("EvalJSON never returned for a runaway script")
-	}
-}
-
-// Size caps close the cheap paths regardless of evaluator: an oversized
-// manifest source is refused before eval, and an eval that materializes an
-// oversized export is refused before it is stored. (Memory isolation proper
-// is the subprocess evaluator serve-multi wires — internal/manifesteval.)
-func TestEmitManifestJSON_RefusesOversizedSource(t *testing.T) {
-	huge := make([]byte, manifestSourceMaxBytes+1)
-	for i := range huge {
-		huge[i] = ' '
-	}
-	copy(huge, []byte("export default {name: 'x'}"))
-
-	_, err := emitManifestJSON(map[string][]byte{"manifest.ts": huge})
-	if err == nil {
-		t.Fatal("oversized manifest source accepted")
-	}
-}
-
-func TestEmitManifestJSON_RefusesOversizedExport(t *testing.T) {
-	// ~64 MiB string from a few bytes of source: the classic doubling bomb,
-	// small enough to stay allocated briefly in a test.
-	src := `
-let s = 'xxxxxxxxxxxxxxxx'
-for (let i = 0; i < 22; i++) s += s
-export default { name: 'bomb', blob: s }
-`
-	_, err := emitManifestJSON(map[string][]byte{"manifest.ts": []byte(src)})
-	if err == nil {
-		t.Fatal("a manifest exporting tens of megabytes was accepted into the store")
-	}
-}
-
-func TestEmitManifestJSON_NoManifestIsNoop(t *testing.T) {
-	files := map[string][]byte{"pb-migrations/x.js": []byte("migrate(()=>{})")}
-	out, err := emitManifestJSON(files)
-	if err != nil {
-		t.Fatalf("emitManifestJSON: %v", err)
-	}
-	if _, ok := out[manifestJSONFile]; ok {
-		t.Error("manifest.json should not be emitted without a manifest source")
-	}
-}
-
 func TestCardDAVSources_ReadsManifestJSON(t *testing.T) {
-	// Emit manifest.json the way publish does, then write it to a package dir and
-	// resolve sources from it — the full host read path.
-	files, err := emitManifestJSON(map[string][]byte{"manifest.ts": []byte(contactsManifestTS)})
-	if err != nil {
-		t.Fatalf("emit: %v", err)
-	}
-	dir := t.TempDir()
-	if err := os.WriteFile(filepath.Join(dir, manifestJSONFile), files[manifestJSONFile], 0o644); err != nil {
-		t.Fatalf("write: %v", err)
-	}
+	// Evaluate manifest.json the way the builder stages it, then resolve
+	// sources from the package dir — the full host read path.
+	dir := writeManifestPkg(t, contactsManifestTS)
 
 	sources, err := CardDAVSources([]lockfile.ResolvedPackage{{Name: "contacts", Version: "0.1.1", Dir: dir}})
 	if err != nil {
@@ -246,14 +135,7 @@ export default manifest
 `
 
 func TestWebDAVSources_ReadsManifestJSON(t *testing.T) {
-	files, err := emitManifestJSON(map[string][]byte{"manifest.ts": []byte(driveManifestTS)})
-	if err != nil {
-		t.Fatalf("emit: %v", err)
-	}
-	dir := t.TempDir()
-	if err := os.WriteFile(filepath.Join(dir, manifestJSONFile), files[manifestJSONFile], 0o644); err != nil {
-		t.Fatalf("write: %v", err)
-	}
+	dir := writeManifestPkg(t, driveManifestTS)
 
 	sources, err := WebDAVSources([]lockfile.ResolvedPackage{{Name: "drive", Version: "0.2.2", Dir: dir}})
 	if err != nil {
@@ -400,14 +282,7 @@ export default manifest
 // A Source that survives the wire round-trip must still build a FileSystem —
 // i.e. the three mirrored struct definitions actually agree.
 func TestWebDAVSources_RoundTripThroughWire(t *testing.T) {
-	files, err := emitManifestJSON(map[string][]byte{"manifest.ts": []byte(driveManifestTS)})
-	if err != nil {
-		t.Fatalf("emit: %v", err)
-	}
-	dir := t.TempDir()
-	if err := os.WriteFile(filepath.Join(dir, manifestJSONFile), files[manifestJSONFile], 0o644); err != nil {
-		t.Fatalf("write: %v", err)
-	}
+	dir := writeManifestPkg(t, driveManifestTS)
 
 	sources, err := WebDAVSources([]lockfile.ResolvedPackage{{Name: "drive", Dir: dir}})
 	if err != nil {
@@ -431,14 +306,7 @@ func TestWebDAVSources_RoundTripThroughWire(t *testing.T) {
 // ceiling but must never be charged to a user. Losing that distinction on the
 // wire would bill one person for a whole mailbox.
 func TestQuotaSources_ReadsManifestJSON(t *testing.T) {
-	files, err := emitManifestJSON(map[string][]byte{"manifest.ts": []byte(driveManifestTS)})
-	if err != nil {
-		t.Fatalf("emit: %v", err)
-	}
-	dir := t.TempDir()
-	if err := os.WriteFile(filepath.Join(dir, manifestJSONFile), files[manifestJSONFile], 0o644); err != nil {
-		t.Fatalf("write: %v", err)
-	}
+	dir := writeManifestPkg(t, driveManifestTS)
 
 	sources, err := QuotaSources([]lockfile.ResolvedPackage{{Name: "drive", Dir: dir}})
 	if err != nil {
@@ -552,16 +420,17 @@ const manifest = {
 export default manifest
 `
 
-// writeManifestPkg emits manifest.json from a manifest.ts source into a fresh
-// temp dir, as the store does when a package is published.
+// writeManifestPkg evaluates a manifest.ts source to manifest.json in a fresh
+// temp dir — the same evaluation the builder performs when staging an
+// artifact's manifests/<slug>/manifest.json for the host's capability readers.
 func writeManifestPkg(t *testing.T, manifestTS string) string {
 	t.Helper()
-	files, err := emitManifestJSON(map[string][]byte{"manifest.ts": []byte(manifestTS)})
+	data, err := manifesteval.EvalJSON(manifestTS, "manifest.ts")
 	if err != nil {
-		t.Fatalf("emit: %v", err)
+		t.Fatalf("eval manifest: %v", err)
 	}
 	dir := t.TempDir()
-	if err := os.WriteFile(filepath.Join(dir, manifestJSONFile), files[manifestJSONFile], 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, manifestJSONFile), data, 0o644); err != nil {
 		t.Fatalf("write: %v", err)
 	}
 	return dir

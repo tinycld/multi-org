@@ -7,34 +7,31 @@ import (
 	"time"
 
 	"tinycld.org/multi-org/internal/orgerr"
-	"tinycld.org/multi-org/internal/store"
 )
 
 // newAdmissionManager wires a manager over sp with the given caps and three
-// active orgs (a, b, c) so admission tests can fill the resident set.
+// active orgs (a, b, c) — all booting the same committed artifact — so
+// admission tests can fill the resident set.
 func newAdmissionManager(t *testing.T, sp *fakeSpawner, maxResident, maxSpawns int) *OrgManager {
 	t.Helper()
 	root := t.TempDir()
 
-	s := store.New(root)
-	if err := s.Publish("@tinycld/core", "1.0.0", map[string][]byte{
-		"client/dist/index.html": []byte("<html></html>"),
-	}); err != nil {
-		t.Fatal(err)
-	}
+	ref := buildArtifact(t, buildsRootFor(root), artifactSpec{
+		Hash:  "core1",
+		Files: map[string]string{"pb_public/index.html": "<html></html>"},
+	})
 
-	lock := []byte(`{"@tinycld/core":"1.0.0"}`)
 	mgr := New(Config{
 		Root:                root,
-		Store:               s,
 		Spawner:             sp,
 		Logger:              quietLogger(),
 		MaxResident:         maxResident,
 		MaxConcurrentSpawns: maxSpawns,
+		ResolveBuild:        resolveBuilds(map[string]BuildRef{"core1": ref}),
 		LookupOrg: stubLookup(map[string]OrgRecord{
-			"a": {Slug: "a", Status: "active", Lockfile: lock},
-			"b": {Slug: "b", Status: "active", Lockfile: lock},
-			"c": {Slug: "c", Status: "active", Lockfile: lock},
+			"a": {Slug: "a", Status: "active", RecipeHash: "core1"},
+			"b": {Slug: "b", Status: "active", RecipeHash: "core1"},
+			"c": {Slug: "c", Status: "active", RecipeHash: "core1"},
 		}),
 	})
 	t.Cleanup(mgr.Shutdown)

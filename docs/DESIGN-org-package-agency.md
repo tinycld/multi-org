@@ -23,8 +23,13 @@ rule landed in the workspace CLAUDE.md. Kernel per-uid filesystem quotas
 landed: `MT_TENANT_DISK_MAX` applies a `quotactl` block limit to the tenant
 uid after `chownTree` (warn-not-fail; the soft `storage_limit_bytes` stays the
 plan, this is the hard backstop against package Go bypassing `app.Save`).
-Remaining: retire `.runtime/packages.json` (redundant with the artifact's
-built-in set), and the audit's OPEN follow-ups (M1/M2/M3/M5/H5).
+`.runtime/packages.json` is retired — nothing consumes the resolved slug list
+tenant-side (the artifact links exactly its set and reconciles its registry
+from its own recipe.json/manifests); the router keeps the in-memory list only
+for the mail-socket decision. **Step 5's structural work is complete**; the
+audit's M1/M2/M3/M5/H5 remain as tracked hardening follow-ups, and the
+browser-level hosted install suite (goal 2's "same UX" finish line) is the
+remaining test-infra item.
 **Motivates:** letting a tenant's own admin manage that org's packages —
 install, uninstall, upgrade, including third-party packages the operator has
 never heard of — while a new org can still be spun up from a default set in
@@ -521,8 +526,15 @@ idle sweep, and the readiness protocol are untouched.
    the mail e2e. The confinement workflow now assembles a full bootstrap
    workspace (`--assemble-only --with <every feature>` + `pnpm install`) so the
    generated app-shell `go.work`/`package_extensions*.go` exist for that build.
-   Remaining: `.runtime/packages.json` retirement, kernel per-uid FS quotas,
-   and the audit's H/M hardening items.
+   The audit's H/M/L hardening landed (H1 rate-limits + lockfile cap, H3
+   version-cache bound, H4 ctl-socket timeouts, M4 hardlink skip, L2
+   degraded-mode ctl-socket refusal, L4 slug assert); M1/M2/M3/M5/H5 are
+   tracked OPEN follow-ups. Kernel per-uid FS quotas landed
+   (`MT_TENANT_DISK_MAX` → `quotactl` block limit on the tenant uid, warn-not-
+   fail). `.runtime/packages.json` is retired — the artifact is the gate, and
+   the router keeps the in-memory slug list only for the mail-socket decision.
+   **The structural step-5 work is complete.** Remaining: the browser-level
+   hosted install suite (goal 2's finish line) and the OPEN audit follow-ups.
 
 Each step lands green on its own; the pinned menu and materialize path worked
 until step 5 removed them.

@@ -11,7 +11,7 @@ import (
 	"time"
 )
 
-// End-to-end through the REAL serve-org binary: an org whose resolved package
+// End-to-end through the REAL dual-mode tenant binary: an org whose resolved package
 // set — the artifact's staged manifests — includes mail must come up serving
 // mail's actual IMAP session on the router-managed imap.sock (in external-TLS
 // mode: plaintext greeting, auth allowed), and an org without mail must bind

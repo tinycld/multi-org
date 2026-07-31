@@ -26,7 +26,7 @@ func TestBuildCmd_EnvIsAllowlistOnly(t *testing.T) {
 		Slug:       "acme",
 		OrgDir:     t.TempDir(),
 		SocketPath: "/tmp/acme.sock",
-		BinaryPath: "/nonexistent/serve-org",
+		BinaryPath: "/nonexistent/tinycld",
 	}
 	cmd := buildCmd(req, slog.New(slog.NewTextHandler(io.Discard, nil)))
 
@@ -69,7 +69,7 @@ func TestEnsureTenantDirs_CreatesTmpdir(t *testing.T) {
 		Slug:       "acme",
 		OrgDir:     orgDir,
 		SocketPath: "/tmp/acme.sock",
-		BinaryPath: "/nonexistent/serve-org",
+		BinaryPath: "/nonexistent/tinycld",
 	}
 	cmd := buildCmd(req, slog.New(slog.NewTextHandler(io.Discard, nil)))
 

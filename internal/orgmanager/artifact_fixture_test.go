@@ -13,9 +13,10 @@ import (
 // lays them out (design D4): buildsRoot/<hash>/ carrying the flattened
 // pb_hooks/pb_migrations/pb_public trees, the org's tenant binary at
 // <dir>/tinycld, and one manifests/<slug>/manifest.json per feature member.
-// Real-binary tests place the serve-org build inside the artifact because
-// production resolves the binary from the artifact itself (BuildRef.Binary =
-// <dir>/tinycld) and confinement mounts the builds root read-only around it.
+// Real-binary tests place the app-shell dual-mode build inside the artifact
+// because production resolves the binary from the artifact itself
+// (BuildRef.Binary = <dir>/tinycld) and confinement mounts the builds root
+// read-only around it.
 
 // artifactMember is one feature member staged into an artifact's manifests/.
 type artifactMember struct {

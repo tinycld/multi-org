@@ -98,8 +98,8 @@ type BuildRef struct {
 	Dir string
 
 	// Binary is the tenant executable inside Dir — the dual-mode app-shell
-	// binary built from the org's own package set, a drop-in serve-org
-	// replacement under the unchanged flags/ready-fd contract.
+	// binary built from the org's own package set, under the standard tenant
+	// flags/ready-fd contract.
 	Binary string
 
 	// Packages carries each feature member with Dir pointing at the artifact's
@@ -168,12 +168,13 @@ type Config struct {
 	QuotaSources func(resolved []lockfile.ResolvedPackage) ([]quota.Source, error)
 
 	// PackageSlugs returns the manifest slugs of an org's resolved package
-	// set. Written to .runtime/packages.json and read by serve-org, which
-	// uses it to gate FEATURE Go registration against the pinned menu the
-	// tenant binary links (internal/tenantpkgs) — an org that has not
-	// installed a package must not get its hooks or background goroutines.
-	// Host-side for the same reason as the DAV sources: the host already
-	// holds the resolved list, and the child must not walk the store.
+	// set. Written to .runtime/packages.json and surfaced to the tenant as
+	// tenantmain.Extras.PackageSlugs. The dual-mode binary links exactly the
+	// org's package set and registers its feature Go unconditionally (the
+	// artifact is the gate), so this is no longer a registration filter; the
+	// tenant uses it as the authoritative slug set for its package-registry
+	// reconcile. Host-side for the same reason as the DAV sources: the host
+	// already holds the resolved list, and the child must not walk the store.
 	PackageSlugs func(resolved []lockfile.ResolvedPackage) ([]string, error)
 
 	// Forwarded controls how each tenant's proxy constructs the
@@ -1088,7 +1089,7 @@ func (m *OrgManager) writeCardDAVConfig(orgDir string, resolved []lockfile.Resol
 //
 // A zero limit still writes the file — "explicitly unlimited" and "no config"
 // should not be distinguishable to the tenant, and the file's presence is what
-// tells serve-org the router is managing this.
+// tells the tenant the router is managing this.
 func (m *OrgManager) writeQuotaConfig(orgDir string, rec OrgRecord, resolved []lockfile.ResolvedPackage) (string, error) {
 	var sources []quota.Source
 	if m.cfg.QuotaSources != nil {

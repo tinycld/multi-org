@@ -13,10 +13,15 @@ deleted — every org is artifact-backed, `internal/store` /
 `transpileForStore` / publish-time manifest eval / `POST /api/store/packages`
 / `CheckPeerVersions` are gone, `internal/materialize` is reduced to
 `MaterializeBuild`, and the `packages` collection is dropped by an appended
-control-plane migration. Remaining: delete `cmd/serve-org` +
-`internal/tenantpkgs` (fold into the dual-mode binary), retire
-`.runtime/packages.json`, the hostile-child audit, kernel quotas, and the
-append-only-migration docs (landed in the workspace CLAUDE.md).
+control-plane migration. `cmd/serve-org` + `internal/tenantpkgs` and the six
+go.mod feature replaces are deleted — every org runs its own per-recipe
+artifact binary (the app shell's dual-mode `main`); the real-binary tests
+build it from the `tinycld` sibling. The hostile-child audit ran
+(`docs/AUDIT-hostile-child.md`): the four criticals + the H/M/L hardening are
+fixed, M1/M2/M3/M5/H5 recorded as OPEN follow-ups. The append-only-migration
+rule landed in the workspace CLAUDE.md. Remaining: retire
+`.runtime/packages.json` (redundant with the artifact's built-in set), and
+kernel per-uid filesystem quotas.
 **Motivates:** letting a tenant's own admin manage that org's packages —
 install, uninstall, upgrade, including third-party packages the operator has
 never heard of — while a new org can still be spun up from a default set in
@@ -498,12 +503,26 @@ idle sweep, and the readiness protocol are untouched.
    write), C2/H2 (`/v1/resolve` git-spec RCE + SSRF → registry-only gate),
    C3 (router subprocesses inheriting secret env → `serve-multi` scrub),
    C4 (build jobs overwriting sibling artifacts → `cas.Commit` chown-root).
-   Remaining: `cmd/serve-org` + `internal/tenantpkgs` deletion (fold into
-   the dual-mode binary), `.runtime/packages.json` retirement, kernel
-   per-uid FS quotas, and the audit's H/M hardening items.
+   `cmd/serve-org` + `internal/tenantpkgs` are DELETED (the pinned menu is
+   gone; the dual-mode binary registers its linked feature Go unconditionally,
+   the artifact being the gate). The router's real-binary tests now build the
+   app shell's dual-mode `main` from the `tinycld` sibling
+   (`testsupport.BuildTenantBinary` → `../tinycld/server`, output basename
+   `tinycld` to match `BuildRef.Binary`), so they exercise the SAME binary a
+   per-org artifact ships. The six `tinycld.org/packages/*` go.mod
+   replaces/requires that existed only to link feature Go into serve-org are
+   dropped (`go mod tidy` pruned them and their transitive indirects). The
+   feature_go_e2e slug-gating test was deleted — per-org runtime slug filtering
+   of feature Go no longer exists to assert (gen-server.ts:57-64); mail-socket
+   gating (feature listeners injected only for mail orgs) is still covered by
+   the mail e2e. The confinement workflow now assembles a full bootstrap
+   workspace (`--assemble-only --with <every feature>` + `pnpm install`) so the
+   generated app-shell `go.work`/`package_extensions*.go` exist for that build.
+   Remaining: `.runtime/packages.json` retirement, kernel per-uid FS quotas,
+   and the audit's H/M hardening items.
 
-Each step lands green on its own; the pinned menu and materialize path keep
-working until step 5 removes them.
+Each step lands green on its own; the pinned menu and materialize path worked
+until step 5 removed them.
 
 ## 8. Rejected alternatives — and the question that broke each
 

@@ -14,15 +14,15 @@ import (
 	"tinycld.org/multi-org/internal/testsupport"
 )
 
-// These tests spawn the real serve-org binary. They are the only coverage of
+// These tests spawn the real dual-mode tenant binary. They are the only coverage of
 // the child's own wiring — listener injection, readiness reporting, the jsvm
 // sandbox, drain-on-SIGTERM — none of which the fake spawner exercises.
 //
 // They cost a build plus a PocketBase boot per case, so they are skipped under
 // -short.
 
-// buildTenantBinary compiles cmd/serve-org once per test run (shared across
-// packages via testsupport).
+// buildTenantBinary compiles the app shell's dual-mode binary once per test run
+// (shared across packages via testsupport) — the real production tenant binary.
 func buildTenantBinary(t *testing.T) string {
 	t.Helper()
 	return testsupport.BuildTenantBinary(t)
@@ -152,7 +152,7 @@ func TestTenant_AdoptsMaterializedOrgName(t *testing.T) {
 // A successful users auth must upsert this org's entry into the parent-domain
 // tinycld_orgs switcher cookie (Set-Cookie through the router's proxy), and a
 // failed auth must not. Drives the real chain: display_name + MT_BASE_DOMAIN →
-// app.json → serve-org's OnRecordAuthRequest hook → Set-Cookie.
+// app.json → the tenant's OnRecordAuthRequest hook → Set-Cookie.
 func TestTenant_SetsSwitcherCookieOnAuth(t *testing.T) {
 	mgr := newRealManager(t, `routerAdd('POST','/mkuser',(e)=>{
         const col = $app.findCollectionByNameOrId('users')

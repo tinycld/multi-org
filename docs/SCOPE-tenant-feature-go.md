@@ -1,7 +1,14 @@
 # Scope — linking feature Go into the tenant process
 
 **Status:** **CLOSED** 2026-07-27 — implemented as D1 + D2 with step 5 resolved
-as option (b). See "How it was closed" at the end.
+as option (b). See "How it was closed" at the end. **SUPERSEDED 2026-07-31** by
+`DESIGN-org-package-agency.md` §7 step 5: the pinned menu (`serve-org` +
+`internal/tenantpkgs`) is deleted. Each org now runs its OWN per-recipe artifact
+binary — the app shell's dual-mode `main` — which links exactly the org's
+package set and registers its feature Go unconditionally (the artifact is the
+gate, replacing the runtime slug filter this doc scoped). The composition-gap
+concern below is answered by per-org builds rather than a hand-pinned menu. This
+document is retained as the record of why option (b) was chosen at the time.
 **Motivates:** REMEDIATION-PLAN P1-5 (calendar member authz), and the whole
 class of findings shaped "enforcement lives in Go a tenant never runs".
 

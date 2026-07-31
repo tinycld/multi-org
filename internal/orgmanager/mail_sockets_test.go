@@ -14,7 +14,7 @@ import (
 // socket — one directory per org, because the Linux spawner chowns exactly
 // that directory to the tenant's uid (P0-1) and a socket in any other
 // directory would be either unreachable or another org's to unlink. Orgs
-// without mail get none, and the spawn request carries the paths so serve-org
+// without mail get none, and the spawn request carries the paths so the tenant
 // binds them itself (the same child-binds precedent as the HTTP socket).
 
 // shortRoot returns a root shallow enough that the primary socket layout fits

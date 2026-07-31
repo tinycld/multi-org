@@ -8,11 +8,20 @@
 # containers), so passwordless sudo grants real CAP_SYS_ADMIN and the
 # namespace/uid work all functions.
 #
-# go.mod resolves every tinycld.org module from SIBLING CHECKOUTS (the fork is
-# vendored in the tinycld repo; core and the feature menu resolve the same
-# way), so this job lays out the same workspace shape as a developer machine:
-# every repo side by side, all on the multi-org branch. If the sibling repos
-# are private, add a repo-scoped PAT as the SIBLING_CHECKOUT_TOKEN secret;
+# WORKSPACE SHAPE. The router's go.mod resolves core and the vendored fork from
+# the `tinycld` sibling (../tinycld/...), and the real-binary tests
+# (BuildTenantBinary) build the app shell's DUAL-MODE tenant binary from
+# ../tinycld/server — the real production tenant binary. That build needs the
+# app shell's GENERATED Go wiring (server/go.work + server/package_extensions*.
+# go), which the workspace generator emits during `pnpm install`; go.work is
+# what links the feature members' server modules (../../<feature>/server), so
+# feature Go now reaches a tenant through that binary, not a router-side menu.
+#
+# So this job assembles a real developer-shaped workspace under ws/ via
+# @tinycld/bootstrap (the router checked out at ws/multi-org beside ws/tinycld,
+# every feature cloned by --with), runs pnpm install to generate the app
+# shell's server wiring, and only then builds and tests the Go. If the sibling
+# repos are private, add a repo-scoped PAT as the SIBLING_CHECKOUT_TOKEN secret;
 # with public repos the default token suffices.
 name: confinement
 
@@ -25,38 +34,62 @@ on:
 jobs:
   confinement:
     runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: multi-org
     steps:
+      # The router is the triggering checkout — land it at ws/multi-org so its
+      # ../tinycld/... go.mod replaces and BuildTenantBinary's ../tinycld/server
+      # lookup resolve against the assembled workspace.
       - uses: actions/checkout@v5
         with:
-          path: multi-org
+          path: ws/multi-org
 
-      - name: Check out sibling repos (go.mod replaces)
+      # tinycld carries its own .node-version; bootstrap has not written ws/
+      # yet, so read it from a shallow standalone checkout of the shell.
+      - name: Check out tinycld for .node-version
         env:
           GH_TOKEN: ${{ secrets.SIBLING_CHECKOUT_TOKEN || github.token }}
-        working-directory: ${{ github.workspace }}
         run: |
-          for repo in tinycld calc calendar contacts drive mail text; do
-            git clone --depth 1 --branch multi-org \
-              "https://x-access-token:${GH_TOKEN}@github.com/tinycld/${repo}.git" "${repo}"
-          done
+          git clone --depth 1 --branch multi-org \
+            "https://x-access-token:${GH_TOKEN}@github.com/tinycld/tinycld.git" .node-version-src
+      - uses: actions/setup-node@v5
+        with:
+          node-version-file: .node-version-src/.node-version
 
+      # Assemble app + core + every feature. bootstrap clones tinycld and each
+      # --with feature as siblings under ws/, matching the router's relative
+      # replaces and the app shell's go.work (../../<feature>/server).
+      - name: Assemble workspace (app + core + features)
+        working-directory: ws
+        env:
+          TINYCLD_REPO_BASE: ${{ secrets.SIBLING_CHECKOUT_TOKEN && format('https://x-access-token:{0}@github.com/tinycld', secrets.SIBLING_CHECKOUT_TOKEN) || 'https://github.com/tinycld' }}
+        run: |
+          npx @tinycld/bootstrap@latest --assemble-only \
+            --with calc --with calendar --with contacts \
+            --with drive --with mail --with text
+
+      # Go toolchain after assembly: .go-version is bootstrap-generated into ws/.
       - uses: actions/setup-go@v6
         with:
-          go-version-file: multi-org/go.mod
-          cache-dependency-path: multi-org/go.sum
+          go-version-file: ws/.go-version
+          cache-dependency-path: ws/multi-org/go.sum
+
+      # Generate the app shell's server wiring (go.work + package_extensions*.go)
+      # that BuildTenantBinary compiles. postinstall runs the generator.
+      - name: Install (workspace root)
+        working-directory: ws
+        run: corepack enable && pnpm install --no-frozen-lockfile
 
       - name: Build and vet
+        working-directory: ws/multi-org
         run: |
           go build ./...
           go vet ./...
 
       - name: Unit and integration tests
+        working-directory: ws/multi-org
         run: go test ./... -count=1
 
       - name: Confinement tests (root)
+        working-directory: ws/multi-org
         # Root gets its own build cache; sharing the runner user's would leave
         # root-owned files behind and break the post-job cache save. The module
         # cache is shared read-only — the steps above already downloaded

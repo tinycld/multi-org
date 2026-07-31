@@ -1,7 +1,13 @@
 # Finding — a tenant is not the same server as single-org
 
 **Found:** 2026-07-27, while tracing whether the calendar takeover was real.
-**Status:** **FIXED** 2026-07-27 — see "How it was closed" at the end.
+**Status:** **FIXED** 2026-07-27 — see "How it was closed" at the end. The
+`Register`/`RegisterTenant` composition split this finding forced still stands;
+only its DELIVERY changed: as of `DESIGN-org-package-agency.md` §7 step 5 the
+pinned menu (`serve-org` + `internal/tenantpkgs`) is gone — each org runs its own
+per-recipe artifact binary that links exactly its package set and registers that
+feature Go unconditionally. Where this doc says "pinned menu", read "the org's
+own artifact binary".
 **Severity:** privilege escalation in every tenant, independent of installed
 packages.
 

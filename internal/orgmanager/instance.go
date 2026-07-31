@@ -74,7 +74,7 @@ type OrgInstance struct {
 	published chan struct{}
 	// torndown closes when shutdown has fully completed — including the
 	// socket cleanup that runs AFTER dead. Since the child no longer unlinks
-	// its own socket on listener close (see serve-org's SetUnlinkOnClose),
+	// its own socket on listener close (see tenantmain's SetUnlinkOnClose),
 	// "process reaped" and "socket removed" are distinct moments; anything
 	// asserting post-eviction disk state must wait on this, not dead.
 	torndown chan struct{}

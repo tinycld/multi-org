@@ -103,8 +103,8 @@ func TestBuilderE2E_BuildsArtifactAndTenantBoots(t *testing.T) {
 // bootTenantFromArtifact assembles a minimal org dir the way the router's
 // materialize step would (hooks + migrations from the artifact, empty
 // pb_data), spawns the artifact's dual-mode binary in tenant mode over the
-// serve-org flag contract, waits for the ready handshake, and health-checks
-// over the unix socket.
+// standard tenant flag contract, waits for the ready handshake, and
+// health-checks over the unix socket.
 func bootTenantFromArtifact(t *testing.T, artifactDir string) {
 	t.Helper()
 	orgDir := t.TempDir()

@@ -111,8 +111,8 @@ func (s *linuxSpawner) Spawn(ctx context.Context, req SpawnRequest, log *slog.Lo
 
 	// The child remounts its own namespace before serving: Go cannot run code
 	// between fork and exec, so the confinement steps that must happen inside
-	// the new mount namespace are done by serve-org itself at startup. See
-	// cmd/serve-org's --confine-packages handling.
+	// the new mount namespace are done by the tenant binary itself at startup.
+	// See tenantmain's --confine-packages handling.
 	req.ConfinePackages = root && s.conf.UIDBase > 0 && s.conf.UIDRange > 0
 
 	cmd := buildCmd(req, log)
@@ -137,7 +137,7 @@ func (s *linuxSpawner) Spawn(ctx context.Context, req SpawnRequest, log *slog.Lo
 			return nil, fmt.Errorf("assign tenant uid for %s: %w", req.Slug, err)
 		}
 		// The child has to remount the package store read-only inside its own
-		// mount namespace (see cmd/serve-org --confine-packages), and mount(2)
+		// mount namespace (see tenantmain --confine-packages), and mount(2)
 		// needs CAP_SYS_ADMIN over that namespace — which a process that has
 		// setuid'd to a plain host uid does not hold. A single-uid user
 		// namespace squares that circle: inside it the child is uid 0 with

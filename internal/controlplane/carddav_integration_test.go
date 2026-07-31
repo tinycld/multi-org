@@ -65,9 +65,9 @@ const manifest = {
 export default manifest
 `
 
-// buildTenantBinary compiles cmd/serve-org once per test run (shared across
-// packages via testsupport). CardDAV now runs inside the tenant process, so
-// proving it works needs the real binary.
+// buildTenantBinary compiles the app shell's dual-mode binary once per test run
+// (shared across packages via testsupport) — the real production tenant binary.
+// CardDAV now runs inside the tenant process, so proving it works needs it.
 func buildTenantBinary(t *testing.T) string {
 	t.Helper()
 	return testsupport.BuildTenantBinary(t)

@@ -58,15 +58,22 @@ tenant app object.
 | `internal/frontrouter` | Plain `http.Handler`: `Host` → subdomain → control-plane / org / apex org-finder page. |
 | `internal/webpage` | Branded HTML pages (cold-start/restart interstitials, unknown-org, apex org finder) + JSON error bodies for non-browser clients. |
 | `internal/server` | Single `http.Server` + wildcard autocert TLS + graceful shutdown. |
-| `cmd/serve-multi` | The router. Wires it all together. |
-| `cmd/serve-org` | The tenant. One org on a unix socket: core's `tenantmain` transport (config loading, socket, readiness handshake, confinement — shared with the dual-mode per-org build binary) composing `coreserver.RegisterTenant`, plus this binary's pinned feature-Go menu (`internal/tenantpkgs`), gated by the org's resolved package set. |
+| `cmd/serve-multi` | The router. Wires it all together — the only binary this module builds. |
+
+The tenant binary is NOT built here. Each org runs its **own artifact binary**
+— the app shell's dual-mode `main` (`tinycld.org/tinycld`), which dispatches to
+core's `tenantmain` transport on `--org-dir` and registers its linked feature Go
+unconditionally (the artifact is the gate). The builder produces one per recipe
+and commits it into `builds/<hash>/tinycld`; for dev, build it standalone from
+the `tinycld` sibling (`cd ../tinycld/server && go build -o … .`).
 
 ## Running
 
-Both binaries are required — the router spawns the tenant one:
+The router is the only binary to build here; it spawns each org's own artifact
+binary:
 
 ```sh
-go build -o bin/ ./cmd/serve-multi ./cmd/serve-org
+go build -o bin/ ./cmd/serve-multi
 MT_ROOT=./mt_data MT_BASE_DOMAIN=tinycld.org MT_ADDR=:443 ./bin/serve-multi
 ```
 
@@ -78,7 +85,6 @@ MT_ROOT=./mt_data MT_BASE_DOMAIN=tinycld.org MT_ADDR=:443 ./bin/serve-multi
 | `MT_TLS_MODE` | `proxy` | `proxy` / `file` / `autocert`. |
 | `MT_TLS_CERT`, `MT_TLS_KEY` | — | Required for `file`. |
 | `MT_SUPERUSER_EMAIL`, `MT_SUPERUSER_PASSWORD` | — | Upserts the control-plane superuser on boot. Without it every provisioning route 401s. |
-| `MT_TENANT_BINARY` | sibling `serve-org` | Override the tenant executable path. |
 | `MT_MAX_RESIDENT_ORGS` | — | Cap on resident tenant processes. When full, the least-recently-used idle org is evicted to admit a newcomer; if every resident org has live connections the newcomer gets 503. Unset ⇒ unlimited — one request per enumerable slug then holds every org resident. |
 | `MT_MAX_CONCURRENT_SPAWNS` | `4` | Cap on simultaneous cold starts (each runs migrations + hook compilation). Excess loads wait, bounded by the spawn timeout. |
 | `MT_TENANT_UID_BASE`, `MT_TENANT_UID_RANGE` | — | **Linux.** The uid window tenants are mapped into. Unset ⇒ tenants run as the host user and are **not** confined. |
@@ -136,8 +142,9 @@ Per-org deploys are serialized (busy → 409) and rate-limited (→ 429).
 
 ## Tenant security boundary
 
-**The boundary is the OS process.** Each org runs in its own `serve-org`
-process, and on Linux that process is confined: its own uid (so another org's
+**The boundary is the OS process.** Each org runs in its own artifact binary
+process (the app shell's dual-mode `main` in tenant mode), and on Linux that
+process is confined: its own uid (so another org's
 `pb_data` is unreadable by the kernel's own rules), its own mount and PID
 namespaces, and its own cgroup. The build-artifact store (`<root>/builds/`) is
 bind-mounted read-only at its real absolute path, because the org's live
@@ -297,7 +304,7 @@ across an address-space boundary). It is still worth upstreaming on its own
 merits for single-process embedders — just note this repo no longer exercises it.
 
 Tenants also rely on one piece of **upstream** behaviour: `apis.Serve` uses
-`core.ServeEvent.Listener` verbatim when set, which is how `serve-org` serves on
-a unix socket without any fork change.
+`core.ServeEvent.Listener` verbatim when set, which is how the tenant binary
+serves on a unix socket without any fork change.
 
 When `BuildServeMux` lands upstream, drop the `replace` and require that release.

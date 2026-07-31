@@ -1,6 +1,9 @@
 # Design — org package agency
 
-**Status:** PROPOSED 2026-07-30. Nothing here is implemented.
+**Status:** IN PROGRESS. Proposed 2026-07-30; §7 step 1 (the `pkgbuild`
+extraction + `RecipeHash` with the cross-repo golden) landed 2026-07-30 —
+see `tinycld.org/core/pkgbuild` and `internal/recipeparity/` here. Steps 2–5
+are not started.
 **Motivates:** letting a tenant's own admin manage that org's packages —
 install, uninstall, upgrade, including third-party packages the operator has
 never heard of — while a new org can still be spun up from a default set in
@@ -302,6 +305,17 @@ idle sweep, and the readiness protocol are untouched.
 
 1. **`pkgbuild` extraction** in core (behind the existing `rebuildDeps`
    seam; World A keeps working unchanged). Recipe-hash golden test.
+   **DONE 2026-07-30** — `tinycld/core/server/pkgbuild` (validation, compat
+   solver + post-assemble verify, assemble behind `MemberSource`, pipeline as
+   a per-instance `Pipeline` struct, native export). Tarball integrity is
+   captured at fetch (`members.lock.json`); `RecipeHash`/`RecipeHashForBuild`
+   + `DetectToolchain` are the single key definition, enforced cross-repo by
+   the paired goldens (`pkgbuild/recipehash_test.go` ↔
+   `internal/recipeparity/recipehash_parity_test.go`). The single-tenant
+   verify step logs the hash as a breadcrumb. Note for step 2: a FromCurrent
+   member copied from a pre-lock active build has integrity "" and RecipeHash
+   refuses — the first fetched build repopulates it; the builder always
+   fetches, so this affects only World A's breadcrumb.
 2. **Builder worker** in multi-org: job queue, per-job confinement, CAS
    write, refcount/GC. Build the default set through it; verify a tenant
    boots from the artifact (dual-mode binary lands here).

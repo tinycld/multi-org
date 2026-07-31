@@ -24,7 +24,7 @@ import (
 	"tinycld.org/core/carddav"
 	"tinycld.org/core/quota"
 	"tinycld.org/core/webdav"
-	"tinycld.org/multi-org/internal/davconfig"
+	"tinycld.org/core/tenantcfg"
 	"tinycld.org/multi-org/internal/lockfile"
 	"tinycld.org/multi-org/internal/materialize"
 	"tinycld.org/multi-org/internal/orgerr"
@@ -960,7 +960,7 @@ func (m *OrgManager) writeCardDAVConfig(orgDir string, resolved []lockfile.Resol
 	}
 	path := filepath.Join(runtimeDir, "carddav.json")
 
-	body, err := json.Marshal(davconfig.Encode(sources))
+	body, err := json.Marshal(tenantcfg.Encode(sources))
 	if err != nil {
 		return "", err
 	}
@@ -999,7 +999,7 @@ func (m *OrgManager) writeQuotaConfig(orgDir string, rec OrgRecord, resolved []l
 
 	body, err := json.Marshal(quotaConfigFile{
 		StorageLimitBytes: rec.StorageLimitBytes,
-		Sources:           davconfig.EncodeQuota(sources),
+		Sources:           tenantcfg.EncodeQuota(sources),
 	})
 	if err != nil {
 		return "", err
@@ -1010,11 +1010,9 @@ func (m *OrgManager) writeQuotaConfig(orgDir string, rec OrgRecord, resolved []l
 	return path, nil
 }
 
-// quotaConfigFile is the wire shape of .runtime/quota.json.
-type quotaConfigFile struct {
-	StorageLimitBytes int64                   `json:"storageLimitBytes"`
-	Sources           []davconfig.QuotaSource `json:"sources"`
-}
+// quotaConfigFile is the wire shape of .runtime/quota.json — tenantcfg's, so
+// this writer and the tenant's loader can never disagree.
+type quotaConfigFile = tenantcfg.QuotaConfig
 
 // resolvedSlugs resolves the org's package slugs through the configured hook.
 // Nil hook ⇒ nil slugs (the host manages no package set; the child registers
@@ -1053,10 +1051,9 @@ func (m *OrgManager) writePackagesConfig(orgDir string, slugs []string, wired bo
 	return path, nil
 }
 
-// packagesConfigFile is the wire shape of .runtime/packages.json.
-type packagesConfigFile struct {
-	Slugs []string `json:"slugs"`
-}
+// packagesConfigFile is the wire shape of .runtime/packages.json —
+// tenantcfg's, so this writer and the tenant's loader can never disagree.
+type packagesConfigFile = tenantcfg.PackagesConfig
 
 // writeAppConfig materializes app-level runtime config where the tenant can
 // read it: the org's public URL (adopted as Settings().Meta.AppURL — the value
@@ -1092,26 +1089,9 @@ func (m *OrgManager) writeAppConfig(orgDir, slug string, rec OrgRecord) (string,
 	return path, nil
 }
 
-// appConfigFile is the wire shape of .runtime/app.json.
-type appConfigFile struct {
-	AppURL string `json:"appURL"`
-
-	// OrgName is the org's display name from the control-plane record, adopted
-	// as the tenant's Settings().Meta.AppName (the client reads it back via
-	// /api/org-info). Empty = leave the tenant's stored name alone.
-	OrgName string `json:"orgName"`
-
-	// BaseDomain is MT_BASE_DOMAIN, so the tenant can scope the cross-org
-	// switcher cookie to the parent domain (Domain=.<baseDomain>). Empty = the
-	// tenant sets no cross-org cookie.
-	BaseDomain string `json:"baseDomain"`
-
-	// TrustedProxyHeaders is what the tenant should set as
-	// Settings().TrustedProxy.Headers. The router guarantees the RIGHTMOST
-	// entry of the (last) header is the best-known client IP — which is
-	// PocketBase's default resolution order (UseLeftmostIP false).
-	TrustedProxyHeaders []string `json:"trustedProxyHeaders"`
-}
+// appConfigFile is the wire shape of .runtime/app.json — tenantcfg's, so
+// this writer and the tenant's loader can never disagree.
+type appConfigFile = tenantcfg.AppConfig
 
 // writeWebDAVConfig is writeCardDAVConfig's counterpart for WebDAV trees. Same
 // rationale for resolving host-side.
@@ -1133,7 +1113,7 @@ func (m *OrgManager) writeWebDAVConfig(orgDir string, resolved []lockfile.Resolv
 	}
 	path := filepath.Join(runtimeDir, "webdav.json")
 
-	body, err := json.Marshal(davconfig.EncodeWebDAV(sources))
+	body, err := json.Marshal(tenantcfg.EncodeWebDAV(sources))
 	if err != nil {
 		return "", err
 	}
@@ -1163,7 +1143,7 @@ func (m *OrgManager) writeCalDAVConfig(orgDir string, resolved []lockfile.Resolv
 	}
 	path := filepath.Join(runtimeDir, "caldav.json")
 
-	body, err := json.Marshal(davconfig.EncodeCalDAV(sources))
+	body, err := json.Marshal(tenantcfg.EncodeCalDAV(sources))
 	if err != nil {
 		return "", err
 	}

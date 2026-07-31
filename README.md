@@ -52,12 +52,12 @@ unix domain socket and never holds a tenant app object.
 | `internal/controlplane` | Control-plane PocketBase app: `orgs`/`packages`/`deployments` schema, `Provisioner` (create/deploy/suspend/resume/archive/publish), HTTP routes, and the DB-backed `OrgLookup`. |
 | `internal/orgmanager` | Lazy per-org process supervisor: materialize → spawn `serve-org` → readiness handshake → reverse proxy. Singleflight-collapsed spawns, crash supervision with backoff, drain-then-kill `Evict`, idle sweeper. |
 | `internal/orgerr` | The three sentinels (`ErrOrgNotFound` / `ErrOrgNotActive` / `ErrOrgUnavailable`) the front router classifies into 404 / 503. |
-| `internal/davconfig` | JSON wire formats for the runtime config the host hands each tenant: CardDAV / CalDAV / WebDAV source lists and quota sources. |
+| `internal/builder` | The trusted builder (DESIGN-org-package-agency §7 step 2): resolves a package set on the trusted side (tarball integrities + manifest facts → recipe hash), runs the shared `pkgbuild` pipeline in a confined re-exec'd job, and commits the runtime tree to the content-addressed cache at `<root>/builds/<recipe-hash>/` (idempotent commit, refcount-style `Sweep`). |
 | `internal/frontrouter` | Plain `http.Handler`: `Host` → subdomain → control-plane / org / apex org-finder page. |
 | `internal/webpage` | Branded HTML pages (cold-start/restart interstitials, unknown-org, apex org finder) + JSON error bodies for non-browser clients. |
 | `internal/server` | Single `http.Server` + wildcard autocert TLS + graceful shutdown. |
 | `cmd/serve-multi` | The router. Wires it all together. |
-| `cmd/serve-org` | The tenant. One org on a unix socket: `coreserver.RegisterTenant` (core guards, sandboxed jsvm, CardDAV/CalDAV/WebDAV, quota) plus the pinned feature-Go menu (`internal/tenantpkgs`), gated by the org's resolved package set. |
+| `cmd/serve-org` | The tenant. One org on a unix socket: core's `tenantmain` transport (config loading, socket, readiness handshake, confinement — shared with the dual-mode per-org build binary) composing `coreserver.RegisterTenant`, plus this binary's pinned feature-Go menu (`internal/tenantpkgs`), gated by the org's resolved package set. |
 
 ## Running
 

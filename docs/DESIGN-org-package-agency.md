@@ -2,8 +2,9 @@
 
 **Status:** IN PROGRESS. Proposed 2026-07-30; §7 step 1 (the `pkgbuild`
 extraction + `RecipeHash` with the cross-repo golden) landed 2026-07-30 —
-see `tinycld.org/core/pkgbuild` and `internal/recipeparity/` here. Steps 2–5
-are not started.
+see `tinycld.org/core/pkgbuild` and `internal/recipeparity/` here. Step 2
+(builder worker + dual-mode binary) landed 2026-07-31 — see `internal/builder`
+here and `tinycld.org/core/tenantmain`. Steps 3–5 are not started.
 **Motivates:** letting a tenant's own admin manage that org's packages —
 install, uninstall, upgrade, including third-party packages the operator has
 never heard of — while a new org can still be spun up from a default set in
@@ -319,6 +320,33 @@ idle sweep, and the readiness protocol are untouched.
 2. **Builder worker** in multi-org: job queue, per-job confinement, CAS
    write, refcount/GC. Build the default set through it; verify a tenant
    boots from the artifact (dual-mode binary lands here).
+   **DONE 2026-07-31** — `internal/builder`: trusted-side resolve (tarball
+   integrities hashed by the router process, manifest facts via the rlimited
+   manifesteval subprocess, recipe hash computed before the job — the package
+   doc records why a confined job must not be able to relabel its artifact),
+   spec-set singleflight + concurrency-capped queue, per-job confinement as a
+   re-exec'd `builder-job` subcommand of serve-multi (mount/PID/single-uid
+   user namespaces + cgroup, mirroring the tenant spawner; `TestConfinement*`
+   in CI), idempotent commit into `<root>/builds/<recipe-hash>/` (binary,
+   dereferenced pb_hooks/pb_migrations, pb_public incl. native OTA bundles,
+   `recipe.json` provenance), and `Sweep` (grace-from-BuiltAt covers the
+   commit→repoint window; liveness policy stays with the caller).
+   **Dual-mode binary:** serve-org's transport glue moved to core
+   (`tenantmain`, `tenantcfg` — the .runtime ABI, now one definition for the
+   router's writers and the tenant's loaders — and `orgcookie`); the app
+   shell's main dispatches to tenant mode on `--org-dir` with the generated
+   `registerTenantPackageExtensions` (per-package `RegisterTenant`; manifest
+   `server.mailListeners` injects the router-managed mail sockets), so an
+   artifact binary is a drop-in serve-org replacement under the unchanged
+   flags/ready-fd contract. Verified by the gated e2e
+   (`internal/builder/e2e_test.go`, `RUN_BUILDER_E2E=1`): the full default
+   set (base + mail/contacts/calendar/drive/calc/text) builds through the
+   builder and a tenant boots from the artifact, applies the full migration
+   set in its sandboxed jsvm (the one `$os` use in core's system_settings
+   migration now degrades to "no env to seed" when sandboxed), and serves
+   `/api/health` over the socket. Router wiring — serve-multi constructing
+   the Builder, the manager spawning from a build reference, `CreateOrg` →
+   default artifact — is step 3.
 3. **Router deploy protocol**: control socket, snapshot/revert, per-org
    serialization, `deploy-result.json`. `CreateOrg` from
    `default_lockfile` → default artifact.

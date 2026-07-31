@@ -19,6 +19,7 @@ import (
 	"github.com/pocketbase/pocketbase/core"
 
 	"tinycld.org/core/mailproto"
+	"tinycld.org/multi-org/internal/builder"
 	"tinycld.org/multi-org/internal/controlplane"
 	"tinycld.org/multi-org/internal/mailrouter"
 	"tinycld.org/multi-org/internal/manifesteval"
@@ -34,6 +35,14 @@ func main() {
 	// plane to run 5ms of JS.
 	if len(os.Args) > 1 && os.Args[1] == manifesteval.Subcommand {
 		os.Exit(manifesteval.ServeStdio())
+	}
+
+	// The hidden builder-job subcommand: this same binary re-exec'd as one
+	// confined build job (see internal/builder). The parent applied the
+	// namespaces/uid/cgroup before exec; this child just runs the real
+	// pkgbuild pipeline and streams progress over stdout.
+	if len(os.Args) > 1 && os.Args[1] == builder.Subcommand {
+		os.Exit(builder.ServeJobStdio(builder.InProcessRunner{}.Run))
 	}
 
 	// run() owns every deferred cleanup, including reaping tenant processes.

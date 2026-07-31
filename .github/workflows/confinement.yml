@@ -64,4 +64,4 @@ jobs:
         run: |
           sudo env "PATH=$PATH" \
             "GOMODCACHE=$(go env GOMODCACHE)" "GOFLAGS=-mod=mod" \
-            go test ./internal/orgmanager/ -run TestConfinement -v -count=1
+            go test ./internal/orgmanager/ ./internal/builder/ -run TestConfinement -v -count=1

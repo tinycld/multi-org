@@ -1,0 +1,305 @@
+package builder
+
+import (
+	"bufio"
+	"context"
+	"encoding/json"
+	"fmt"
+	"io"
+	"log/slog"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"syscall"
+	"time"
+
+	"tinycld.org/core/pkgbuild"
+)
+
+// Subcommand is the hidden argv[1] serve-multi dispatches to ServeJobStdio —
+// the same re-exec pattern as manifesteval's subcommand: the child must not
+// boot a control plane just to run a build.
+const Subcommand = "builder-job"
+
+// DefaultJobTimeout bounds one whole build job. Novel recipes legitimately
+// take minutes (pnpm install + Metro export + go build); a job past this is
+// wedged, and the org it was for keeps serving its old build regardless.
+const DefaultJobTimeout = 45 * time.Minute
+
+// jobLine is the child → parent stdout protocol: one JSON object per line.
+// Progress and log lines stream into the parent's ProgressSink; exactly one
+// result line ends the run. Non-JSON stdout lines are tolerated as logs — a
+// build executes arbitrary package tooling, and a stray print must not break
+// the protocol.
+type jobLine struct {
+	Type    string `json:"type"` // "progress" | "log" | "result"
+	Step    string `json:"step,omitempty"`
+	Percent int    `json:"percent,omitempty"`
+	Message string `json:"message,omitempty"`
+	OK      bool   `json:"ok,omitempty"`
+	Error   string `json:"error,omitempty"`
+}
+
+// SubprocessRunner executes each job in a re-exec'd child process (argv is
+// typically {selfExe, Subcommand}), confined on Linux when the host is
+// configured for it (see JobConfinement). This is the production Runner: the
+// build runs package-author code by design — pnpm lifecycle scripts, Metro,
+// member Go compilation — so it gets the same treatment as a tenant: its own
+// uid, mount and PID namespaces, and a cgroup, and it never runs in the
+// router's own process.
+type SubprocessRunner struct {
+	// Argv launches the child; element 0 is the binary. Required.
+	Argv []string
+
+	// Confinement configures the Linux job jail; the zero value (and any
+	// non-Linux host) runs the child unconfined, mirroring the tenant
+	// spawner's degraded mode.
+	Confinement JobConfinement
+
+	// Timeout bounds one job; zero means DefaultJobTimeout.
+	Timeout time.Duration
+
+	// Log receives confinement warnings; nil means slog.Default().
+	Log *slog.Logger
+
+	// extraEnv rides on top of the scrubbed child environment. Test seam only
+	// (the helper-process pattern dispatches on an env var); production code
+	// never sets it — the scrubbed env IS the contract.
+	extraEnv []string
+}
+
+// JobConfinement mirrors orgmanager.LinuxConfinement for build jobs, with one
+// deliberate difference: a single dedicated uid rather than a per-entity
+// window. Jobs are serialized by the builder's concurrency cap and each runs
+// in a fresh job dir inside fresh namespaces; what the uid boundary protects
+// is every TENANT (and the router) from build-executed code, not one build
+// from a later one — successive builds already share the pnpm store and npm
+// cache as a deliberate reuse choice, exactly like World A's baked store.
+type JobConfinement struct {
+	// UID is the host uid build jobs run as (0 disables uid separation).
+	// Must be outside the tenant uid window.
+	UID int
+
+	// CgroupRoot is the cgroup v2 directory to place jobs under; empty
+	// disables cgroup placement.
+	CgroupRoot string
+
+	// MemoryMax / PidsMax / CPUMax are cgroup v2 limit strings written into
+	// the job's cgroup before the child starts work. Empty writes nothing.
+	MemoryMax string
+	PidsMax   string
+	CPUMax    string
+}
+
+// JobConfinementFromEnv reads the builder confinement settings:
+// MT_BUILDER_UID, MT_BUILDER_CGROUP_ROOT, MT_BUILDER_MEMORY_MAX,
+// MT_BUILDER_PIDS_MAX, MT_BUILDER_CPU_MAX.
+func JobConfinementFromEnv() JobConfinement {
+	uid := 0
+	if v := os.Getenv("MT_BUILDER_UID"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			uid = n
+		}
+	}
+	return JobConfinement{
+		UID:        uid,
+		CgroupRoot: os.Getenv("MT_BUILDER_CGROUP_ROOT"),
+		MemoryMax:  os.Getenv("MT_BUILDER_MEMORY_MAX"),
+		PidsMax:    os.Getenv("MT_BUILDER_PIDS_MAX"),
+		CPUMax:     os.Getenv("MT_BUILDER_CPU_MAX"),
+	}
+}
+
+func (r SubprocessRunner) log() *slog.Logger {
+	if r.Log != nil {
+		return r.Log
+	}
+	return slog.Default()
+}
+
+func (r SubprocessRunner) Run(ctx context.Context, spec JobSpec, sink pkgbuild.ProgressSink) error {
+	if len(r.Argv) == 0 {
+		return fmt.Errorf("builder: SubprocessRunner has no argv")
+	}
+	sink = sinkOrNop(sink)
+	timeout := r.Timeout
+	if timeout == 0 {
+		timeout = DefaultJobTimeout
+	}
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	input, err := json.Marshal(spec)
+	if err != nil {
+		return err
+	}
+
+	jobDir := filepath.Dir(spec.BuildDir)
+	if err := os.MkdirAll(jobDir, 0o755); err != nil {
+		return err
+	}
+
+	cmd := exec.Command(r.Argv[0], r.Argv[1:]...)
+	cmd.Stdin = strings.NewReader(string(input))
+	// The toolchains (go, node, pnpm, npm) live wherever the operator put
+	// them, so unlike a tenant's fixed /usr/bin:/bin the job inherits the
+	// ROUTER's PATH — operator-controlled either way. Everything else is
+	// scrubbed; HOME doubles as npm's cache root so per-job state dies with
+	// the job dir.
+	cmd.Env = append([]string{
+		"HOME=" + jobDir,
+		"TMPDIR=" + filepath.Join(jobDir, "tmp"),
+		"PATH=" + os.Getenv("PATH"),
+	}, r.extraEnv...)
+	if err := os.MkdirAll(filepath.Join(jobDir, "tmp"), 0o755); err != nil {
+		return err
+	}
+	cmd.Dir = jobDir
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	var stderr strings.Builder
+	cmd.Stderr = &stderr
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return err
+	}
+
+	confined, err := confineJobCmd(cmd, jobDir, spec, r.Confinement, r.log())
+	if err != nil {
+		return err
+	}
+
+	if err := cmd.Start(); err != nil {
+		return fmt.Errorf("start build job: %w", err)
+	}
+	if confined && r.Confinement.CgroupRoot != "" {
+		if err := placeJobInCgroup(r.Confinement, spec.BuildID, cmd.Process.Pid); err != nil {
+			r.log().Warn("could not place build job in cgroup — it runs with NO resource limits",
+				"buildId", spec.BuildID, "error", err)
+		}
+	}
+	// The context backstop kills the whole process GROUP: the job's real work
+	// happens in grandchildren (pnpm, node, go) that a plain Process.Kill
+	// would orphan mid-write.
+	killed := make(chan struct{})
+	go func() {
+		select {
+		case <-ctx.Done():
+			_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+		case <-killed:
+		}
+	}()
+	defer close(killed)
+
+	result, readErr := streamJobLines(stdout, sink)
+	waitErr := cmd.Wait()
+
+	switch {
+	case ctx.Err() != nil:
+		return fmt.Errorf("build job timed out or was canceled: %w", ctx.Err())
+	case result != nil && !result.OK:
+		// The child reported its own failure before exiting nonzero — its
+		// structured reason beats the bare exit status.
+		return fmt.Errorf("build failed: %s", result.Error)
+	case waitErr != nil:
+		msg := strings.TrimSpace(stderr.String())
+		if msg == "" {
+			msg = waitErr.Error()
+		}
+		return fmt.Errorf("build job died: %s", firstLines(msg, 8))
+	case readErr != nil:
+		return fmt.Errorf("read build job output: %w", readErr)
+	case result == nil:
+		return fmt.Errorf("build job exited without reporting a result")
+	}
+	return nil
+}
+
+// streamJobLines forwards the child's progress/log lines into sink and
+// returns the final result line, if any.
+func streamJobLines(r io.Reader, sink pkgbuild.ProgressSink) (*jobLine, error) {
+	var result *jobLine
+	sc := bufio.NewScanner(r)
+	sc.Buffer(make([]byte, 64*1024), 1024*1024)
+	for sc.Scan() {
+		raw := sc.Text()
+		var line jobLine
+		if err := json.Unmarshal([]byte(raw), &line); err != nil {
+			sink.Logf("%s", raw)
+			continue
+		}
+		switch line.Type {
+		case "progress":
+			sink.Progress(line.Step, line.Percent, line.Message)
+		case "log":
+			sink.Logf("%s", line.Message)
+		case "result":
+			l := line
+			result = &l
+		default:
+			sink.Logf("%s", raw)
+		}
+	}
+	return result, sc.Err()
+}
+
+// ServeJobStdio is the child side: read one JobSpec from stdin, run the job,
+// stream progress as JSON lines on stdout, and end with a result line. run is
+// the job body — serve-multi passes InProcessRunner{}.Run (the real
+// pipeline); tests pass fakes. Called before any other init, like
+// manifesteval.ServeStdio.
+func ServeJobStdio(run func(ctx context.Context, spec JobSpec, sink pkgbuild.ProgressSink) error) int {
+	body, err := io.ReadAll(io.LimitReader(os.Stdin, 8<<20))
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "read job spec: %v\n", err)
+		return 1
+	}
+	var spec JobSpec
+	if err := json.Unmarshal(body, &spec); err != nil {
+		fmt.Fprintf(os.Stderr, "decode job spec: %v\n", err)
+		return 1
+	}
+	out := json.NewEncoder(os.Stdout)
+	sink := stdioSink{enc: out}
+	if err := run(context.Background(), spec, sink); err != nil {
+		_ = out.Encode(jobLine{Type: "result", OK: false, Error: err.Error()})
+		return 1
+	}
+	if err := out.Encode(jobLine{Type: "result", OK: true}); err != nil {
+		fmt.Fprintf(os.Stderr, "write result: %v\n", err)
+		return 1
+	}
+	return 0
+}
+
+// stdioSink writes ProgressSink events as protocol lines. json.Encoder is not
+// concurrency-safe, but pkgbuild delivers sink events from one goroutine at a
+// time (RunCmdStreaming's single reader), matching its own throttle's
+// assumption.
+type stdioSink struct {
+	enc *json.Encoder
+}
+
+func (s stdioSink) Progress(step string, percent int, message string) {
+	_ = s.enc.Encode(jobLine{Type: "progress", Step: step, Percent: percent, Message: message})
+}
+
+func (s stdioSink) Logf(format string, args ...any) {
+	_ = s.enc.Encode(jobLine{Type: "log", Message: fmt.Sprintf(format, args...)})
+}
+
+func sinkOrNop(sink pkgbuild.ProgressSink) pkgbuild.ProgressSink {
+	if sink == nil {
+		return pkgbuild.NopSink()
+	}
+	return sink
+}
+
+func firstLines(s string, n int) string {
+	lines := strings.SplitN(s, "\n", n+1)
+	if len(lines) > n {
+		return strings.Join(lines[:n], "\n") + " …"
+	}
+	return s
+}

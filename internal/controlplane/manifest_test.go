@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	"tinycld.org/multi-org/internal/davconfig"
+	"tinycld.org/core/tenantcfg"
 	"tinycld.org/multi-org/internal/lockfile"
 	"tinycld.org/multi-org/internal/manifesteval"
 )
@@ -418,7 +418,7 @@ func TestWebDAVSources_RoundTripThroughWire(t *testing.T) {
 	// compares zero == zero below and the drop is invisible.
 	assertFullyPopulated(t, sources[0])
 
-	decoded := davconfig.DecodeWebDAV(davconfig.EncodeWebDAV(sources))
+	decoded := tenantcfg.DecodeWebDAV(tenantcfg.EncodeWebDAV(sources))
 	if len(decoded) != 1 {
 		t.Fatalf("round trip produced %d sources, want 1", len(decoded))
 	}
@@ -459,7 +459,7 @@ func TestQuotaSources_ReadsManifestJSON(t *testing.T) {
 		assertFullyPopulated(t, s)
 	}
 
-	decoded := davconfig.DecodeQuota(davconfig.EncodeQuota(sources))
+	decoded := tenantcfg.DecodeQuota(tenantcfg.EncodeQuota(sources))
 	if !reflect.DeepEqual(sources, decoded) {
 		t.Fatalf("wire round trip changed the sources:\n before %+v\n after  %+v", sources, decoded)
 	}
@@ -483,7 +483,7 @@ func TestQuotaSources_PreservesUnownedSource(t *testing.T) {
 	if sources[0].OwnerField != "" {
 		t.Fatalf("OwnerField = %q, want empty — shared data has nobody to charge", sources[0].OwnerField)
 	}
-	if davconfig.DecodeQuota(davconfig.EncodeQuota(sources))[0].OwnerField != "" {
+	if tenantcfg.DecodeQuota(tenantcfg.EncodeQuota(sources))[0].OwnerField != "" {
 		t.Fatal("the wire round trip must preserve an absent owner")
 	}
 }
@@ -720,7 +720,7 @@ func TestCalDAVSources_RoundTripThroughWire(t *testing.T) {
 	// func and deliberately not carried; the walker skips func fields.)
 	assertFullyPopulated(t, sources[0])
 
-	decoded := davconfig.DecodeCalDAV(davconfig.EncodeCalDAV(sources))
+	decoded := tenantcfg.DecodeCalDAV(tenantcfg.EncodeCalDAV(sources))
 	if len(decoded) != 1 {
 		t.Fatalf("round trip produced %d sources, want 1", len(decoded))
 	}
@@ -738,22 +738,22 @@ func TestCalDAVSources_SurvivesJSONFile(t *testing.T) {
 		t.Fatalf("CalDAVSources: %v", err)
 	}
 
-	body, err := json.Marshal(davconfig.EncodeCalDAV(sources))
+	body, err := json.Marshal(tenantcfg.EncodeCalDAV(sources))
 	if err != nil {
 		t.Fatalf("marshal: %v", err)
 	}
-	var wire []davconfig.CalDAVSource
+	var wire []tenantcfg.CalDAVSource
 	if err := json.Unmarshal(body, &wire); err != nil {
 		t.Fatalf("unmarshal: %v", err)
 	}
 	assertFullyPopulated(t, sources[0])
-	decoded := davconfig.DecodeCalDAV(wire)
+	decoded := tenantcfg.DecodeCalDAV(wire)
 	if !reflect.DeepEqual(sources[0], decoded[0]) {
 		t.Fatalf("JSON round trip changed the Source:\n before %+v\n after  %+v", sources[0], decoded[0])
 	}
 }
 
-// The CardDAV mirror (davconfig.Source) had no round-trip coverage at all —
+// The CardDAV mirror (tenantcfg.Source) had no round-trip coverage at all —
 // the same silent-drop class the WebDAV and CalDAV round-trips guard.
 func TestCardDAVSources_RoundTripThroughWire(t *testing.T) {
 	dir := writeManifestPkg(t, contactsManifestTS)
@@ -767,7 +767,7 @@ func TestCardDAVSources_RoundTripThroughWire(t *testing.T) {
 	}
 	assertFullyPopulated(t, sources[0])
 
-	decoded := davconfig.Decode(davconfig.Encode(sources))
+	decoded := tenantcfg.Decode(tenantcfg.Encode(sources))
 	if len(decoded) != 1 {
 		t.Fatalf("round trip produced %d sources, want 1", len(decoded))
 	}

@@ -17,7 +17,7 @@ import (
 	"net/http"
 	"strings"
 
-	"tinycld.org/multi-org/internal/orgcookie"
+	"tinycld.org/core/orgcookie"
 )
 
 // WantsHTML reports whether the request reads as a browser navigation: only

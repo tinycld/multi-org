@@ -481,6 +481,26 @@ idle sweep, and the readiness protocol are untouched.
    covering the store-path provisioning routes over real HTTP.
 5. **Deletions** (§5) + hostile-child audit + kernel quotas + docs
    (append-only migration rule).
+   **IN PROGRESS 2026-07-31.** Landed: the legacy store/materialize
+   provisioning path is deleted — every org is artifact-backed
+   (`orgs.recipe_hash` required; `CreateOrg`/deploy demand a base-bearing
+   lockfile + an enabled builder). `internal/store`, `lockfile.Resolve`,
+   `materialize.Materialize`, `Provisioner.Deploy`/`PublishPackage`,
+   `POST /api/store/packages`, `transpileForStore` + its paired esbuild
+   golden (the fork keeps the sole copy), publish-time manifest eval
+   (`emitManifestJSON`), and `CheckPeerVersions` are gone; the peer gate is
+   authoritative inside `builder.Build`. The `packages` collection is
+   dropped by an appended control-plane migration (`1900000003`) — the
+   append-only rule, now recorded in the workspace CLAUDE.md. The
+   hostile-child audit ran (`docs/AUDIT-hostile-child.md`) and its four
+   CONFIRMED criticals are fixed with regression tests: C1 (root following
+   tenant symlinks into `.runtime` → `tenantcfg.WriteRuntimeFile` beneath-
+   write), C2/H2 (`/v1/resolve` git-spec RCE + SSRF → registry-only gate),
+   C3 (router subprocesses inheriting secret env → `serve-multi` scrub),
+   C4 (build jobs overwriting sibling artifacts → `cas.Commit` chown-root).
+   Remaining: `cmd/serve-org` + `internal/tenantpkgs` deletion (fold into
+   the dual-mode binary), `.runtime/packages.json` retirement, kernel
+   per-uid FS quotas, and the audit's H/M hardening items.
 
 Each step lands green on its own; the pinned menu and materialize path keep
 working until step 5 removes them.

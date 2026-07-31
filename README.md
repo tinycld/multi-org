@@ -139,10 +139,13 @@ Per-org deploys are serialized (busy → 409) and rate-limited (→ 429).
 **The boundary is the OS process.** Each org runs in its own `serve-org`
 process, and on Linux that process is confined: its own uid (so another org's
 `pb_data` is unreadable by the kernel's own rules), its own mount and PID
-namespaces, and its own cgroup. The package store is bind-mounted read-only at
-its real absolute path, because `materialize` fills `pb_hooks`/`pb_migrations`
-with absolute symlinks into it — a naive `chroot` to the org directory would
-break every one of them.
+namespaces, and its own cgroup. The build-artifact store (`<root>/builds/`) is
+bind-mounted read-only at its real absolute path, because the org's live
+`pb_hooks`/`pb_migrations`/`pb_public` are absolute symlinks into its committed
+artifact — a naive `chroot` to the org directory would break every one of
+them. Committed artifacts are owned by root (reclaimed from the build-job uid
+at commit time), so a build job running package-author code cannot tamper with
+another org's already-committed binary.
 
 This closes the class of exploit that in-process allowlisting provably could
 not. The motivating case: `$app.db()` hands tenant JS a raw SQL surface, so a

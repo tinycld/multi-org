@@ -195,6 +195,17 @@ func run() error {
 	}
 	defer mailShutdown()
 
+	// Every secret-bearing env var has now been consumed (superuser bootstrap,
+	// TLS config, mail TLS). Scrub them from the process environment BEFORE any
+	// tenant-reachable subprocess can run: the builder's inline `npm pack` /
+	// `npm view` (control socket /v1/resolve, /v1/versions) and the tenant
+	// spawner all run during serving, and pkgbuild.RunCmd inherits os.Environ()
+	// for the legitimate single-tenant case. Unsetting here means a subprocess
+	// the router shells out to cannot read MT_SUPERUSER_PASSWORD or a TLS key
+	// path even if it tried — the allowlist-from-nothing stance the tenant
+	// spawner already takes, applied to the router process itself.
+	scrubSecretEnv()
+
 	controlMux, err := apis.BuildServeMux(cp.App, apis.ServeConfig{})
 	if err != nil {
 		return fmt.Errorf("control-plane mux: %w", err)
@@ -322,6 +333,21 @@ func sweepBuilds(ctx context.Context, bld *builder.Builder, dep *controlplane.De
 		if len(removed) > 0 {
 			log.Printf("build GC: removed %d unreferenced artifact(s)", len(removed))
 		}
+	}
+}
+
+// scrubSecretEnv unsets the router's secret-bearing environment variables once
+// every in-process consumer has read them, so no subprocess the router later
+// spawns (npm/git tooling, the tenant binary) can inherit them. Non-secret
+// MT_* vars the spawner/builder read lazily (uid window, cgroup root, resource
+// limits) are deliberately left in place.
+func scrubSecretEnv() {
+	for _, k := range []string{
+		"MT_SUPERUSER_EMAIL", "MT_SUPERUSER_PASSWORD",
+		"MT_TLS_CERT", "MT_TLS_KEY",
+		"MT_MAIL_TLS_CERT", "MT_MAIL_TLS_KEY",
+	} {
+		_ = os.Unsetenv(k)
 	}
 }
 

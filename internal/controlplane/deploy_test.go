@@ -449,6 +449,52 @@ func TestControlHandler_MetadataSurface(t *testing.T) {
 	}
 }
 
+// The metadata surface runs its subprocess (`npm pack`, `npm view`,
+// `git ls-remote`) inline in the ROUTER process, outside every confinement.
+// A git/URL spec passes ValidatePackageSpec but would make `npm pack` run the
+// package's prepare scripts as root (RCE) and `git ls-remote` hit an arbitrary
+// URL with the router's creds (SSRF). Both /v1/resolve and /v1/versions must
+// refuse anything that is not a registry spec.
+func TestControlHandler_MetadataSurfaceRefusesNonRegistrySpecs(t *testing.T) {
+	h := newDeployHarness(t)
+	d := newDeployer(h.cp.App, h.root, &fakeArtifactBuilder{hash: hashNew},
+		func(string) {}, nil, quietTestLogger())
+	handler := d.Handler("acme")
+
+	post := func(path, body string) int {
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, path, strings.NewReader(body)))
+		return rec.Code
+	}
+
+	// Each of these is accepted by ValidatePackageSpec (git/URL forms npm pack
+	// understands) but must be refused before the subprocess runs.
+	for _, spec := range []string{
+		"github:evil/pkg",
+		"git+https://internal-host/repo.git",
+		"git+ssh://git@internal/repo",
+		"https://169.254.169.254/latest/meta-data",
+		"git+file:///root/secret",
+	} {
+		if code := post("/v1/resolve", `{"spec":`+jsonString(spec)+`}`); code != http.StatusBadRequest {
+			t.Errorf("/v1/resolve %q = %d, want 400 (non-registry spec must be refused before the subprocess)", spec, code)
+		}
+		if code := post("/v1/versions", `{"spec":`+jsonString(spec)+`}`); code != http.StatusBadRequest {
+			t.Errorf("/v1/versions %q = %d, want 400", spec, code)
+		}
+	}
+
+	// A registry spec still resolves.
+	if code := post("/v1/resolve", `{"spec":"@tinycld/todo@1.0.0"}`); code != http.StatusOK {
+		t.Errorf("/v1/resolve registry spec = %d, want 200", code)
+	}
+}
+
+func jsonString(s string) string {
+	b, _ := json.Marshal(s)
+	return string(b)
+}
+
 func TestLiveRecipeHashes_CoversRowsAndInflight(t *testing.T) {
 	h := newDeployHarness(t)
 	org := h.org(t)

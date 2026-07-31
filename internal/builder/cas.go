@@ -130,6 +130,16 @@ func (s *Store) Commit(recipeHash, srcDir string) (string, error) {
 	if _, err := os.Stat(filepath.Join(srcDir, RecipeFile)); err != nil {
 		return "", fmt.Errorf("commit %s: staged tree has no %s: %w", recipeHash, RecipeFile, err)
 	}
+	// The staged tree was produced inside the confined build job, so it is
+	// owned by the JOB uid with owner-write. Committed artifacts are shared by
+	// hash and booted by many orgs, so a build job that could still write into
+	// builds/ (it runs the recipe's own lifecycle scripts) could overwrite a
+	// SIBLING org's already-committed binary. Reclaim the tree to root before
+	// it becomes visible so a committed artifact is immutable to every job
+	// uid — the trust boundary the package doc's argument depends on.
+	if err := chownTreeToRoot(srcDir); err != nil {
+		return "", fmt.Errorf("commit %s: %w", recipeHash, err)
+	}
 	// Artifacts are served to (and bind-mounted read-only into) tenant
 	// processes running as other uids: open the tree for traversal/read before
 	// it becomes visible, preserving exec bits (the server binary).
@@ -193,6 +203,24 @@ func (s *Store) Remove(recipeHash string) error {
 		return err
 	}
 	return os.RemoveAll(dir)
+}
+
+// chownTreeToRoot reclaims a staged artifact tree from the build-job uid to
+// root (uid/gid 0). Only root can chown to root, and job-uid confinement only
+// exists when the builder runs as root, so off that path (a non-root dev host,
+// where jobs are unconfined and already run as the builder's own uid) this is
+// a no-op — there is no distinct job uid to reclaim from. Symlinks are
+// Lchown'd, never followed.
+func chownTreeToRoot(root string) error {
+	if os.Geteuid() != 0 {
+		return nil
+	}
+	return filepath.WalkDir(root, func(path string, _ fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		return os.Lchown(path, 0, 0)
+	})
 }
 
 // chmodTreeWorldReadable opens dirs to 0755 and files to 0644 (0755 when any

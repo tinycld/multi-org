@@ -783,6 +783,13 @@ func secureRuntimeDir(dir string, mode os.FileMode) error {
 	return nil
 }
 
+// writeRuntimeFile writes a host-authored config into <orgDir>/.runtime,
+// hardened against a tenant-planted symlink (tenantcfg owns the beneath-write —
+// one ABI definition shared with the deployer).
+func writeRuntimeFile(orgDir, name string, body []byte) (string, error) {
+	return tenantcfg.WriteRuntimeFile(orgDir, name, body, 0o644)
+}
+
 // fallbackSocketParent picks the directory holding the per-org socket dirs when
 // the primary path would overrun sun_path.
 //
@@ -1034,20 +1041,11 @@ func (m *OrgManager) writeCardDAVConfig(orgDir string, resolved []lockfile.Resol
 		return "", nil
 	}
 
-	runtimeDir := filepath.Join(orgDir, ".runtime")
-	if err := os.MkdirAll(runtimeDir, 0o755); err != nil {
-		return "", err
-	}
-	path := filepath.Join(runtimeDir, "carddav.json")
-
 	body, err := json.Marshal(tenantcfg.Encode(sources))
 	if err != nil {
 		return "", err
 	}
-	if err := os.WriteFile(path, body, 0o644); err != nil {
-		return "", err
-	}
-	return path, nil
+	return writeRuntimeFile(orgDir, "carddav.json", body)
 }
 
 // writeQuotaConfig materializes the org's storage ceiling where the tenant can
@@ -1071,12 +1069,6 @@ func (m *OrgManager) writeQuotaConfig(orgDir string, rec OrgRecord, resolved []l
 		}
 	}
 
-	runtimeDir := filepath.Join(orgDir, ".runtime")
-	if err := os.MkdirAll(runtimeDir, 0o755); err != nil {
-		return "", err
-	}
-	path := filepath.Join(runtimeDir, "quota.json")
-
 	body, err := json.Marshal(quotaConfigFile{
 		StorageLimitBytes: rec.StorageLimitBytes,
 		Sources:           tenantcfg.EncodeQuota(sources),
@@ -1084,10 +1076,7 @@ func (m *OrgManager) writeQuotaConfig(orgDir string, rec OrgRecord, resolved []l
 	if err != nil {
 		return "", err
 	}
-	if err := os.WriteFile(path, body, 0o644); err != nil {
-		return "", err
-	}
-	return path, nil
+	return writeRuntimeFile(orgDir, "quota.json", body)
 }
 
 // quotaConfigFile is the wire shape of .runtime/quota.json — tenantcfg's, so
@@ -1115,20 +1104,11 @@ func (m *OrgManager) writePackagesConfig(orgDir string, slugs []string, wired bo
 		return "", nil
 	}
 
-	runtimeDir := filepath.Join(orgDir, ".runtime")
-	if err := os.MkdirAll(runtimeDir, 0o755); err != nil {
-		return "", err
-	}
-	path := filepath.Join(runtimeDir, "packages.json")
-
 	body, err := json.Marshal(packagesConfigFile{Slugs: slugs})
 	if err != nil {
 		return "", err
 	}
-	if err := os.WriteFile(path, body, 0o644); err != nil {
-		return "", err
-	}
-	return path, nil
+	return writeRuntimeFile(orgDir, "packages.json", body)
 }
 
 // packagesConfigFile is the wire shape of .runtime/packages.json —
@@ -1145,11 +1125,6 @@ type packagesConfigFile = tenantcfg.PackagesConfig
 // tenant is fronted by the router, so the trust always applies even when no
 // OrgURL hook is wired.
 func (m *OrgManager) writeAppConfig(orgDir, slug string, rec OrgRecord) (string, error) {
-	runtimeDir := filepath.Join(orgDir, ".runtime")
-	if err := os.MkdirAll(runtimeDir, 0o755); err != nil {
-		return "", err
-	}
-	path := filepath.Join(runtimeDir, "app.json")
 
 	cfg := appConfigFile{
 		TrustedProxyHeaders: []string{"X-Forwarded-For"},
@@ -1163,10 +1138,7 @@ func (m *OrgManager) writeAppConfig(orgDir, slug string, rec OrgRecord) (string,
 	if err != nil {
 		return "", err
 	}
-	if err := os.WriteFile(path, body, 0o644); err != nil {
-		return "", err
-	}
-	return path, nil
+	return writeRuntimeFile(orgDir, "app.json", body)
 }
 
 // appConfigFile is the wire shape of .runtime/app.json — tenantcfg's, so
@@ -1187,20 +1159,11 @@ func (m *OrgManager) writeWebDAVConfig(orgDir string, resolved []lockfile.Resolv
 		return "", nil
 	}
 
-	runtimeDir := filepath.Join(orgDir, ".runtime")
-	if err := os.MkdirAll(runtimeDir, 0o755); err != nil {
-		return "", err
-	}
-	path := filepath.Join(runtimeDir, "webdav.json")
-
 	body, err := json.Marshal(tenantcfg.EncodeWebDAV(sources))
 	if err != nil {
 		return "", err
 	}
-	if err := os.WriteFile(path, body, 0o644); err != nil {
-		return "", err
-	}
-	return path, nil
+	return writeRuntimeFile(orgDir, "webdav.json", body)
 }
 
 // writeCalDAVConfig is writeCardDAVConfig's counterpart for calendar trees. Same
@@ -1217,20 +1180,11 @@ func (m *OrgManager) writeCalDAVConfig(orgDir string, resolved []lockfile.Resolv
 		return "", nil
 	}
 
-	runtimeDir := filepath.Join(orgDir, ".runtime")
-	if err := os.MkdirAll(runtimeDir, 0o755); err != nil {
-		return "", err
-	}
-	path := filepath.Join(runtimeDir, "caldav.json")
-
 	body, err := json.Marshal(tenantcfg.EncodeCalDAV(sources))
 	if err != nil {
 		return "", err
 	}
-	if err := os.WriteFile(path, body, 0o644); err != nil {
-		return "", err
-	}
-	return path, nil
+	return writeRuntimeFile(orgDir, "caldav.json", body)
 }
 
 // Evict removes an org's instance and tears down its process. The next Get

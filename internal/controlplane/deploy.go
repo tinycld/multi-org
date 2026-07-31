@@ -383,16 +383,14 @@ func (d *Deployer) setDeploymentStatus(dep *core.Record, status string, cause er
 // writeDeployResult durably records the outcome where the (re)spawned tenant
 // reads it (tenantcfg owns the shape — one ABI definition).
 func (d *Deployer) writeDeployResult(orgDir string, res tenantcfg.DeployResult) {
-	if err := os.MkdirAll(filepath.Join(orgDir, ".runtime"), 0o755); err != nil {
-		d.log.Error("could not create .runtime for deploy result", "error", err)
-		return
-	}
 	body, err := json.Marshal(res)
 	if err != nil {
 		d.log.Error("could not encode deploy result", "error", err)
 		return
 	}
-	if err := os.WriteFile(tenantcfg.DeployResultPath(orgDir), body, 0o644); err != nil {
+	// Hardened beneath-write (tenantcfg owns it): a hostile tenant that owns
+	// its .runtime tree cannot redirect this root-authored write via a symlink.
+	if _, err := tenantcfg.WriteRuntimeFile(orgDir, filepath.Base(tenantcfg.DeployResultPath(orgDir)), body, 0o644); err != nil {
 		d.log.Error("could not write deploy result", "error", err)
 	}
 }
@@ -525,6 +523,16 @@ func (d *Deployer) Handler(slug string) http.Handler {
 	// decodeSpec bounds and shape-validates a single fetch spec before any
 	// subprocess (npm/git) sees it — same stance as refsFor: constrain the
 	// token, don't sanitize.
+	//
+	// REGISTRY SPECS ONLY. /v1/resolve and /v1/versions run their subprocess
+	// (`npm pack`, `npm view`, `git ls-remote`) inline in the ROUTER process,
+	// outside every confinement. `npm pack` on a git spec runs the package's
+	// prepare/prepack scripts, and `git ls-remote` on a URL spec is an SSRF
+	// with the router's credentials — both as root. A confined tenant may
+	// legitimately propose only npm-published packages anyway (the org
+	// lockfile is {npm name: version} with nowhere to carry git provenance —
+	// the same gate coreserver/pkg_hosted enforces tenant-side), so refuse
+	// anything that is not a registry spec here, before the subprocess.
 	decodeSpec := func(w http.ResponseWriter, r *http.Request) (string, bool) {
 		var body struct {
 			Spec string `json:"spec"`
@@ -535,6 +543,10 @@ func (d *Deployer) Handler(slug string) http.Handler {
 		}
 		if err := pkgbuild.ValidatePackageSpec(body.Spec); err != nil {
 			writeCtlJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+			return "", false
+		}
+		if src, _ := pkgbuild.ClassifySpec(body.Spec); src != pkgbuild.SourceNpm {
+			writeCtlJSON(w, http.StatusBadRequest, map[string]any{"error": "only npm-published packages may be resolved here; git and URL specs are not supported"})
 			return "", false
 		}
 		return body.Spec, true

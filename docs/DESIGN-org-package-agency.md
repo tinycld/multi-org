@@ -19,9 +19,12 @@ artifact binary (the app shell's dual-mode `main`); the real-binary tests
 build it from the `tinycld` sibling. The hostile-child audit ran
 (`docs/AUDIT-hostile-child.md`): the four criticals + the H/M/L hardening are
 fixed, M1/M2/M3/M5/H5 recorded as OPEN follow-ups. The append-only-migration
-rule landed in the workspace CLAUDE.md. Remaining: retire
-`.runtime/packages.json` (redundant with the artifact's built-in set), and
-kernel per-uid filesystem quotas.
+rule landed in the workspace CLAUDE.md. Kernel per-uid filesystem quotas
+landed: `MT_TENANT_DISK_MAX` applies a `quotactl` block limit to the tenant
+uid after `chownTree` (warn-not-fail; the soft `storage_limit_bytes` stays the
+plan, this is the hard backstop against package Go bypassing `app.Save`).
+Remaining: retire `.runtime/packages.json` (redundant with the artifact's
+built-in set), and the audit's OPEN follow-ups (M1/M2/M3/M5/H5).
 **Motivates:** letting a tenant's own admin manage that org's packages —
 install, uninstall, upgrade, including third-party packages the operator has
 never heard of — while a new org can still be spun up from a default set in

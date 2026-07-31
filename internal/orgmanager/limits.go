@@ -110,6 +110,58 @@ func parseCPUMax(v string) (string, error) {
 	return fmt.Sprintf("%d %d", quota, cpuPeriodMicros), nil
 }
 
+// diskMaxRe matches a byte count with an optional binary-unit suffix, same
+// shape as memory.max but resolved to an absolute byte count for quotactl.
+var diskMaxRe = regexp.MustCompile(`^([0-9]+)([KMGT]?)$`)
+
+// DiskMaxBytesFromEnv reads MT_TENANT_DISK_MAX — the per-tenant hard filesystem
+// quota (block limit) applied to the tenant uid via quotactl, the kernel
+// backstop against hostile package Go bypassing app.Save (design §4). It is a
+// router-wide ceiling distinct from the per-org soft storage_limit_bytes (the
+// commercial plan the app layer enforces): set it comfortably ABOVE any plan so
+// the app's own "over limit" error fires first and a tenant only hits EDQUOT on
+// genuine runaway. 0 (unset) means no kernel quota. An invalid value is logged
+// and treated as unset, matching the cgroup-limit philosophy.
+func DiskMaxBytesFromEnv(log *slog.Logger) int64 {
+	raw := os.Getenv("MT_TENANT_DISK_MAX")
+	if raw == "" {
+		return 0
+	}
+	n, err := parseByteSize(raw)
+	if err != nil {
+		log.Error("invalid MT_TENANT_DISK_MAX ignored — no kernel disk quota until fixed",
+			"value", raw, "error", err)
+		return 0
+	}
+	return n
+}
+
+func parseByteSize(v string) (int64, error) {
+	m := diskMaxRe.FindStringSubmatch(v)
+	if m == nil {
+		return 0, fmt.Errorf("want bytes with optional K/M/G/T suffix (e.g. 10G)")
+	}
+	n, err := strconv.ParseInt(m[1], 10, 64)
+	if err != nil {
+		return 0, err
+	}
+	mult := int64(1)
+	switch m[2] {
+	case "K":
+		mult = 1 << 10
+	case "M":
+		mult = 1 << 20
+	case "G":
+		mult = 1 << 30
+	case "T":
+		mult = 1 << 40
+	}
+	if n > math.MaxInt64/mult {
+		return 0, fmt.Errorf("value overflows int64 bytes")
+	}
+	return n * mult, nil
+}
+
 // cgroupLimitsWarning returns the operator warning for a limit configuration
 // that cannot do what it appears to, or "" when the configuration is coherent.
 // NewSpawner logs it at Warn — same degraded-but-loud philosophy as the rest

@@ -33,6 +33,14 @@ type LinuxConfinement struct {
 	// CgroupRoot with no limits at all draws a NewSpawner warning, since the
 	// group then constrains nothing.
 	Limits TenantLimits
+
+	// DiskMaxBytes is the per-tenant hard filesystem quota (block limit)
+	// applied to the tenant uid via quotactl before the child starts — the
+	// kernel backstop against hostile package Go writing past its plan by
+	// bypassing app.Save (design §4). 0 disables it. Applied warn-not-fail: a
+	// quota that cannot be set (fs without quotas enabled) is an honest "no
+	// backstop", not a failed spawn.
+	DiskMaxBytes int64
 }
 
 // linuxSpawner runs each tenant confined: its own uid, its own mount and PID
@@ -59,10 +67,11 @@ func (s *linuxSpawner) tenantUID(slug, orgDir string) (int, error) {
 // from the environment.
 func NewSpawner(log *slog.Logger) Spawner {
 	conf := LinuxConfinement{
-		UIDBase:    envInt("MT_TENANT_UID_BASE", 0),
-		UIDRange:   envInt("MT_TENANT_UID_RANGE", 0),
-		CgroupRoot: os.Getenv("MT_CGROUP_ROOT"),
-		Limits:     TenantLimitsFromEnv(log),
+		UIDBase:      envInt("MT_TENANT_UID_BASE", 0),
+		UIDRange:     envInt("MT_TENANT_UID_RANGE", 0),
+		CgroupRoot:   os.Getenv("MT_CGROUP_ROOT"),
+		Limits:       TenantLimitsFromEnv(log),
+		DiskMaxBytes: DiskMaxBytesFromEnv(log),
 	}
 
 	if os.Geteuid() != 0 {
@@ -154,6 +163,19 @@ func (s *linuxSpawner) Spawn(ctx context.Context, req SpawnRequest, log *slog.Lo
 		}
 		if err := chownTree(req.OrgDir, uid); err != nil {
 			return nil, fmt.Errorf("chown org dir for %s: %w", req.Slug, err)
+		}
+		// The kernel disk backstop rides the tenant uid chownTree just
+		// established: every byte under the org dir is now owned by `uid`, and
+		// the uid owns nothing else on the host, so a per-uid block quota
+		// bounds exactly this org's on-disk footprint. Warn-not-fail — a
+		// resource limit, not an isolation boundary (the cgroup precedent
+		// below): a filesystem without quotas enabled leaves the tenant
+		// unbounded but serving, stated honestly rather than failing the spawn.
+		if s.conf.DiskMaxBytes > 0 {
+			if err := applyDiskQuota(req.OrgDir, uid, s.conf.DiskMaxBytes); err != nil {
+				log.Warn("could not apply kernel disk quota — the tenant's disk use is UNBOUNDED by the kernel",
+					"slug", req.Slug, "error", err)
+			}
 		}
 		// The child creates the socket itself, so its per-org directory must
 		// be writable by the tenant uid — but ONLY that directory. Its parent

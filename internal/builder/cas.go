@@ -20,16 +20,24 @@ import (
 // package doc's trust argument.
 const RecipeFile = "recipe.json"
 
+// MemberManifestsDir is the artifact subdirectory holding each feature
+// member's evaluated manifest as manifests/<slug>/manifest.json — the same
+// shape the package store materializes, so the router's capability wiring
+// (controlplane.CardDAVSources etc.) reads an artifact member exactly like a
+// store package. Written by the trusted parent from resolve-time evaluation,
+// never by the confined job. The base member ships no manifest.
+const MemberManifestsDir = "manifests"
+
 // Recipe is the parsed shape of RecipeFile.
 type Recipe struct {
-	RecipeHash     string                   `json:"recipeHash"`
-	BuildID        string                   `json:"buildId"`
-	BuiltAt        time.Time                `json:"builtAt"`
-	Toolchain      pkgbuild.Toolchain       `json:"toolchain"`
+	RecipeHash     string                    `json:"recipeHash"`
+	BuildID        string                    `json:"buildId"`
+	BuiltAt        time.Time                 `json:"builtAt"`
+	Toolchain      pkgbuild.Toolchain        `json:"toolchain"`
 	Members        []pkgbuild.ResolvedMember `json:"members"`
-	Overrides      map[string]string        `json:"overrides"`
-	ReleaseID      string                   `json:"releaseId"`
-	RuntimeVersion string                   `json:"runtimeVersion"`
+	Overrides      map[string]string         `json:"overrides"`
+	ReleaseID      string                    `json:"releaseId"`
+	RuntimeVersion string                    `json:"runtimeVersion"`
 }
 
 // Store is the content-addressed build-artifact cache: one immutable directory

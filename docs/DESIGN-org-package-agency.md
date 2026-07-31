@@ -4,7 +4,8 @@
 extraction + `RecipeHash` with the cross-repo golden) landed 2026-07-30 —
 see `tinycld.org/core/pkgbuild` and `internal/recipeparity/` here. Step 2
 (builder worker + dual-mode binary) landed 2026-07-31 — see `internal/builder`
-here and `tinycld.org/core/tenantmain`. Steps 3–5 are not started.
+here and `tinycld.org/core/tenantmain`. Step 3 (router deploy protocol +
+builder wiring) landed 2026-07-31 — see §7. Steps 4–5 are not started.
 **Motivates:** letting a tenant's own admin manage that org's packages —
 install, uninstall, upgrade, including third-party packages the operator has
 never heard of — while a new org can still be spun up from a default set in
@@ -350,6 +351,44 @@ idle sweep, and the readiness protocol are untouched.
 3. **Router deploy protocol**: control socket, snapshot/revert, per-org
    serialization, `deploy-result.json`. `CreateOrg` from
    `default_lockfile` → default artifact.
+   **DONE 2026-07-31** — serve-multi constructs the Builder
+   (`MT_SCAFFOLD_ROOT` enables it; jobs re-exec confined per
+   `MT_BUILDER_*`), the manager spawns artifact-backed orgs from a build
+   reference (`orgs.recipe_hash` → `controlplane.BuildResolver` →
+   `materialize.MaterializeBuild` atomic repoint into `builds/<hash>/`,
+   the artifact's own dual-mode binary, `--confine-packages` over the
+   builds root), and the artifact carries each member's evaluated
+   manifest (`manifests/<slug>/manifest.json`, staged by the trusted
+   parent) so the existing capability hooks read artifact members exactly
+   like store packages. `controlplane.Deployer` is D6 steps 3–5: per-org
+   serialization + rate limit, build (the authoritative peer gate runs
+   inside `builder.Build`), record `deployments` row
+   (proposed→committed|reverted, `job_id`), repoint
+   (`prev_recipe_hash` = revert target, also GC liveness), evict, respawn
+   — readiness is the commit/revert decision; failure restores
+   `.deploy/backup.db` (+ WAL sidecars removed), repoints the previous
+   build, respawns it, and writes `.runtime/deploy-result.json`
+   (`tenantcfg.DeployResult` — one ABI definition; loaders/`Consume` for
+   step 4's reconcile). The control socket is `ctl.sock` in the per-org
+   0700 socket dir — ROUTER-bound, tenant-dialed (the inverse of every
+   other per-org socket), versioned surface `POST /v1/build` (warm the
+   artifact while the org keeps serving — the §6 build-latency answer)
+   and `POST /v1/deploy` (202 after record+repoint; 409 busy / 429
+   rate-limited); tenants get the path via the new `--control-socket`
+   flag → `tenantmain.Extras.ControlSocket`. D7: `control_settings`
+   singleton with `default_lockfile` (GET/PUT
+   `/api/settings/default-lockfile`), copied by lockfile-less
+   `CreateOrg`; a base-bearing set provisions from the (cache-hit)
+   artifact, an explicit empty set stays a zero-package lean shell.
+   **Artifact-vs-legacy discriminator:** a lockfile containing the base
+   member (`tinycld`) is an artifact set — store sets never include the
+   app shell — so both paths coexist until step 5. Implementation-time
+   decisions recorded: the §5 DAV-materialization deletion candidate was
+   NOT taken — per-package `RegisterTenant` does not self-mount DAV, so
+   artifact orgs keep the `.runtime` DAV/quota configs, now sourced from
+   the artifact's staged manifests; operator-driven deploys (superuser
+   route) have no proposing tenant, take no snapshot, and revert
+   build-pointer-only.
 4. **Tenant-side**: hosted-mode wiring for the existing Packages UI
    (propose instead of exit-75), in-tenant downs against the control-socket
    flow, `pkg_registry` reconciliation from the built-in set.

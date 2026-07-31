@@ -194,3 +194,80 @@ func TestMaterialize_IsIdempotent(t *testing.T) {
 		t.Fatalf("expected exactly 1 hook after re-materialize, got %d", len(entries))
 	}
 }
+
+// An artifact-backed org's live names point straight into the committed build
+// tree, the transition from a store materialization is atomic, and leftover
+// store-era generations are pruned to the newest (a draining predecessor may
+// still read it).
+func TestMaterializeBuild_PointsLiveNamesAtArtifact(t *testing.T) {
+	artifact := t.TempDir()
+	for _, name := range []string{"pb_hooks", "pb_public", "pb_migrations"} {
+		if err := os.MkdirAll(filepath.Join(artifact, name), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(artifact, "pb_public", "index.html"), []byte("<html>built</html>"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Start from a store materialization, as an org migrating onto its first
+	// artifact would.
+	root := t.TempDir()
+	s := store.New(root)
+	if err := s.Publish("@tinycld/core", "2.4.0", map[string][]byte{
+		"client/dist/index.html": []byte("<html>store</html>"),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	lf, _ := lockfile.Parse([]byte(`{"@tinycld/core":"2.4.0"}`))
+	resolved, err := lf.Resolve(s)
+	if err != nil {
+		t.Fatal(err)
+	}
+	orgDir := filepath.Join(t.TempDir(), "acme")
+	if err := Materialize(orgDir, resolved); err != nil {
+		t.Fatal(err)
+	}
+	if err := Materialize(orgDir, resolved); err != nil { // two generations on disk
+		t.Fatal(err)
+	}
+
+	if err := MaterializeBuild(orgDir, artifact); err != nil {
+		t.Fatal(err)
+	}
+
+	idx, err := os.ReadFile(filepath.Join(orgDir, "pb_public", "index.html"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(idx) != "<html>built</html>" {
+		t.Fatalf("live pb_public reads %q, want the artifact's tree", idx)
+	}
+	target, err := os.Readlink(filepath.Join(orgDir, "pb_hooks"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if target != filepath.Join(artifact, "pb_hooks") {
+		t.Fatalf("pb_hooks -> %q, want absolute artifact path", target)
+	}
+
+	// Store-era generations pruned to the newest only.
+	entries, err := os.ReadDir(orgDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gens := 0
+	for _, e := range entries {
+		if _, ok := parseGeneration(e.Name(), "pb_public"); ok {
+			gens++
+		}
+	}
+	if gens != 1 {
+		t.Fatalf("%d pb_public generations survive, want 1", gens)
+	}
+
+	// Idempotent, and safe to run again over an artifact-backed org.
+	if err := MaterializeBuild(orgDir, artifact); err != nil {
+		t.Fatal(err)
+	}
+}

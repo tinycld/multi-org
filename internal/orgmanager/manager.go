@@ -23,8 +23,8 @@ import (
 	"tinycld.org/core/caldav"
 	"tinycld.org/core/carddav"
 	"tinycld.org/core/quota"
-	"tinycld.org/core/webdav"
 	"tinycld.org/core/tenantcfg"
+	"tinycld.org/core/webdav"
 	"tinycld.org/multi-org/internal/lockfile"
 	"tinycld.org/multi-org/internal/materialize"
 	"tinycld.org/multi-org/internal/orgerr"
@@ -66,6 +66,13 @@ type OrgRecord struct {
 	Status   string
 	Lockfile []byte
 
+	// RecipeHash names the committed build artifact this org boots from
+	// (DESIGN-org-package-agency D4). Non-empty ⇒ the org is artifact-backed:
+	// load resolves it through Config.ResolveBuild and ignores the package
+	// store entirely. Empty ⇒ the legacy store/materialize path (kept until
+	// design §7 step 5 removes it).
+	RecipeHash string
+
 	// DisplayName is the org's human-facing name from the control-plane
 	// record. Materialized into .runtime/app.json (orgName) and adopted as the
 	// tenant's Settings().Meta.AppName, which is where the client's
@@ -81,6 +88,26 @@ type OrgRecord struct {
 
 // LookupFunc resolves an org's control-plane record by slug.
 type LookupFunc func(slug string) (OrgRecord, bool)
+
+// BuildRef is a committed build artifact an org boots from — the resolution of
+// an OrgRecord.RecipeHash.
+type BuildRef struct {
+	// Dir is the committed artifact directory (<root>/builds/<hex>). Its
+	// pb_hooks/pb_migrations/pb_public become the org's live trees; its parent
+	// (the builds root) is what confinement exposes read-only, exactly the
+	// package-store rule.
+	Dir string
+
+	// Binary is the tenant executable inside Dir — the dual-mode app-shell
+	// binary built from the org's own package set, a drop-in serve-org
+	// replacement under the unchanged flags/ready-fd contract.
+	Binary string
+
+	// Packages carries each feature member with Dir pointing at the artifact's
+	// staged manifest directory (manifests/<slug>/), so the capability hooks
+	// that read store packages read artifact members unchanged.
+	Packages []lockfile.ResolvedPackage
+}
 
 type Config struct {
 	Root      string
@@ -108,8 +135,23 @@ type Config struct {
 	// 0 = the default of 4.
 	MaxConcurrentSpawns int
 
-	// TenantBinary is the path to the serve-org executable.
+	// TenantBinary is the path to the serve-org executable — the shared
+	// pinned-menu binary legacy (store-backed) orgs run. Artifact-backed orgs
+	// run their build's own binary instead (BuildRef.Binary).
 	TenantBinary string
+
+	// ResolveBuild resolves an org's RecipeHash to its committed artifact.
+	// Required for artifact-backed orgs; nil fails their load (a lockfile-only
+	// deployment never needs it).
+	ResolveBuild func(recipeHash string) (BuildRef, error)
+
+	// Control returns the handler the manager serves on the org's control
+	// socket — the router-bound, tenant-dialed channel a tenant proposes
+	// deploys over (design D1). The socket lives in the org's 0700 socket
+	// directory, so only that org's uid can reach it: identity is by
+	// construction and the handler needs no authentication. Nil ⇒ no control
+	// socket is bound.
+	Control func(slug string) http.Handler
 
 	Logger *slog.Logger
 
@@ -332,16 +374,42 @@ func (m *OrgManager) load(ctx context.Context, slug string) (*OrgInstance, error
 
 	orgDir := filepath.Join(m.cfg.Root, "pb_orgs", slug)
 
-	lf, err := lockfile.Parse(rec.Lockfile)
-	if err != nil {
-		return nil, fmt.Errorf("lockfile parse for %s: %w", slug, err)
-	}
-	resolved, err := lf.Resolve(m.cfg.Store)
-	if err != nil {
-		return nil, fmt.Errorf("lockfile resolve for %s: %w", slug, err)
-	}
-	if err := materialize.Materialize(orgDir, resolved); err != nil {
-		return nil, fmt.Errorf("materialize %s: %w", slug, err)
+	// An artifact-backed org (RecipeHash set) boots its own build: binary and
+	// live trees come from builds/<hash>/, and the read-only mount confinement
+	// applies covers the builds root instead of the package store. A legacy
+	// org keeps the store/materialize path until step 5 deletes it.
+	var (
+		resolved []lockfile.ResolvedPackage
+		src      = bootSource{
+			binary:      m.cfg.TenantBinary,
+			packagesDir: filepath.Join(m.cfg.Root, "packages"),
+		}
+	)
+	if rec.RecipeHash != "" {
+		if m.cfg.ResolveBuild == nil {
+			return nil, fmt.Errorf("org %s references build %s but no build resolver is wired", slug, rec.RecipeHash)
+		}
+		ref, err := m.cfg.ResolveBuild(rec.RecipeHash)
+		if err != nil {
+			return nil, fmt.Errorf("resolve build for %s: %w", slug, err)
+		}
+		if err := materialize.MaterializeBuild(orgDir, ref.Dir); err != nil {
+			return nil, fmt.Errorf("materialize build %s: %w", slug, err)
+		}
+		resolved = ref.Packages
+		src = bootSource{binary: ref.Binary, packagesDir: filepath.Dir(ref.Dir)}
+	} else {
+		lf, err := lockfile.Parse(rec.Lockfile)
+		if err != nil {
+			return nil, fmt.Errorf("lockfile parse for %s: %w", slug, err)
+		}
+		resolved, err = lf.Resolve(m.cfg.Store)
+		if err != nil {
+			return nil, fmt.Errorf("lockfile resolve for %s: %w", slug, err)
+		}
+		if err := materialize.Materialize(orgDir, resolved); err != nil {
+			return nil, fmt.Errorf("materialize %s: %w", slug, err)
+		}
 	}
 
 	// After materialize, never before: materialize is what establishes the org
@@ -388,7 +456,7 @@ func (m *OrgManager) load(ctx context.Context, slug string) (*OrgInstance, error
 		return nil, fmt.Errorf("app config %s: %w", slug, err)
 	}
 
-	inst, err := m.spawn(ctx, slug, orgDir, runtimeConfigs{
+	inst, err := m.spawn(ctx, slug, orgDir, src, runtimeConfigs{
 		cardDAV:  davConfig,
 		calDAV:   caldavConfig,
 		webDAV:   webdavConfig,
@@ -439,8 +507,16 @@ type runtimeConfigs struct {
 	app      string
 }
 
+// bootSource is what a load resolved to boot from: the tenant executable and
+// the read-only tree confinement must expose (the package store for legacy
+// orgs, the builds root for artifact-backed ones).
+type bootSource struct {
+	binary      string
+	packagesDir string
+}
+
 // spawn starts the tenant process and waits for it to report readiness.
-func (m *OrgManager) spawn(ctx context.Context, slug, orgDir string, cfgs runtimeConfigs, withMail bool) (*OrgInstance, error) {
+func (m *OrgManager) spawn(ctx context.Context, slug, orgDir string, src bootSource, cfgs runtimeConfigs, withMail bool) (*OrgInstance, error) {
 	socks, err := m.socketPaths(slug, withMail)
 	if err != nil {
 		return nil, err
@@ -454,43 +530,61 @@ func (m *OrgManager) spawn(ctx context.Context, slug, orgDir string, cfgs runtim
 		}
 	}
 
+	log := m.cfg.Logger
+
+	// The control socket is ROUTER-bound and tenant-dialed — the inverse of
+	// every other per-org socket — so it is bound before the child exists and
+	// its lifecycle belongs to the instance teardown, not the child.
+	var ctl *controlServer
+	if m.cfg.Control != nil {
+		ctl, err = startControl(socks.ctl, m.cfg.Control(slug), log)
+		if err != nil {
+			return nil, fmt.Errorf("%w: control socket for %s: %v", orgerr.ErrOrgUnavailable, slug, err)
+		}
+	}
+	fail := func(err error) (*OrgInstance, error) {
+		ctl.close(log, slug)
+		return nil, err
+	}
+
 	readyR, readyW, err := os.Pipe()
 	if err != nil {
-		return nil, fmt.Errorf("%w: readiness pipe for %s: %v", orgerr.ErrOrgUnavailable, slug, err)
+		return fail(fmt.Errorf("%w: readiness pipe for %s: %v", orgerr.ErrOrgUnavailable, slug, err))
 	}
 	defer readyR.Close()
 
-	log := m.cfg.Logger
 	proc, err := m.cfg.Spawner.Spawn(ctx, SpawnRequest{
-		Slug:           slug,
-		OrgDir:         orgDir,
-		SocketPath:     sockPath,
-		IMAPSocketPath: socks.imap,
-		SMTPSocketPath: socks.smtp,
-		MXSocketPath:   socks.mx,
-		BinaryPath:     m.cfg.TenantBinary,
-		CardDAVConfig:  cfgs.cardDAV,
-		CalDAVConfig:   cfgs.calDAV,
-		WebDAVConfig:   cfgs.webDAV,
-		QuotaConfig:    cfgs.quota,
-		PackagesConfig: cfgs.packages,
-		AppConfig:      cfgs.app,
-		HooksPool:      m.cfg.HooksPool,
-		Drain:          drainTimeout,
-		ReadyFile:      readyW,
-		PackagesDir:    filepath.Join(m.cfg.Root, "packages"),
+		Slug:              slug,
+		OrgDir:            orgDir,
+		SocketPath:        sockPath,
+		IMAPSocketPath:    socks.imap,
+		SMTPSocketPath:    socks.smtp,
+		MXSocketPath:      socks.mx,
+		ControlSocketPath: socks.ctl,
+		BinaryPath:        src.binary,
+		CardDAVConfig:     cfgs.cardDAV,
+		CalDAVConfig:      cfgs.calDAV,
+		WebDAVConfig:      cfgs.webDAV,
+		QuotaConfig:       cfgs.quota,
+		PackagesConfig:    cfgs.packages,
+		AppConfig:         cfgs.app,
+		HooksPool:         m.cfg.HooksPool,
+		Drain:             drainTimeout,
+		ReadyFile:         readyW,
+		PackagesDir:       src.packagesDir,
 	}, log)
 	// The write end belongs to the child now; the host must close its copy or
 	// it will never observe EOF when the child dies.
 	readyW.Close()
 	if err != nil {
-		return nil, fmt.Errorf("%w: spawn %s: %v", orgerr.ErrOrgUnavailable, slug, err)
+		return fail(fmt.Errorf("%w: spawn %s: %v", orgerr.ErrOrgUnavailable, slug, err))
 	}
 
 	inst := &OrgInstance{
 		slug:      slug,
 		sockPath:  sockPath,
 		mailSocks: MailSockets{IMAP: socks.imap, SMTP: socks.smtp, MX: socks.mx},
+		ctl:       ctl,
 		proc:      proc,
 		proxy:     newProxy(sockPath, m.cfg.Forwarded, log),
 		closed:    make(chan struct{}),
@@ -517,6 +611,7 @@ func (m *OrgManager) spawn(ctx context.Context, slug, orgDir string, cfgs runtim
 		_ = proc.Kill()
 		<-inst.dead
 		_ = os.Remove(sockPath)
+		ctl.close(log, slug)
 		return nil, err
 	}
 
@@ -555,28 +650,33 @@ func socketInode(path string) uint64 {
 // NUL and keeps one limit across platforms.
 const maxSocketPath = 100
 
-// Basenames of the per-org mail sockets. Fixed short names: they share the
-// org's socket directory (and its sun_path budget) with the HTTP socket.
+// Basenames of the per-org mail and control sockets. Fixed short names: they
+// share the org's socket directory (and its sun_path budget) with the HTTP
+// socket.
 const (
 	imapSockName = "imap.sock"
 	smtpSockName = "smtp.sock"
 	mxSockName   = "mx.sock"
+	ctlSockName  = "ctl.sock"
 )
 
-// orgSockets are the unix sockets one org's tenant serves on. http is always
-// set; the mail sockets are set only for an org whose resolved package set
-// includes mail.
+// orgSockets are the unix sockets in one org's socket directory. http is
+// always set and tenant-bound; the mail sockets (tenant-bound) are set only
+// for an org whose resolved package set includes mail; ctl (ROUTER-bound,
+// tenant-dialed — the deploy-proposal channel) is set only when the manager
+// wires a Control handler.
 type orgSockets struct {
 	http string
 	imap string
 	smtp string
 	mx   string
+	ctl  string
 }
 
 // all returns the non-empty socket paths.
 func (s orgSockets) all() []string {
 	out := []string{s.http}
-	for _, p := range []string{s.imap, s.smtp, s.mx} {
+	for _, p := range []string{s.imap, s.smtp, s.mx, s.ctl} {
 		if p != "" {
 			out = append(out, p)
 		}
@@ -599,6 +699,7 @@ func (s orgSockets) all() []string {
 // splitting an org's sockets across directories would leave some in a dir the
 // spawner never chowned.
 func (m *OrgManager) socketPaths(slug string, withMail bool) (orgSockets, error) {
+	withControl := m.cfg.Control != nil
 	longestBase := func(httpBase string) string {
 		longest := httpBase
 		if withMail {
@@ -608,6 +709,9 @@ func (m *OrgManager) socketPaths(slug string, withMail bool) (orgSockets, error)
 				}
 			}
 		}
+		if withControl && len(ctlSockName) > len(longest) {
+			longest = ctlSockName
+		}
 		return longest
 	}
 	build := func(dir, httpBase string) orgSockets {
@@ -616,6 +720,9 @@ func (m *OrgManager) socketPaths(slug string, withMail bool) (orgSockets, error)
 			s.imap = filepath.Join(dir, imapSockName)
 			s.smtp = filepath.Join(dir, smtpSockName)
 			s.mx = filepath.Join(dir, mxSockName)
+		}
+		if withControl {
+			s.ctl = filepath.Join(dir, ctlSockName)
 		}
 		return s
 	}

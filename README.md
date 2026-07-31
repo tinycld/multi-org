@@ -49,8 +49,8 @@ unix domain socket and never holds a tenant app object.
 | `internal/store` | Immutable, version-addressed package store (`<root>/packages/<name>/<version>/`). |
 | `internal/lockfile` | Per-org `{name: version}` lockfile; parse + resolve against the store. |
 | `internal/materialize` | Symlink-farm an org's `pb_hooks` (from `server/`) and `pb_public` (from `client/dist/`) from resolved packages. |
-| `internal/controlplane` | Control-plane PocketBase app: `orgs`/`packages`/`deployments` schema, `Provisioner` (create/deploy/suspend/resume/archive/publish), HTTP routes, and the DB-backed `OrgLookup`. |
-| `internal/orgmanager` | Lazy per-org process supervisor: materialize → spawn `serve-org` → readiness handshake → reverse proxy. Singleflight-collapsed spawns, crash supervision with backoff, drain-then-kill `Evict`, idle sweeper. |
+| `internal/controlplane` | Control-plane PocketBase app: `orgs`/`packages`/`deployments`/`control_settings` schema, `Provisioner` (create/deploy/suspend/resume/archive/publish), the `Deployer` (the D6 deploy orchestrator: per-org serialization + rate limit, build → repoint → respawn with commit/revert, `.runtime/deploy-result.json`), HTTP routes, and the DB-backed `OrgLookup`. |
+| `internal/orgmanager` | Lazy per-org process supervisor: materialize (store symlink farm, or repoint at a committed build artifact) → spawn the tenant binary (shared `serve-org`, or the artifact's own dual-mode binary) → readiness handshake → reverse proxy. Singleflight-collapsed spawns, crash supervision with backoff, drain-then-kill `Evict`, idle sweeper, and the router-bound per-org control socket (`ctl.sock`) tenants propose deploys over. |
 | `internal/orgerr` | The three sentinels (`ErrOrgNotFound` / `ErrOrgNotActive` / `ErrOrgUnavailable`) the front router classifies into 404 / 503. |
 | `internal/builder` | The trusted builder (DESIGN-org-package-agency §7 step 2): resolves a package set on the trusted side (tarball integrities + manifest facts → recipe hash), runs the shared `pkgbuild` pipeline in a confined re-exec'd job, and commits the runtime tree to the content-addressed cache at `<root>/builds/<recipe-hash>/` (idempotent commit, refcount-style `Sweep`). |
 | `internal/frontrouter` | Plain `http.Handler`: `Host` → subdomain → control-plane / org / apex org-finder page. |
@@ -91,9 +91,51 @@ deployed pair stays together without configuration.
 | `MT_MAIL_TLS_CERT`, `MT_MAIL_TLS_KEY` | falls back to `MT_TLS_CERT`/`MT_TLS_KEY` | Wildcard cert the router terminates mail TLS with. Tenants never hold this key. |
 | `MT_IMAPS_ADDR`, `MT_SMTPS_ADDR`, `MT_MX_ADDR` | `:993`, `:465`, `:25` | Mail listener addresses; the literal value `off` disables that one listener. |
 | `MT_MX_HOSTNAME` | `MT_BASE_DOMAIN` | Identity the `:25` greeting announces and the HELO name toward tenants. |
+| `MT_SCAFFOLD_ROOT` | — | Enables the **trusted builder**: an operator-provisioned workspace scaffold root (`package-versions.json`, `scripts/link-members.ts`, …; bootstrap is its source of truth). Set, package sets whose lockfile includes the app shell (`tinycld`) are built into shared artifacts under `<root>/builds/<recipe-hash>/` and orgs boot their own per-set binary; unset, only the legacy store/materialize path exists. |
+| `MT_BUILDER_MAX_CONCURRENT` | `1` | Cap on simultaneously-running build jobs; excess queue. Builds are minutes of CPU-saturating work — the queue is the capacity seam. |
+| `MT_BUILDER_UID` | — | **Linux.** Dedicated host uid build jobs run as (outside the tenant uid window). Unset ⇒ jobs run unconfined. |
+| `MT_BUILDER_CGROUP_ROOT` | — | **Linux.** cgroup v2 dir to place build jobs under. |
+| `MT_BUILDER_MEMORY_MAX`, `MT_BUILDER_PIDS_MAX`, `MT_BUILDER_CPU_MAX` | — | **Linux.** Per-job cgroup limits, same value syntax as the `MT_TENANT_*` counterparts. |
 
 None of these reach a tenant process: children are spawned with an explicitly
 constructed environment (see the security section).
+
+## Artifact-backed orgs & the deploy protocol
+
+With `MT_SCAFFOLD_ROOT` set, a lockfile that includes the app shell
+(`"tinycld": "<version>"`) is an **artifact set**: the trusted builder fetches
+every member from its registry spec, computes the recipe hash, runs the
+`pkgbuild` pipeline in a confined job, and commits the runtime tree to
+`<root>/builds/<recipe-hash>/`. The org row stores that hash
+(`orgs.recipe_hash`); at load the manager points the org's
+`pb_hooks`/`pb_migrations`/`pb_public` into the artifact (atomic symlink
+swap), boots the artifact's **own dual-mode binary** instead of the shared
+`serve-org`, and feeds the capability wiring from the artifact's staged
+`manifests/<slug>/manifest.json`. Two orgs with the same set share the entry
+by construction; an hourly sweep removes artifacts no org's current or
+previous build references.
+
+`POST /api/orgs` with **no** lockfile copies the operator-editable template
+(`PUT /api/settings/default-lockfile`) — the default set is just a warm cache
+entry, so provisioning costs seconds. An explicit empty lockfile still means a
+zero-package lean shell (legacy path). Store-name lockfiles (no `tinycld`
+entry) keep the store/materialize path until design §7 step 5 deletes it.
+
+Deploys (operator `POST /api/orgs/{slug}/deploy`, or the tenant itself over
+its **control socket** — `ctl.sock` in the org's 0700 socket dir, router-bound
+and tenant-dialed, so identity is the filesystem):
+
+1. `POST /v1/build {lockfile}` — build or cache-hit the artifact and wait.
+   The org keeps serving its old build; novel sets pay their minutes here.
+2. Tenant snapshots its DB to `.deploy/backup.db`, runs its down migrations,
+   then `POST /v1/deploy {lockfile, jobId}` — 202 once the proposal is
+   recorded and the org row repointed; the tenant waits to be killed.
+3. Router evicts and respawns; the readiness handshake is the commit/revert
+   decision. Failure restores the snapshot, repoints the previous build,
+   respawns it, and records the reason in `.runtime/deploy-result.json`
+   (shape owned by core's `tenantcfg`) plus the `deployments` row.
+
+Per-org deploys are serialized (busy → 409) and rate-limited (→ 429).
 
 ## Tenant security boundary
 

@@ -68,13 +68,46 @@ func run() error {
 	// Manifest JS from published packages evaluates in a re-exec'd,
 	// memory-limited child of this binary: an allocation bomb kills the
 	// child, never the router and the tenants it fronts.
-	if selfExe, err := os.Executable(); err == nil {
-		controlplane.SetManifestEvaluator(func(src, name string) ([]byte, error) {
+	var evalManifest func(src, name string) ([]byte, error)
+	selfExe, selfErr := os.Executable()
+	if selfErr == nil {
+		evalManifest = func(src, name string) ([]byte, error) {
 			return manifesteval.EvalSubprocess(context.Background(),
 				[]string{selfExe, manifesteval.Subcommand}, src, name)
-		})
+		}
+		controlplane.SetManifestEvaluator(evalManifest)
 	} else {
-		log.Printf("cannot resolve own executable (%v); manifest eval stays in-process", err)
+		log.Printf("cannot resolve own executable (%v); manifest eval stays in-process", selfErr)
+	}
+
+	// The trusted builder (design D3): package sets become shared
+	// content-addressed artifacts under <root>/builds. Enabled by
+	// MT_SCAFFOLD_ROOT — an operator-provisioned workspace scaffold; without
+	// it the router keeps the legacy store/materialize path only. Jobs run as
+	// a re-exec'd, confined `builder-job` child of this binary (build jobs
+	// execute package-author code by design).
+	var bld *builder.Builder
+	if scaffoldRoot := os.Getenv("MT_SCAFFOLD_ROOT"); scaffoldRoot != "" {
+		var runner builder.Runner = builder.InProcessRunner{}
+		if selfErr == nil {
+			runner = builder.SubprocessRunner{
+				Argv:        []string{selfExe, builder.Subcommand},
+				Confinement: builder.JobConfinementFromEnv(),
+			}
+		} else {
+			log.Printf("builder jobs stay in-process (no self exe): %v", selfErr)
+		}
+		var err error
+		bld, err = builder.New(builder.Config{
+			Root:          root,
+			ScaffoldRoot:  scaffoldRoot,
+			MaxConcurrent: getenvInt("MT_BUILDER_MAX_CONCURRENT", 0),
+			Runner:        runner,
+			EvalManifest:  evalManifest,
+		})
+		if err != nil {
+			return fmt.Errorf("builder: %w", err)
+		}
 	}
 
 	cp, err := controlplane.New(filepath.Join(root, "pb_control", "pb_data"))
@@ -94,7 +127,30 @@ func run() error {
 
 	pkgStore := store.New(root)
 
-	mgr := orgmanager.New(orgmanager.Config{
+	// The provisioner and the deploy orchestrator reach the manager only
+	// through these closures; the manager is constructed just below, after
+	// the provisioner exists, because artifact-backed orgs need the
+	// provisioner's control handler at spawn time. Neither closure runs
+	// before serving starts.
+	var mgr *orgmanager.OrgManager
+	evictOrg := func(slug string) { mgr.Evict(slug) }
+	// Provision-time verification boots the new org through the manager: the
+	// first spawn applies the org's migrations inside the CONFINED tenant
+	// process (the control plane never runs tenant JS), and a failure comes
+	// back through the readiness handshake with the child's reason. The
+	// deploy orchestrator uses the same hook as its commit/revert decision.
+	verifyOrg := func(ctx context.Context, slug string) error {
+		_, err := mgr.Get(ctx, slug)
+		return err
+	}
+
+	prov := controlplane.NewProvisioner(cp.App, root, pkgStore, evictOrg, verifyOrg)
+	if bld != nil {
+		prov.EnableBuilds(bld, slog.Default())
+	}
+	prov.RegisterRoutes()
+
+	mgrCfg := orgmanager.Config{
 		Root:      root,
 		Store:     pkgStore,
 		LookupOrg: controlplane.OrgLookup(cp.App),
@@ -125,7 +181,12 @@ func run() error {
 			Proto:        "https",
 			PeerIsClient: tlsMode != server.TLSProxy,
 		},
-	})
+	}
+	if bld != nil {
+		mgrCfg.ResolveBuild = controlplane.BuildResolver(bld.Store(), "tinycld")
+		mgrCfg.Control = prov.ControlHandler()
+	}
+	mgr = orgmanager.New(mgrCfg)
 	defer mgr.Shutdown()
 
 	// The mail ports (:993/:465/:25), opt-in via MT_MAIL_PORTS_ENABLED. Same
@@ -137,17 +198,6 @@ func run() error {
 	}
 	defer mailShutdown()
 
-	// Provision-time verification boots the new org through the manager: the
-	// first spawn applies the org's migrations inside the CONFINED tenant
-	// process (the control plane never runs tenant JS), and a failure comes
-	// back through the readiness handshake with the child's reason.
-	prov := controlplane.NewProvisioner(cp.App, root, pkgStore, mgr.Evict,
-		func(ctx context.Context, slug string) error {
-			_, err := mgr.Get(ctx, slug)
-			return err
-		})
-	prov.RegisterRoutes()
-
 	controlMux, err := apis.BuildServeMux(cp.App, apis.ServeConfig{})
 	if err != nil {
 		return fmt.Errorf("control-plane mux: %w", err)
@@ -155,6 +205,13 @@ func run() error {
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
+
+	// Artifact GC (design D4): an artifact is live while any org's current or
+	// previous build resolves to it, or a deploy is in flight against it; the
+	// grace window from BuiltAt covers a fresh build's commit→repoint gap.
+	if bld != nil {
+		go sweepBuilds(ctx, bld, prov.Deployer())
+	}
 
 	log.Printf("serve-multi listening on %s for *.%s (tls=%s)", addr, baseDomain, tlsMode)
 	err = server.Serve(ctx, addr, server.Params{
@@ -241,6 +298,34 @@ func startMailPorts(baseDomain string, cp *controlplane.ControlPlane, mgr *orgma
 	log.Printf("mail ports listening (imaps=%v smtps=%v mx=%v)",
 		r.IMAPSListenerAddr(), r.SMTPSListenerAddr(), r.MXListenerAddr())
 	return r.Shutdown, nil
+}
+
+// sweepBuilds periodically removes unreferenced build artifacts. Hourly with
+// a two-hour grace: deploys take seconds-to-minutes, so a live-but-unlisted
+// artifact only exists inside windows both mechanisms already cover
+// (in-flight tracking for cache hits, BuiltAt grace for fresh builds).
+func sweepBuilds(ctx context.Context, bld *builder.Builder, dep *controlplane.Deployer) {
+	t := time.NewTicker(time.Hour)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+		}
+		live, err := dep.LiveRecipeHashes()
+		if err != nil {
+			log.Printf("build GC: cannot resolve live set: %v", err)
+			continue
+		}
+		removed, err := bld.Store().Sweep(func(hash string) bool { return live[hash] }, 2*time.Hour, time.Now())
+		if err != nil {
+			log.Printf("build GC: sweep: %v", err)
+		}
+		if len(removed) > 0 {
+			log.Printf("build GC: removed %d unreferenced artifact(s)", len(removed))
+		}
+	}
 }
 
 // defaultTenantBinary resolves serve-org next to this executable.

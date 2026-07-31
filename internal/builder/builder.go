@@ -236,6 +236,9 @@ func (b *Builder) buildOne(ctx context.Context, refs []PackageRef, sink pkgbuild
 		return Result{}, fmt.Errorf("build %s (job dir kept at %s): %w", res.RecipeHash, jobDir, err)
 	}
 
+	if err := writeMemberManifests(spec.ArtifactDir, res.Manifests); err != nil {
+		return Result{}, err
+	}
 	tc, _ := b.toolchain()
 	if err := writeRecipeFile(spec.ArtifactDir, Recipe{
 		RecipeHash: res.RecipeHash,
@@ -290,4 +293,20 @@ func writeRecipeFile(artifactDir string, r Recipe) error {
 		return err
 	}
 	return os.WriteFile(filepath.Join(artifactDir, RecipeFile), append(b, '\n'), 0o644)
+}
+
+// writeMemberManifests stages manifests/<slug>/manifest.json for every feature
+// member, parent-side (see MemberManifestsDir). Like RecipeFile these are
+// identity facts the confined job must not author.
+func writeMemberManifests(artifactDir string, manifests map[string]json.RawMessage) error {
+	for slug, raw := range manifests {
+		dir := filepath.Join(artifactDir, MemberManifestsDir, slug)
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			return err
+		}
+		if err := os.WriteFile(filepath.Join(dir, "manifest.json"), raw, 0o644); err != nil {
+			return err
+		}
+	}
+	return nil
 }

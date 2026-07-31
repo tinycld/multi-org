@@ -124,6 +124,9 @@ func buildCmd(req SpawnRequest, log *slog.Logger) *exec.Cmd {
 	if req.MXSocketPath != "" {
 		args = append(args, "--mx-socket", req.MXSocketPath)
 	}
+	if req.ControlSocketPath != "" {
+		args = append(args, "--control-socket", req.ControlSocketPath)
+	}
 	if req.ConfinePackages {
 		args = append(args, "--confine-packages", req.PackagesDir)
 	}

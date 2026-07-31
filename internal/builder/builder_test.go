@@ -2,6 +2,7 @@ package builder
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -188,6 +189,26 @@ func TestBuild_ProducesCommittedArtifact(t *testing.T) {
 	}
 	if res.RecipeHash != want {
 		t.Fatalf("RecipeHash = %q, want %q", res.RecipeHash, want)
+	}
+
+	// Each feature member's evaluated manifest is staged parent-side into
+	// manifests/<slug>/manifest.json; the base ships none.
+	raw, err := os.ReadFile(filepath.Join(res.Dir, MemberManifestsDir, "mail", "manifest.json"))
+	if err != nil {
+		t.Fatalf("staged mail manifest: %v", err)
+	}
+	var mf struct {
+		Slug         string            `json:"slug"`
+		PeerVersions map[string]string `json:"peerVersions"`
+	}
+	if err := json.Unmarshal(raw, &mf); err != nil {
+		t.Fatal(err)
+	}
+	if mf.Slug != "mail" || mf.PeerVersions["@tinycld/core"] == "" {
+		t.Fatalf("staged mail manifest = %s", raw)
+	}
+	if _, err := os.Stat(filepath.Join(res.Dir, MemberManifestsDir, "tinycld")); !os.IsNotExist(err) {
+		t.Fatalf("base member staged a manifest (err=%v)", err)
 	}
 }
 

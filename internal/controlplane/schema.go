@@ -56,7 +56,90 @@ func controlPlaneMigrations() core.MigrationsList {
 			return txApp.Delete(c)
 		},
 	})
+	// Build-artifact backing (design §7 step 3): orgs point at a committed
+	// recipe, deployments carry outcome, and the operator-editable default
+	// package set (D7) gets a home. Separate migration for the same
+	// upgrade-in-place reason as above.
+	list.Add(&core.Migration{
+		File: "1900000002_org_builds.go",
+		Up:   addBuildFields,
+		Down: func(txApp core.App) error {
+			if c, err := txApp.FindCollectionByNameOrId("control_settings"); err == nil {
+				if err := txApp.Delete(c); err != nil {
+					return err
+				}
+			}
+			if orgs, err := txApp.FindCollectionByNameOrId("orgs"); err == nil {
+				orgs.Fields.RemoveByName("recipe_hash")
+				orgs.Fields.RemoveByName("prev_recipe_hash")
+				if err := txApp.Save(orgs); err != nil {
+					return err
+				}
+			}
+			if deps, err := txApp.FindCollectionByNameOrId("deployments"); err == nil {
+				for _, name := range []string{"recipe_hash", "status", "error", "job_id"} {
+					deps.Fields.RemoveByName(name)
+				}
+				if err := txApp.Save(deps); err != nil {
+					return err
+				}
+			}
+			return nil
+		},
+	})
 	return list
+}
+
+// addBuildFields extends orgs and deployments for artifact-backed deploys and
+// creates the control_settings singleton.
+//
+//   - orgs.recipe_hash: the committed build the org boots from ("" = legacy
+//     store-materialized org). orgs.prev_recipe_hash: the revert target — kept
+//     after a successful deploy too, because GC liveness counts it (design D4:
+//     "plus each org's previous build").
+//   - deployments gains recipe_hash, a status lifecycle
+//     (proposed → committed | reverted, failed for builds that never repointed;
+//     "" on legacy rows means committed), the failure reason, and the
+//     tenant-minted job_id that ties an outcome back to the pkg_install_log
+//     row the org's Packages UI polls.
+func addBuildFields(txApp core.App) error {
+	orgs, err := txApp.FindCollectionByNameOrId("orgs")
+	if err != nil {
+		return err
+	}
+	orgs.Fields.Add(&core.TextField{Name: "recipe_hash"})
+	orgs.Fields.Add(&core.TextField{Name: "prev_recipe_hash"})
+	if err := txApp.Save(orgs); err != nil {
+		return err
+	}
+
+	deps, err := txApp.FindCollectionByNameOrId("deployments")
+	if err != nil {
+		return err
+	}
+	deps.Fields.Add(&core.TextField{Name: "recipe_hash"})
+	deps.Fields.Add(&core.SelectField{Name: "status", Values: []string{"proposed", "committed", "reverted", "failed"}, MaxSelect: 1})
+	deps.Fields.Add(&core.TextField{Name: "error"})
+	deps.Fields.Add(&core.TextField{Name: "job_id"})
+	if err := txApp.Save(deps); err != nil {
+		return err
+	}
+
+	return createControlSettings(txApp)
+}
+
+// createControlSettings is the control plane's one-row settings collection.
+// All rules nil (superuser-only): the default set is the operator's, same
+// trust altitude as the storage ceiling. The single row is created lazily by
+// settingsRecord — a fresh collection with zero rows means zero defaults.
+func createControlSettings(app core.App) error {
+	c := core.NewBaseCollection("control_settings")
+	// default_lockfile is the package set CreateOrg copies when the caller
+	// passes none (design D7). Editing it affects NEW orgs only — an org owns
+	// its lockfile from the moment it is copied.
+	c.Fields.Add(&core.JSONField{Name: "default_lockfile"})
+	c.Fields.Add(&core.AutodateField{Name: "updated", OnCreate: true, OnUpdate: true})
+	return app.Save(c)
 }
 
 // RunSchema applies the control-plane schema against a single app, recording it

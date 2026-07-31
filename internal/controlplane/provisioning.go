@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/base64"
 	"fmt"
+	"log/slog"
+	"net/http"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -12,6 +14,8 @@ import (
 	"github.com/pocketbase/pocketbase/apis"
 	"github.com/pocketbase/pocketbase/core"
 
+	"tinycld.org/core/pkgbuild"
+	"tinycld.org/multi-org/internal/builder"
 	"tinycld.org/multi-org/internal/lockfile"
 	"tinycld.org/multi-org/internal/materialize"
 	"tinycld.org/multi-org/internal/store"
@@ -37,6 +41,11 @@ type Provisioner struct {
 	store  *store.PackageStore
 	evict  EvictFunc
 	verify VerifyFunc
+
+	// deployer executes artifact-backed provisioning and the D6 deploy
+	// protocol. Nil until EnableBuilds — a router without a builder keeps the
+	// legacy store path only.
+	deployer *Deployer
 }
 
 // NewProvisioner builds a Provisioner. verify may be nil, in which case
@@ -45,6 +54,27 @@ type Provisioner struct {
 // a 502 on first request, so production wiring should always pass one.
 func NewProvisioner(app core.App, root string, s *store.PackageStore, evict EvictFunc, verify VerifyFunc) *Provisioner {
 	return &Provisioner{app: app, root: root, store: s, evict: evict, verify: verify}
+}
+
+// EnableBuilds attaches the trusted builder: CreateOrg and Deploy gain the
+// artifact path for base-bearing lockfiles, and ControlHandler starts serving
+// the per-org deploy protocol.
+func (p *Provisioner) EnableBuilds(b *builder.Builder, log *slog.Logger) {
+	p.deployer = newDeployer(p.app, p.root, b, p.evict, p.verify, log)
+}
+
+// Deployer exposes the deploy orchestrator (nil before EnableBuilds) — the
+// GC sweep reads its liveness policy.
+func (p *Provisioner) Deployer() *Deployer { return p.deployer }
+
+// ControlHandler is the orgmanager.Config.Control hook: the per-org control
+// socket surface. Nil when builds are not enabled, which keeps the manager
+// from binding control sockets that could accept nothing.
+func (p *Provisioner) ControlHandler() func(slug string) http.Handler {
+	if p.deployer == nil {
+		return nil
+	}
+	return p.deployer.Handler
 }
 
 var slugRe = regexp.MustCompile(`^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$`)
@@ -74,6 +104,17 @@ func (p *Provisioner) CreateOrg(slug, displayName string, lock map[string]string
 		return nil, fmt.Errorf("org %q already exists", slug)
 	}
 
+	// D7: no explicit lockfile ⇒ copy the control-plane template. The org
+	// owns the copy from this moment — later template edits affect new orgs
+	// only. An explicit empty map remains "zero packages".
+	if lock == nil {
+		var err error
+		lock, err = DefaultLockfile(p.app)
+		if err != nil {
+			return nil, fmt.Errorf("default lockfile: %w", err)
+		}
+	}
+
 	orgDir := filepath.Join(p.root, "pb_orgs", slug)
 	for _, sub := range []string{"pb_data", "pb_hooks", "pb_public", "pb_migrations"} {
 		if err := os.MkdirAll(filepath.Join(orgDir, sub), 0o755); err != nil {
@@ -85,19 +126,38 @@ func (p *Provisioner) CreateOrg(slug, displayName string, lock map[string]string
 	if err != nil {
 		return nil, fmt.Errorf("marshal lockfile: %w", err)
 	}
-	lf, err := lockfile.Parse(lfBytes)
-	if err != nil {
-		return nil, fmt.Errorf("parse lockfile: %w", err)
-	}
-	resolved, err := lf.Resolve(p.store)
-	if err != nil {
-		return nil, fmt.Errorf("resolve lockfile: %w", err)
-	}
-	if err := CheckPeerVersions(resolved); err != nil {
-		return nil, fmt.Errorf("lockfile compatibility: %w", err)
-	}
-	if err := materialize.Materialize(orgDir, resolved); err != nil {
-		return nil, fmt.Errorf("materialize: %w", err)
+
+	// A base-bearing set is built into a shared artifact (a cache hit for the
+	// default set — provisioning then costs seconds, D4); the org's live
+	// trees come from the artifact at load, so nothing is materialized here.
+	// A store set keeps the legacy resolve/materialize path.
+	recipeHash := ""
+	if IsArtifactSet(lock) {
+		if p.deployer == nil {
+			return nil, fmt.Errorf("lockfile includes the app shell (%q) but no builder is configured (MT_SCAFFOLD_ROOT)", pkgbuild.BaseMemberSlug)
+		}
+		res, err := p.deployer.BuildSet(context.Background(), lock)
+		if err != nil {
+			return nil, fmt.Errorf("build package set: %w", err)
+		}
+		recipeHash = res.RecipeHash
+		p.deployer.trackHash(recipeHash)
+		defer p.deployer.untrackHash(recipeHash)
+	} else {
+		lf, err := lockfile.Parse(lfBytes)
+		if err != nil {
+			return nil, fmt.Errorf("parse lockfile: %w", err)
+		}
+		resolved, err := lf.Resolve(p.store)
+		if err != nil {
+			return nil, fmt.Errorf("resolve lockfile: %w", err)
+		}
+		if err := CheckPeerVersions(resolved); err != nil {
+			return nil, fmt.Errorf("lockfile compatibility: %w", err)
+		}
+		if err := materialize.Materialize(orgDir, resolved); err != nil {
+			return nil, fmt.Errorf("materialize: %w", err)
+		}
 	}
 
 	rec := existing
@@ -109,6 +169,7 @@ func (p *Provisioner) CreateOrg(slug, displayName string, lock map[string]string
 	rec.Set("status", "provisioning")
 	rec.Set("data_dir", filepath.Join("pb_orgs", slug))
 	rec.Set("lockfile", string(lfBytes))
+	rec.Set("recipe_hash", recipeHash)
 	if err := p.app.Save(rec); err != nil {
 		return nil, fmt.Errorf("save org record: %w", err)
 	}
@@ -267,7 +328,52 @@ func (p *Provisioner) RegisterRoutes() {
 			if err := re.BindBody(&body); err != nil {
 				return re.BadRequestError("invalid body", err)
 			}
-			if err := p.Deploy(re.Request.PathValue("slug"), body.Lockfile); err != nil {
+			slug := re.Request.PathValue("slug")
+			// A base-bearing set deploys through the D6 orchestrator (build →
+			// repoint → respawn with commit/revert); a store set keeps the
+			// legacy rematerialize path until step 5 removes it.
+			if IsArtifactSet(body.Lockfile) && p.deployer != nil {
+				recipeHash, err := p.deployer.Deploy(context.Background(), slug, body.Lockfile, "")
+				if err != nil {
+					return re.BadRequestError(err.Error(), err)
+				}
+				return re.JSON(202, map[string]any{"recipeHash": recipeHash})
+			}
+			if err := p.Deploy(slug, body.Lockfile); err != nil {
+				return re.BadRequestError(err.Error(), err)
+			}
+			return re.NoContent(204)
+		}).Bind(apis.RequireSuperuserAuth())
+
+		// The D7 template: the package set new orgs copy when POST /api/orgs
+		// carries no lockfile. Operator-owned, superuser-only, affects NEW
+		// orgs only.
+		g.GET("/settings/default-lockfile", func(re *core.RequestEvent) error {
+			lock, err := DefaultLockfile(p.app)
+			if err != nil {
+				return re.InternalServerError(err.Error(), err)
+			}
+			if lock == nil {
+				lock = map[string]string{}
+			}
+			return re.JSON(200, map[string]any{"lockfile": lock})
+		}).Bind(apis.RequireSuperuserAuth())
+
+		g.PUT("/settings/default-lockfile", func(re *core.RequestEvent) error {
+			var body struct {
+				Lockfile map[string]string `json:"lockfile"`
+			}
+			if err := re.BindBody(&body); err != nil {
+				return re.BadRequestError("invalid body", err)
+			}
+			// Validate the entries now — a template that cannot build should
+			// fail the operator saving it, not the next org's provisioning.
+			if len(body.Lockfile) > 0 {
+				if _, err := refsFor(body.Lockfile); err != nil {
+					return re.BadRequestError(err.Error(), err)
+				}
+			}
+			if err := SetDefaultLockfile(p.app, body.Lockfile); err != nil {
 				return re.BadRequestError(err.Error(), err)
 			}
 			return re.NoContent(204)

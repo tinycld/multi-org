@@ -85,7 +85,7 @@ func TestConfinementBuilderJob_MemberTreesReadableByJobUID(t *testing.T) {
 	}
 
 	for path, wantMode := range map[string]os.FileMode{
-		memberDir: 0o755,
+		memberDir:                                0o755,
 		filepath.Join(memberDir, "package.json"): 0o644,
 	} {
 		st, err := os.Stat(path)

@@ -39,6 +39,10 @@ type OrgInstance struct {
 	mailSocks    MailSockets
 	mailSockRefs []sockRef
 
+	// ctl is the router-bound control socket server (nil when the manager
+	// wires no Control handler). Torn down with the instance.
+	ctl *controlServer
+
 	proc    Process
 	proxy   *httputil.ReverseProxy
 	handler http.Handler // proxy wrapped in the in-flight tracking middleware
@@ -315,6 +319,7 @@ func (i *OrgInstance) shutdown(drain, kill time.Duration) {
 				i.log.Warn("could not remove tenant mail socket", "slug", i.slug, "path", ref.path, "error", err)
 			}
 		}
+		i.ctl.close(i.log, i.slug)
 	})
 }
 

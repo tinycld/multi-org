@@ -43,10 +43,10 @@ func TestStore_RejectsMalformedHashes(t *testing.T) {
 	s := NewStore(t.TempDir())
 	for _, hash := range []string{
 		"",
-		testHex,                    // missing prefix
-		"sha256:short",             // wrong length
-		"sha256:../../etc/passwd",  // traversal
-		"sha512:" + testHex,        // wrong algorithm
+		testHex,                              // missing prefix
+		"sha256:short",                       // wrong length
+		"sha256:../../etc/passwd",            // traversal
+		"sha512:" + testHex,                  // wrong algorithm
 		"sha256:" + strings.ToUpper(testHex), // not lowercase hex
 	} {
 		if _, err := s.Dir(hash); err == nil {

@@ -39,6 +39,7 @@ type resolvedInput struct {
 	Members      []pkgbuild.ResolvedMember
 	PeerVersions map[string]map[string]string // by slug
 	Dirs         map[string]string            // slug → extracted package dir
+	Manifests    map[string]json.RawMessage   // slug → evaluated manifest JSON (base has none)
 	Overrides    map[string]string
 	RecipeHash   string
 
@@ -114,6 +115,7 @@ func (b *Builder) resolve(refs []PackageRef) (*resolvedInput, error) {
 	res := &resolvedInput{
 		PeerVersions: map[string]map[string]string{},
 		Dirs:         map[string]string{},
+		Manifests:    map[string]json.RawMessage{},
 		fetchRoot:    fetchRoot,
 	}
 	ok := false
@@ -139,7 +141,7 @@ func (b *Builder) resolve(refs []PackageRef) (*resolvedInput, error) {
 		if err != nil {
 			return nil, fmt.Errorf("resolve %s: hash tarball: %w", ref.Spec, err)
 		}
-		member, peers, err := b.identifyMember(extracted)
+		member, peers, manifestJSON, err := b.identifyMember(extracted)
 		if err != nil {
 			return nil, fmt.Errorf("resolve %s: %w", ref.Spec, err)
 		}
@@ -148,6 +150,9 @@ func (b *Builder) resolve(refs []PackageRef) (*resolvedInput, error) {
 			return nil, fmt.Errorf("resolve: two specs resolve to member %q", member.Slug)
 		}
 		res.Dirs[member.Slug] = extracted
+		if manifestJSON != nil {
+			res.Manifests[member.Slug] = manifestJSON
+		}
 		res.Members = append(res.Members, member)
 		if len(peers) > 0 {
 			res.PeerVersions[member.Slug] = peers
@@ -194,37 +199,41 @@ func (b *Builder) validateSpec(spec string) error {
 
 // identifyMember establishes one fetched package's identity. A package with a
 // manifest source is a feature member — its facts come from the evaluated
-// manifest, mirroring pkgbuild's readBuildMembers. A package without one is
-// the base (app shell) iff it nests core/package.json named @tinycld/core;
-// its version is CORE's, recorded under the name peer ranges constrain.
-func (b *Builder) identifyMember(dir string) (pkgbuild.ResolvedMember, map[string]string, error) {
+// manifest, mirroring pkgbuild's readBuildMembers — and the evaluated JSON is
+// returned whole, so the artifact can carry it for the router's capability
+// wiring (manifests/<slug>/manifest.json). A package without one is the base
+// (app shell) iff it nests core/package.json named @tinycld/core; its version
+// is CORE's, recorded under the name peer ranges constrain, and it has no
+// manifest JSON.
+func (b *Builder) identifyMember(dir string) (pkgbuild.ResolvedMember, map[string]string, json.RawMessage, error) {
 	src, name := readManifestSource(dir)
 	if src == nil {
-		return identifyBase(dir)
+		member, peers, err := identifyBase(dir)
+		return member, peers, nil, err
 	}
 	data, err := b.cfg.EvalManifest(string(src), name)
 	if err != nil {
-		return pkgbuild.ResolvedMember{}, nil, fmt.Errorf("evaluate %s: %w", name, err)
+		return pkgbuild.ResolvedMember{}, nil, nil, fmt.Errorf("evaluate %s: %w", name, err)
 	}
 	var facts manifestFacts
 	if err := json.Unmarshal(data, &facts); err != nil {
-		return pkgbuild.ResolvedMember{}, nil, fmt.Errorf("parse evaluated %s: %w", name, err)
+		return pkgbuild.ResolvedMember{}, nil, nil, fmt.Errorf("parse evaluated %s: %w", name, err)
 	}
 	switch {
 	case facts.Slug == "":
-		return pkgbuild.ResolvedMember{}, nil, fmt.Errorf("%s declares no slug", name)
+		return pkgbuild.ResolvedMember{}, nil, nil, fmt.Errorf("%s declares no slug", name)
 	case !pkgbuild.SlugPattern.MatchString(facts.Slug):
-		return pkgbuild.ResolvedMember{}, nil, fmt.Errorf("%s declares invalid slug %q", name, facts.Slug)
+		return pkgbuild.ResolvedMember{}, nil, nil, fmt.Errorf("%s declares invalid slug %q", name, facts.Slug)
 	case facts.Slug == pkgbuild.BaseMemberSlug:
-		return pkgbuild.ResolvedMember{}, nil, fmt.Errorf("%s claims the reserved base slug %q", name, pkgbuild.BaseMemberSlug)
+		return pkgbuild.ResolvedMember{}, nil, nil, fmt.Errorf("%s claims the reserved base slug %q", name, pkgbuild.BaseMemberSlug)
 	case facts.Name == "" || facts.Version == "":
-		return pkgbuild.ResolvedMember{}, nil, fmt.Errorf("%s declares no name/version", name)
+		return pkgbuild.ResolvedMember{}, nil, nil, fmt.Errorf("%s declares no name/version", name)
 	}
 	return pkgbuild.ResolvedMember{
 		Slug:    facts.Slug,
 		Name:    facts.Name,
 		Version: facts.Version,
-	}, facts.PeerVersions, nil
+	}, facts.PeerVersions, json.RawMessage(data), nil
 }
 
 func identifyBase(dir string) (pkgbuild.ResolvedMember, map[string]string, error) {

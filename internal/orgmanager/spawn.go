@@ -38,6 +38,13 @@ type SpawnRequest struct {
 	SMTPSocketPath string
 	MXSocketPath   string
 
+	// ControlSocketPath is the ROUTER-bound control socket the tenant dials
+	// to propose deploys (design D1). Already bound and serving by the time
+	// the child starts; passed so the tenant knows where to dial. Empty when
+	// the manager wires no Control handler — the tenant then has no deploy
+	// channel.
+	ControlSocketPath string
+
 	// CardDAVConfig is the path to the JSON source list the child registers
 	// CardDAV routes from, or "" when the org's packages contribute none.
 	CardDAVConfig string

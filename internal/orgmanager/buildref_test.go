@@ -122,21 +122,10 @@ func TestGet_ArtifactBackedOrgSpawnsFromBuild(t *testing.T) {
 		t.Fatalf("pb_public serves %q, want the artifact's tree", idx)
 	}
 
-	// The package-slug capability resolved through the artifact's staged
-	// manifest — and "mail" present means the mail sockets were assigned.
-	var pkgs struct {
-		Slugs []string `json:"slugs"`
-	}
-	raw, err := os.ReadFile(req.PackagesConfig)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := json.Unmarshal(raw, &pkgs); err != nil {
-		t.Fatal(err)
-	}
-	if len(pkgs.Slugs) != 1 || pkgs.Slugs[0] != "mail" {
-		t.Fatalf("packages.json slugs = %v, want [mail]", pkgs.Slugs)
-	}
+	// The resolved package slugs (from the artifact's staged manifest) drive
+	// the mail-socket decision: "mail" present means the mail sockets were
+	// assigned. This is now the slugs' only consumer — the tenant needs no
+	// packages.json, since its artifact links exactly its set.
 	if req.IMAPSocketPath == "" {
 		t.Fatal("mail member did not produce mail sockets")
 	}

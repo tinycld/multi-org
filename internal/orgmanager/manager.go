@@ -168,13 +168,13 @@ type Config struct {
 	QuotaSources func(resolved []lockfile.ResolvedPackage) ([]quota.Source, error)
 
 	// PackageSlugs returns the manifest slugs of an org's resolved package
-	// set. Written to .runtime/packages.json and surfaced to the tenant as
-	// tenantmain.Extras.PackageSlugs. The dual-mode binary links exactly the
-	// org's package set and registers its feature Go unconditionally (the
-	// artifact is the gate), so this is no longer a registration filter; the
-	// tenant uses it as the authoritative slug set for its package-registry
-	// reconcile. Host-side for the same reason as the DAV sources: the host
-	// already holds the resolved list, and the child must not walk the store.
+	// set. Used only to decide mail-socket assignment (an org gets IMAP/SMTP/MX
+	// sockets iff its set includes "mail"). The dual-mode binary links exactly
+	// the org's package set and registers its feature Go unconditionally, and a
+	// tenant reconciles its package registry from the artifact's own
+	// recipe.json/manifests — so the resolved slug list no longer needs to
+	// reach the tenant at all. Host-side because only the host holds the
+	// resolved list.
 	PackageSlugs func(resolved []lockfile.ResolvedPackage) ([]string, error)
 
 	// Forwarded controls how each tenant's proxy constructs the
@@ -434,14 +434,12 @@ func (m *OrgManager) load(ctx context.Context, slug string) (*OrgInstance, error
 		return nil, fmt.Errorf("quota config %s: %w", slug, err)
 	}
 
+	// The resolved slugs are needed only for the mail-socket decision now: a
+	// per-org artifact links exactly its package set, so the tenant needs no
+	// packages.json to gate feature Go (the artifact is the gate).
 	slugs, err := m.resolvedSlugs(resolved)
 	if err != nil {
 		return nil, fmt.Errorf("resolve package slugs %s: %w", slug, err)
-	}
-
-	packagesConfig, err := m.writePackagesConfig(orgDir, slugs, m.cfg.PackageSlugs != nil)
-	if err != nil {
-		return nil, fmt.Errorf("packages config %s: %w", slug, err)
 	}
 
 	appConfig, err := m.writeAppConfig(orgDir, slug, rec)
@@ -450,12 +448,11 @@ func (m *OrgManager) load(ctx context.Context, slug string) (*OrgInstance, error
 	}
 
 	inst, err := m.spawn(ctx, slug, orgDir, src, runtimeConfigs{
-		cardDAV:  davConfig,
-		calDAV:   caldavConfig,
-		webDAV:   webdavConfig,
-		quota:    quotaConfig,
-		packages: packagesConfig,
-		app:      appConfig,
+		cardDAV: davConfig,
+		calDAV:  caldavConfig,
+		webDAV:  webdavConfig,
+		quota:   quotaConfig,
+		app:     appConfig,
 	}, slices.Contains(slugs, "mail"))
 	if err != nil {
 		m.noteCrash(slug)
@@ -492,12 +489,11 @@ func (m *OrgManager) load(ctx context.Context, slug string) (*OrgInstance, error
 // so a mix-up at the call site would hand a tenant the wrong protocol's config
 // and compile cleanly.
 type runtimeConfigs struct {
-	cardDAV  string
-	calDAV   string
-	webDAV   string
-	quota    string
-	packages string
-	app      string
+	cardDAV string
+	calDAV  string
+	webDAV  string
+	quota   string
+	app     string
 }
 
 // bootSource is what a load resolved to boot from: the tenant executable and
@@ -559,7 +555,6 @@ func (m *OrgManager) spawn(ctx context.Context, slug, orgDir string, src bootSou
 		CalDAVConfig:      cfgs.calDAV,
 		WebDAVConfig:      cfgs.webDAV,
 		QuotaConfig:       cfgs.quota,
-		PackagesConfig:    cfgs.packages,
 		AppConfig:         cfgs.app,
 		HooksPool:         m.cfg.HooksPool,
 		Drain:             drainTimeout,
@@ -1115,36 +1110,15 @@ func (m *OrgManager) writeQuotaConfig(orgDir string, rec OrgRecord, resolved []l
 type quotaConfigFile = tenantcfg.QuotaConfig
 
 // resolvedSlugs resolves the org's package slugs through the configured hook.
-// Nil hook ⇒ nil slugs (the host manages no package set; the child registers
-// no feature Go and gets no mail sockets).
+// Nil hook ⇒ nil slugs. Used only for the mail-socket decision: an org's
+// artifact links exactly its package set, so feature Go needs no runtime slug
+// gate (the artifact is the gate).
 func (m *OrgManager) resolvedSlugs(resolved []lockfile.ResolvedPackage) ([]string, error) {
 	if m.cfg.PackageSlugs == nil {
 		return nil, nil
 	}
 	return m.cfg.PackageSlugs(resolved)
 }
-
-// writePackagesConfig materializes the org's resolved package slugs where the
-// tenant can read them. Like quota.json it is ALWAYS written when the hook is
-// wired — an empty slug list must be indistinguishable from "no packages
-// installed" (register no feature Go), never from "config missing". `wired`
-// carries whether the PackageSlugs hook exists at all (the caller resolves
-// the slugs once, for this file AND the mail-socket decision).
-func (m *OrgManager) writePackagesConfig(orgDir string, slugs []string, wired bool) (string, error) {
-	if !wired {
-		return "", nil
-	}
-
-	body, err := json.Marshal(packagesConfigFile{Slugs: slugs})
-	if err != nil {
-		return "", err
-	}
-	return writeRuntimeFile(orgDir, "packages.json", body)
-}
-
-// packagesConfigFile is the wire shape of .runtime/packages.json —
-// tenantcfg's, so this writer and the tenant's loader can never disagree.
-type packagesConfigFile = tenantcfg.PackagesConfig
 
 // writeAppConfig materializes app-level runtime config where the tenant can
 // read it: the org's public URL (adopted as Settings().Meta.AppURL — the value

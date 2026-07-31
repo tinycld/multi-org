@@ -57,14 +57,6 @@ type SpawnRequest struct {
 	// QuotaConfig is the path to the org's materialized quota.json, carrying
 	// the storage ceiling the operator assigned.
 	QuotaConfig string
-	// PackagesConfig is the path to the org's materialized packages.json — the
-	// resolved package slugs, surfaced to the child as tenantmain.Extras.
-	// PackageSlugs. The dual-mode binary registers its linked feature Go
-	// unconditionally (the artifact is the gate), so this no longer gates
-	// registration; it remains the org's authoritative slug set for the
-	// tenant's package-registry reconcile. Empty when the host wires no
-	// PackageSlugs hook.
-	PackagesConfig string
 	// AppConfig is the path to the org's materialized app.json, carrying the
 	// public URL the tenant adopts as Settings().Meta.AppURL at boot. Empty
 	// when the host wires no OrgURL hook (the tenant then keeps its stored

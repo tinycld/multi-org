@@ -109,9 +109,6 @@ func buildCmd(req SpawnRequest, log *slog.Logger) *exec.Cmd {
 	if req.QuotaConfig != "" {
 		args = append(args, "--quota-config", req.QuotaConfig)
 	}
-	if req.PackagesConfig != "" {
-		args = append(args, "--packages-config", req.PackagesConfig)
-	}
 	if req.AppConfig != "" {
 		args = append(args, "--app-config", req.AppConfig)
 	}

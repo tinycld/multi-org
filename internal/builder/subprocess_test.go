@@ -68,7 +68,20 @@ func (s *recordingSink) Logf(format string, args ...any) {
 
 func helperSpec(t *testing.T) JobSpec {
 	t.Helper()
-	jobDir := filepath.Join(t.TempDir(), "job")
+	// t.TempDir() is 0700 and, under `go test` as root, sits beneath a
+	// likewise-private parent. A confined job runs as an unprivileged builder
+	// uid and cannot traverse either, so it fails to create its own build dir.
+	// Widen traversal on the whole chain — the dirs hold only fixture data.
+	base := t.TempDir()
+	for p := base; p != "/" && p != "."; p = filepath.Dir(p) {
+		if err := os.Chmod(p, 0o711); err != nil {
+			break // outside our temp root; nothing further to widen
+		}
+	}
+	jobDir := filepath.Join(base, "job")
+	if err := os.MkdirAll(jobDir, 0o777); err != nil {
+		t.Fatal(err)
+	}
 	return JobSpec{
 		BuildID:     "recipe-test",
 		BuildDir:    filepath.Join(jobDir, "build"),
@@ -78,8 +91,19 @@ func helperSpec(t *testing.T) JobSpec {
 
 func helperRunner(t *testing.T, mode string) SubprocessRunner {
 	t.Helper()
+	// The job re-execs this test binary. Under `sudo go test` it lives in
+	// root's private build cache (0700 dirs, 0700 file), which an
+	// unprivileged builder uid cannot exec — so make the binary and its
+	// parent chain traversable. Best effort: unconfined runs never need it.
+	self := os.Args[0]
+	_ = os.Chmod(self, 0o755)
+	for p := filepath.Dir(self); p != "/" && p != "."; p = filepath.Dir(p) {
+		if err := os.Chmod(p, 0o711); err != nil {
+			break
+		}
+	}
 	return SubprocessRunner{
-		Argv:     []string{os.Args[0], "-test.run=TestMain"},
+		Argv:     []string{self, "-test.run=TestMain"},
 		extraEnv: []string{"BUILDER_JOB_HELPER=" + mode},
 	}
 }

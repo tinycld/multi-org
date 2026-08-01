@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"sync"
 	"testing"
 )
@@ -51,6 +52,13 @@ func BuildTenantBinary(t *testing.T) string {
 		// and feature members; `go build -o <out> .` builds that package's main.
 		cmd := exec.Command("go", "build", "-o", out, ".")
 		cmd.Dir = serverDir
+		// Strip -mod from any inherited GOFLAGS. serverDir is in workspace
+		// mode (its go.work is what resolves core + the feature members), and
+		// Go rejects -mod=mod there outright — so a caller that legitimately
+		// sets it for THIS module (the CI confinement step runs as root with
+		// GOFLAGS=-mod=mod against a read-only module cache) would otherwise
+		// break the nested build it has no say over.
+		cmd.Env = append(os.Environ(), "GOFLAGS="+stripModFlag(os.Getenv("GOFLAGS")))
 		if combined, err := cmd.CombinedOutput(); err != nil {
 			tenantBinErr = fmt.Errorf("build app-shell tenant binary in %s: %v\n%s", serverDir, err, combined)
 			return
@@ -72,6 +80,19 @@ func BuildTenantBinary(t *testing.T) string {
 		t.Fatal(tenantBinErr)
 	}
 	return tenantBinPath
+}
+
+// stripModFlag removes any -mod=... entry from a GOFLAGS value, preserving the
+// rest (GOMODCACHE-adjacent flags, -buildvcs, …). GOFLAGS is space-separated.
+func stripModFlag(goflags string) string {
+	kept := make([]string, 0, 4)
+	for _, f := range strings.Fields(goflags) {
+		if f == "-mod" || strings.HasPrefix(f, "-mod=") {
+			continue
+		}
+		kept = append(kept, f)
+	}
+	return strings.Join(kept, " ")
 }
 
 // appShellServerDir resolves the sibling app-shell server checkout

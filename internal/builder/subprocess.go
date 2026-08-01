@@ -148,13 +148,24 @@ func (r SubprocessRunner) Run(ctx context.Context, spec JobSpec, sink pkgbuild.P
 	// ROUTER's PATH — operator-controlled either way. Everything else is
 	// scrubbed; HOME doubles as npm's cache root so per-job state dies with
 	// the job dir.
+	jobTmp := filepath.Join(jobDir, "tmp")
 	cmd.Env = append([]string{
 		"HOME=" + jobDir,
-		"TMPDIR=" + filepath.Join(jobDir, "tmp"),
+		"TMPDIR=" + jobTmp,
 		"PATH=" + os.Getenv("PATH"),
 	}, r.extraEnv...)
-	if err := os.MkdirAll(filepath.Join(jobDir, "tmp"), 0o755); err != nil {
+	if err := os.MkdirAll(jobTmp, 0o755); err != nil {
 		return err
+	}
+	// Unix sockets created under TMPDIR (tsx's IPC pipe during the workspace
+	// postinstall, most notably) are bound by sun_path (~104 bytes on macOS,
+	// 108 on Linux). A deep builder root pushes the job TMPDIR past it and the
+	// build dies with an obscure `listen EINVAL` inside pnpm install — warn
+	// with the real cause so the operator shortens MT_ROOT instead of chasing
+	// a phantom pnpm failure.
+	if len(jobTmp) > 75 {
+		r.log().Warn("build job TMPDIR is long; tools creating unix sockets there may fail with listen EINVAL (sun_path limit) — use a shorter builder root",
+			"tmpdir", jobTmp, "len", len(jobTmp))
 	}
 	cmd.Dir = jobDir
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}

@@ -37,6 +37,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"sync"
@@ -160,6 +161,12 @@ func New(cfg Config) (*Builder, error) {
 // dir through it; GC sweeps it).
 func (b *Builder) Store() *Store { return b.store }
 
+// NpmRegistry reports the configured registry override ("" = npm's default).
+// The control socket's /v1/versions discovers versions through the same
+// registry member fetches resolve from, so a registry-fronted deployment
+// (the hosted e2e, an air-gapped mirror) sees a consistent package universe.
+func (b *Builder) NpmRegistry() string { return b.cfg.NpmRegistry }
+
 // Result is a completed (or cache-satisfied) build.
 type Result struct {
 	RecipeHash string
@@ -262,7 +269,9 @@ func (b *Builder) buildOne(ctx context.Context, refs []PackageRef, sink pkgbuild
 	if err != nil {
 		return Result{}, err
 	}
-	_ = os.RemoveAll(jobDir)
+	if err := removeJobDir(jobDir); err != nil {
+		sink.Logf("could not remove finished job dir %s: %v", jobDir, err)
+	}
 	result.Dir = dir
 	sink.Progress("Build complete", 100, res.RecipeHash)
 	return result, nil
@@ -270,6 +279,26 @@ func (b *Builder) buildOne(ctx context.Context, refs []PackageRef, sink pkgbuild
 
 func (b *Builder) workDir() string {
 	return filepath.Join(b.cfg.Root, "builder")
+}
+
+// removeJobDir deletes a finished job's work tree. The job runs with
+// HOME=jobDir, so its Go module cache lands under it — and the go tool writes
+// module dirs read-only, which makes a plain RemoveAll fail with EPERM on
+// every module entry when the router doesn't run as root (macOS dev hosts),
+// silently leaking a multi-GB tree per build. Unlinking needs write permission
+// on the PARENT directory, so restoring owner-write on directories is
+// sufficient; file modes are irrelevant to removal.
+func removeJobDir(jobDir string) error {
+	_ = filepath.WalkDir(jobDir, func(path string, d fs.DirEntry, err error) error {
+		if err != nil || !d.IsDir() {
+			return nil
+		}
+		if info, infoErr := d.Info(); infoErr == nil && info.Mode().Perm()&0o200 == 0 {
+			_ = os.Chmod(path, info.Mode().Perm()|0o200)
+		}
+		return nil
+	})
+	return os.RemoveAll(jobDir)
 }
 
 // toolchain returns the recipe toolchain, detecting from PATH once when the

@@ -45,6 +45,8 @@ func (f *fakeArtifactBuilder) Build(_ context.Context, refs []builder.PackageRef
 	return builder.Result{RecipeHash: f.hash, Dir: "/builds/x", Cached: true}, nil
 }
 
+func (f *fakeArtifactBuilder) NpmRegistry() string { return "" }
+
 func (f *fakeArtifactBuilder) ResolveSpec(spec string) (builder.ResolvedSpec, error) {
 	if f.err != nil {
 		return builder.ResolvedSpec{}, f.err
@@ -634,6 +636,23 @@ func TestControlHandler_ReadEndpointsBounded(t *testing.T) {
 	}
 	if throttled == 0 {
 		t.Fatalf("no /v1/resolve call was throttled; the per-org rate limit is not enforced")
+	}
+}
+
+// One legitimate UI interaction is a same-second sequence of read calls (the
+// Packages screen fires a /v1/versions per registry row on mount, and Install
+// fires /v1/resolve right behind them). The token bucket must admit that whole
+// burst — a strict one-per-second floor failed the install's resolve — while
+// still refusing once the burst is exhausted.
+func TestBeginRead_AllowsUIBurstThenThrottles(t *testing.T) {
+	d := newDeployer(nil, "", nil, nil, nil, nil)
+	for i := 0; i < int(d.readBurst); i++ {
+		if err := d.beginRead("acme"); err != nil {
+			t.Fatalf("burst call %d refused: %v", i, err)
+		}
+	}
+	if err := d.beginRead("acme"); err == nil {
+		t.Fatal("burst exhausted but the next call was still admitted; the sustained rate is unbounded")
 	}
 }
 

@@ -233,4 +233,18 @@ func TestControlSocket_NotBoundWhenUnconfined(t *testing.T) {
 	if got := unconfined.lastReq().ControlSocketPath; got != "" {
 		t.Fatalf("unconfined spawner bound a control socket (%q); degraded mode must not accept tenant-proposed deploys", got)
 	}
+
+	// AllowUnconfinedControl (the dev/test override MT_ALLOW_UNCONFINED_CONTROL
+	// wires — the hosted install suite on macOS) re-enables the bind. It must
+	// be an explicit opt-in: the refusal above is the DEFAULT.
+	override := &fakeSpawner{unconfined: true}
+	mgr3 := newArtifactManager(t, override, fakeArtifact(t))
+	mgr3.cfg.Control = controlHandler
+	mgr3.cfg.AllowUnconfinedControl = true
+	if _, err := mgr3.Get(context.Background(), "acme"); err != nil {
+		t.Fatalf("Get(acme) unconfined+override: %v", err)
+	}
+	if override.lastReq().ControlSocketPath == "" {
+		t.Fatal("AllowUnconfinedControl set but no control socket was bound")
+	}
 }

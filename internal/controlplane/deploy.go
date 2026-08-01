@@ -39,6 +39,10 @@ import (
 type ArtifactBuilder interface {
 	Build(ctx context.Context, refs []builder.PackageRef, sink pkgbuild.ProgressSink) (builder.Result, error)
 	ResolveSpec(spec string) (builder.ResolvedSpec, error)
+	// NpmRegistry is the builder's registry override ("" = npm default);
+	// /v1/versions discovers through it so version listings come from the
+	// same universe member fetches resolve against.
+	NpmRegistry() string
 }
 
 type Deployer struct {
@@ -60,16 +64,23 @@ type Deployer struct {
 	last     map[string]time.Time
 	inflight map[string]int // recipe hash → deploys between Build and settle
 
-	// readMin is the per-org floor between accepted /v1/build, /v1/resolve and
-	// /v1/versions calls. These are read-ish (a build is a cache hit or shares
-	// the builder's singleflight; resolve/versions shell out to npm/git), so
-	// they are NOT serialized behind the deploy mutex — doing so would break the
-	// warm-build-while-serving flow (a tenant builds its next set while the org
-	// keeps serving). A short min-interval is enough to stop a tenant hammering
-	// the router's inline toolchain into disk/fd/process exhaustion; the
-	// builder's own MaxConcurrent semaphore caps genuine build concurrency.
-	readMin  time.Duration
-	lastRead map[string]time.Time
+	// readMin is the per-org sustained-rate floor for accepted /v1/build,
+	// /v1/resolve and /v1/versions calls — one refilled token per readMin,
+	// bucketed with readBurst of headroom. These are read-ish (a build is a
+	// cache hit or shares the builder's singleflight; resolve/versions shell
+	// out to npm/git), so they are NOT serialized behind the deploy mutex —
+	// doing so would break the warm-build-while-serving flow (a tenant builds
+	// its next set while the org keeps serving). The sustained rate stops a
+	// tenant hammering the router's inline toolchain into disk/fd/process
+	// exhaustion; the burst exists because ONE legitimate UI interaction is
+	// itself a same-second sequence (the Packages screen's mount fires a
+	// /v1/versions per registry row, and clicking Install fires /v1/resolve
+	// right behind them — a strict 1/s floor failed the install's resolve).
+	// The builder's own MaxConcurrent semaphore caps genuine build concurrency.
+	readMin    time.Duration
+	readBurst  float64
+	readTokens map[string]float64
+	lastRead   map[string]time.Time
 }
 
 // Typed refusals the control-socket handler maps onto status codes.
@@ -99,25 +110,38 @@ func newDeployer(app core.App, root string, b ArtifactBuilder, evict EvictFunc, 
 		log:         log,
 		minInterval: 30 * time.Second,
 		readMin:     time.Second,
+		readBurst:   10,
 		busy:        map[string]bool{},
 		last:        map[string]time.Time{},
 		inflight:    map[string]int{},
+		readTokens:  map[string]float64{},
 		lastRead:    map[string]time.Time{},
 	}
 }
 
 // beginRead throttles the read-ish control endpoints (/v1/build, /v1/resolve,
-// /v1/versions) per-org: at most one accepted call per readMin. Separate from
-// begin (the deploy slot) on purpose — these must NOT serialize behind the
-// deploy mutex, or a tenant warming its next build while serving would deadlock
-// against its own in-flight deploy.
+// /v1/versions) per-org with a token bucket: readBurst tokens of headroom,
+// refilled at one per readMin. Separate from begin (the deploy slot) on
+// purpose — these must NOT serialize behind the deploy mutex, or a tenant
+// warming its next build while serving would deadlock against its own
+// in-flight deploy.
 func (d *Deployer) beginRead(slug string) error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	if since := time.Since(d.lastRead[slug]); since < d.readMin {
+	now := time.Now()
+	tokens := d.readBurst // first sight of an org starts with a full bucket
+	if last, seen := d.lastRead[slug]; seen {
+		tokens = d.readTokens[slug] + now.Sub(last).Seconds()/d.readMin.Seconds()
+		if tokens > d.readBurst {
+			tokens = d.readBurst
+		}
+	}
+	d.lastRead[slug] = now
+	if tokens < 1 {
+		d.readTokens[slug] = tokens
 		return errReadRateLimited
 	}
-	d.lastRead[slug] = time.Now()
+	d.readTokens[slug] = tokens - 1
 	return nil
 }
 
@@ -681,6 +705,16 @@ func (d *Deployer) Handler(slug string) http.Handler {
 		if !ok {
 			return
 		}
+		// A novel build is MINUTES of synchronous work, but the ctl-socket
+		// server's slow-loris write deadline (controlsock.go, 30s) is armed
+		// per-request — by the time the build finishes, the deadline has long
+		// passed and the response write EOFs the tenant mid-install. Extend
+		// this one request's deadline to the build budget AFTER the (bounded,
+		// already-decoded) body is consumed; every other route keeps the tight
+		// default. Mirrors the tenant's own 90-minute build client budget.
+		if err := http.NewResponseController(w).SetWriteDeadline(time.Now().Add(90 * time.Minute)); err != nil {
+			d.log.Warn("could not extend /v1/build write deadline; a long build may EOF the proposer", "slug", slug, "error", err)
+		}
 		// Deliberately not r.Context(): the build is shared via singleflight,
 		// and one proposer hanging up must not cancel it for the org's retry.
 		// The builder's own job timeout bounds it.
@@ -747,7 +781,7 @@ func (d *Deployer) Handler(slug string) http.Handler {
 		if !ok {
 			return
 		}
-		source, versions, fetchErr := pkgbuild.VersionsForSpec(spec)
+		source, versions, fetchErr := pkgbuild.VersionsForSpecVia(spec, d.builds.NpmRegistry())
 		if versions == nil {
 			versions = []string{}
 		}

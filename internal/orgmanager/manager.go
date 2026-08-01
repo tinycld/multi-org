@@ -154,6 +154,16 @@ type Config struct {
 	// socket is bound.
 	Control func(slug string) http.Handler
 
+	// AllowUnconfinedControl binds control sockets even when the spawner does
+	// not confine tenants. DEV/TEST ONLY — never set it in production: without
+	// per-tenant uids every tenant shares the host user, so the 0700
+	// socket-dir identity that authenticates ctl.sock collapses and ANY tenant
+	// can deploy to ANY org (the exact exposure the L2 refusal exists for).
+	// It exists so the hosted install suite can exercise tenant-proposed
+	// deploys on an unconfined dev host (macOS), where tenants are not
+	// isolated from each other anyway.
+	AllowUnconfinedControl bool
+
 	Logger *slog.Logger
 
 	// CardDAVSources returns the CardDAV sources an org's resolved package set
@@ -720,8 +730,12 @@ func (s orgSockets) all() []string {
 // tenant could dial any org's socket and deploy to it. Refusing the bind in
 // that case means degraded mode has no tenant-proposed deploys (L2); the
 // control-plane API's operator-driven deploys are unaffected.
+// AllowUnconfinedControl (dev/test only — see its doc) overrides the refusal.
 func (m *OrgManager) controlEnabled() bool {
-	return m.cfg.Control != nil && m.cfg.Spawner != nil && m.cfg.Spawner.Confines()
+	if m.cfg.Control == nil || m.cfg.Spawner == nil {
+		return false
+	}
+	return m.cfg.Spawner.Confines() || m.cfg.AllowUnconfinedControl
 }
 
 func (m *OrgManager) socketPaths(slug string, withMail bool) (orgSockets, error) {

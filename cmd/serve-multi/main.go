@@ -98,6 +98,16 @@ func run() error {
 			MaxConcurrent: getenvInt("MT_BUILDER_MAX_CONCURRENT", 0),
 			Runner:        runner,
 			EvalManifest:  evalManifest,
+			// Shared pnpm store override (default <root>/builder/pnpm-store).
+			// Pointing it at an existing store makes builds hardlink instead
+			// of re-downloading — the hosted install runner reuses the
+			// developer's own store the same way the builder e2e does.
+			PnpmStoreDir: os.Getenv("MT_BUILDER_PNPM_STORE"),
+			// Registry override for member-spec fetches AND /v1/resolve +
+			// /v1/versions discovery (the build workspace's own pnpm install
+			// keeps normal resolution). Test/e2e + private-mirror seam — the
+			// hosted install runner fronts a local fixture registry with it.
+			NpmRegistry: os.Getenv("MT_NPM_REGISTRY"),
 		})
 		if err != nil {
 			return fmt.Errorf("builder: %w", err)
@@ -182,6 +192,14 @@ func run() error {
 	mgrCfg.ResolveBuild = controlplane.BuildResolver(buildStore, "tinycld")
 	if bld != nil {
 		mgrCfg.Control = prov.ControlHandler()
+	}
+	// DEV/TEST ONLY: bind control sockets even without tenant confinement.
+	// On an unconfined host all tenants share one uid, so any tenant can dial
+	// any org's ctl.sock and deploy to it — the L2 refusal this bypasses.
+	// Exists for the hosted install suite on macOS dev hosts.
+	if os.Getenv("MT_ALLOW_UNCONFINED_CONTROL") == "true" {
+		mgrCfg.AllowUnconfinedControl = true
+		log.Printf("WARNING: MT_ALLOW_UNCONFINED_CONTROL=true — control sockets are bound WITHOUT tenant confinement; any tenant can deploy to any org. Dev/test only, NEVER production.")
 	}
 	mgr = orgmanager.New(mgrCfg)
 	defer mgr.Shutdown()

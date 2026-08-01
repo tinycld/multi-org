@@ -59,6 +59,13 @@ type Deployer struct {
 	// minInterval is the per-org floor between accepted proposals.
 	minInterval time.Duration
 
+	// finishing tracks the detached finish() goroutines. finish outlives the
+	// Deploy call that spawned it (the readiness handshake IS the async tail),
+	// and its last acts are writes to app — so anything that tears the app
+	// down must wait for it first, or those writes hit a closed DB and panic
+	// inside PocketBase's save path. Wait() is that barrier.
+	finishing sync.WaitGroup
+
 	mu       sync.Mutex
 	busy     map[string]bool
 	last     map[string]time.Time
@@ -97,11 +104,36 @@ var (
 // shell plus every shipped feature is well under 256.
 const maxLockfileEntries = 256
 
+// liveDeployers tracks every Deployer built against a given app so a caller
+// tearing that app down can drain the detached finish() goroutines first (see
+// WaitForAppDeploys). Production wires one Deployer per app and never tears an
+// app down mid-process, so this exists for the teardown ordering tests need.
+var (
+	liveDeployersMu sync.Mutex
+	liveDeployers   = map[core.App][]*Deployer{}
+)
+
+// WaitForAppDeploys drains the in-flight deploy tails of every Deployer built
+// against app. Call it before closing/resetting an app: finish() writes rows
+// through app after the evict callback fires, so tearing the app down on the
+// evict signal alone races those writes into a closed database.
+func WaitForAppDeploys(app core.App) {
+	liveDeployersMu.Lock()
+	ds := append([]*Deployer(nil), liveDeployers[app]...)
+	liveDeployersMu.Unlock()
+	for _, d := range ds {
+		d.WaitForDeploys()
+	}
+	liveDeployersMu.Lock()
+	delete(liveDeployers, app)
+	liveDeployersMu.Unlock()
+}
+
 func newDeployer(app core.App, root string, b ArtifactBuilder, evict EvictFunc, verify VerifyFunc, log *slog.Logger) *Deployer {
 	if log == nil {
 		log = slog.Default()
 	}
-	return &Deployer{
+	d := &Deployer{
 		app:         app,
 		root:        root,
 		builds:      b,
@@ -117,6 +149,10 @@ func newDeployer(app core.App, root string, b ArtifactBuilder, evict EvictFunc, 
 		readTokens:  map[string]float64{},
 		lastRead:    map[string]time.Time{},
 	}
+	liveDeployersMu.Lock()
+	liveDeployers[app] = append(liveDeployers[app], d)
+	liveDeployersMu.Unlock()
+	return d
 }
 
 // beginRead throttles the read-ish control endpoints (/v1/build, /v1/resolve,
@@ -353,9 +389,19 @@ func (d *Deployer) deploy(ctx context.Context, slug string, next map[string]stri
 	}
 
 	settled = true
-	go d.finish(slug, dep, prev, res.RecipeHash, jobID, snap)
+	d.finishing.Add(1)
+	go func() {
+		defer d.finishing.Done()
+		d.finish(slug, dep, prev, res.RecipeHash, jobID, snap)
+	}()
 	return res.RecipeHash, nil
 }
+
+// WaitForDeploys blocks until every in-flight finish() goroutine has returned.
+// finish's tail writes deployment/org rows through app, so a caller that is
+// about to tear the app down (tests) must drain first — otherwise those writes
+// land on a closed database and panic inside PocketBase's save path.
+func (d *Deployer) WaitForDeploys() { d.finishing.Wait() }
 
 // orgBuildState is the org row subset finish() restores on a failed deploy.
 type orgBuildState struct {

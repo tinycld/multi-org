@@ -144,7 +144,7 @@ func setupCardDAVOrgs(t *testing.T, root string) (*orgmanager.OrgManager, *Provi
 	if err := cp.App.Bootstrap(); err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = cp.App.ResetBootstrapState() })
+	t.Cleanup(func() { WaitForAppDeploys(cp.App); _ = cp.App.ResetBootstrapState() })
 	if err := cpInitForTest(cp); err != nil {
 		t.Fatal(err)
 	}
@@ -215,7 +215,7 @@ func seedOrg(t *testing.T, p *Provisioner, root, artifactDir, slug, email, first
 	if err := app.Bootstrap(); err != nil {
 		t.Fatalf("seed bootstrap(%s): %v", slug, err)
 	}
-	defer app.ResetBootstrapState()
+	defer func() { WaitForAppDeploys(app); _ = app.ResetBootstrapState() }()
 	if err := app.RunAllMigrations(); err != nil {
 		t.Fatalf("seed migrations(%s): %v", slug, err)
 	}

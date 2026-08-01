@@ -74,7 +74,7 @@ func newDeployHarness(t *testing.T) *deployHarness {
 	if err := cp.App.Bootstrap(); err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = cp.App.ResetBootstrapState() })
+	t.Cleanup(func() { WaitForAppDeploys(cp.App); _ = cp.App.ResetBootstrapState() })
 	if err := cpInitForTest(cp); err != nil {
 		t.Fatal(err)
 	}
@@ -702,7 +702,7 @@ func TestCreateOrg_DefaultTemplateBuildsArtifact(t *testing.T) {
 	if err := cp.App.Bootstrap(); err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = cp.App.ResetBootstrapState() })
+	t.Cleanup(func() { WaitForAppDeploys(cp.App); _ = cp.App.ResetBootstrapState() })
 	if err := cpInitForTest(cp); err != nil {
 		t.Fatal(err)
 	}
@@ -748,7 +748,7 @@ func TestCreateOrg_ArtifactSetWithoutBuilderRefuses(t *testing.T) {
 	if err := cp.App.Bootstrap(); err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = cp.App.ResetBootstrapState() })
+	t.Cleanup(func() { WaitForAppDeploys(cp.App); _ = cp.App.ResetBootstrapState() })
 	if err := cpInitForTest(cp); err != nil {
 		t.Fatal(err)
 	}
@@ -767,7 +767,7 @@ func TestDefaultLockfile_Roundtrip(t *testing.T) {
 	if err := cp.App.Bootstrap(); err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = cp.App.ResetBootstrapState() })
+	t.Cleanup(func() { WaitForAppDeploys(cp.App); _ = cp.App.ResetBootstrapState() })
 	if err := cpInitForTest(cp); err != nil {
 		t.Fatal(err)
 	}

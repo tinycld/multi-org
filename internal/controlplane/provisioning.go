@@ -287,6 +287,41 @@ func (p *Provisioner) RegisterRoutes() {
 			return re.NoContent(204)
 		}).Bind(apis.RequireSuperuserAuth())
 
+		// Mail domains: the MX routing registry, keyed by slug rather than the
+		// orgs relation id an operator would otherwise have to look up first.
+		// Superuser-only like the rest — an org must not be able to claim its
+		// own domains, since the unique index means a claim denies it to every
+		// other org.
+		g.GET("/orgs/{slug}/mail-domains", func(re *core.RequestEvent) error {
+			domains, err := p.ListMailDomains(re.Request.PathValue("slug"))
+			if err != nil {
+				return re.NotFoundError(err.Error(), err)
+			}
+			return re.JSON(200, map[string]any{"domains": domains})
+		}).Bind(apis.RequireSuperuserAuth())
+
+		g.POST("/orgs/{slug}/mail-domains", func(re *core.RequestEvent) error {
+			var body struct {
+				Domain string `json:"domain"`
+			}
+			if err := re.BindBody(&body); err != nil {
+				return re.BadRequestError("invalid body", err)
+			}
+			rec, err := p.AddMailDomain(re.Request.PathValue("slug"), body.Domain)
+			if err != nil {
+				return re.BadRequestError(err.Error(), err)
+			}
+			return re.JSON(201, map[string]any{"domain": rec.GetString("domain")})
+		}).Bind(apis.RequireSuperuserAuth())
+
+		g.DELETE("/orgs/{slug}/mail-domains/{domain}", func(re *core.RequestEvent) error {
+			err := p.RemoveMailDomain(re.Request.PathValue("slug"), re.Request.PathValue("domain"))
+			if err != nil {
+				return re.BadRequestError(err.Error(), err)
+			}
+			return re.NoContent(204)
+		}).Bind(apis.RequireSuperuserAuth())
+
 		g.POST("/orgs/{slug}/suspend", func(re *core.RequestEvent) error {
 			if err := p.Suspend(re.Request.PathValue("slug")); err != nil {
 				return re.BadRequestError(err.Error(), err)

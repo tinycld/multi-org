@@ -86,6 +86,11 @@ func helperSpec(t *testing.T) JobSpec {
 		BuildID:     "recipe-test",
 		BuildDir:    filepath.Join(jobDir, "build"),
 		ArtifactDir: filepath.Join(jobDir, "artifact"),
+		// Production always has a store dir (Builder defaults it from Root).
+		// The confined path chowns it to the job uid, and MkdirAll("") fails
+		// with a bare `mkdir :` — so an unset one breaks confinement setup
+		// before the child ever starts.
+		PnpmStoreDir: filepath.Join(base, "pnpm-store"),
 	}
 }
 

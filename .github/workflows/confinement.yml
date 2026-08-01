@@ -44,11 +44,15 @@ jobs:
 
       # tinycld carries its own .node-version; bootstrap has not written ws/
       # yet, so read it from a shallow standalone checkout of the shell.
+      # Clone the default branch rather than pinning a ref: the shell's
+      # multi-org branch merged into main and was deleted, and a hardcoded
+      # branch name silently rots into a "Remote branch not found" the moment
+      # that happens again.
       - name: Check out tinycld for .node-version
         env:
           GH_TOKEN: ${{ secrets.SIBLING_CHECKOUT_TOKEN || github.token }}
         run: |
-          git clone --depth 1 --branch multi-org \
+          git clone --depth 1 \
             "https://x-access-token:${GH_TOKEN}@github.com/tinycld/tinycld.git" .node-version-src
       - uses: actions/setup-node@v5
         with:

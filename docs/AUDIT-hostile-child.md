@@ -1,6 +1,7 @@
 # Hostile-child audit — router↔tenant contract
 
 **Status:** performed 2026-07-31 as design §7 step 5's hostile-child audit.
+All findings — including the follow-ups (H5, M1, M2, M3, M5) — are now FIXED.
 Threat model (design §4): a tenant process runs third-party package Go the
 org's admin chose, in-process with full process privileges. The OS boundary
 (uid / mount+PID namespaces / cgroup / allowlist env / read-only artifact
@@ -70,27 +71,33 @@ are immutable to the job uid. Status: **FIXED**.
 - **H4** — control-socket `http.Server` has no timeouts / `MaxHeaderBytes` →
   slowloris fd-exhaustion of the router. Status: **FIXED**.
 - **H5** — mail `TrackConn` taken before authentication lets unauthenticated
-  clients pin orgs resident and starve admission. Status: **OPEN** — needs the
-  splice to observe auth before tracking; tracked as follow-up (touches the
-  mailrouter splice path, larger than the step-5 contract fixes).
+  clients pin orgs resident and starve admission. Status: **FIXED** — the
+  splice observes protocol auth (IMAP tagged OK on a LOGIN/AUTHENTICATE tag,
+  SMTP 235) and grants TrackConn only then; unauthenticated sessions are cut
+  at an absolute pre-auth deadline and never pin the org. The MX relay keeps
+  its ungated TrackConn deliberately: server-to-server, message fully
+  buffered first, bounded by relayTimeout and the per-transaction org cap.
 
 ## MEDIUM / LOW
 
 - **M1** — ready→exit resets crash backoff to 1s forever (`clearCrash` on the
-  readiness handshake, not on sustained health). Status: **OPEN** — the fix
-  needs a per-slug delayed-clear timer with cancellation on crash/evict (a
-  timer restructure, not a small edit); left as a follow-up.
+  readiness handshake, not on sustained health). Status: **FIXED** — no timer
+  needed: crash history survives readiness, and the supervisor resets it at
+  exit only when the child had `healthyUptime` of actual service first.
 - **M2** — readiness is a self-report; the router never probes the socket, so a
-  ready-but-not-serving build forges a deploy commit. Status: **OPEN**
-  (follow-up: dial + health-check before treating a spawn as ready).
+  ready-but-not-serving build forges a deploy commit. Status: **FIXED** — after
+  the ready line the manager dials the tenant socket and requires a complete
+  HTTP response (`probeServing`) before the spawn counts as live.
 - **M3** — a tenant can plant `.deploy/backup.db` a later operator deploy
-  restores. Status: **PARTIAL** — the beneath-write guard (C1) + snapshot
-  `Lstat` refuse a symlinked/irregular backup; binding the snapshot to its
-  proposing deploy is an OPEN follow-up.
+  restores. Status: **FIXED** — operator deploys never restore a snapshot (no
+  proposing tenant took downs), and a tenant-proposed deploy restores only the
+  regular file `Lstat`-fingerprinted (inode/size/mtime) at proposal time; a
+  swapped or symlinked file is refused.
 - **M4** — `chownTree` will `Lchown` a tenant-planted hardlink out of the org
   dir (gated by `fs.protected_hardlinks`). Status: **FIXED** (skip `Nlink>1`).
 - **M5** — tenant stdout floods the router log sink (no rate limit). Status:
-  **OPEN** (follow-up: token-bucket `pipeToLog`).
+  **FIXED** — `pipeToLog` token-buckets each stream (drain-and-drop, never
+  backpressure that would wedge the child) and surfaces a dropped-line count.
 - **L1** — `--confine-packages` remount is child-enforced / post-`init()`;
   sound as defense-in-depth only (the binary can't be swapped by the tenant).
 - **L2** — degraded (non-root) mode collapses the ctl.sock boundary → cross-org

@@ -1,6 +1,7 @@
 package orgmanager
 
 import (
+	"context"
 	"io"
 	"log/slog"
 	"os"
@@ -130,3 +131,51 @@ func TestEnsureTenantDirs_Idempotent(t *testing.T) {
 		t.Errorf("existing tmp contents were disturbed: %v", err)
 	}
 }
+
+// TestPipeToLog_RateLimitsFloods pins M5: a tenant flooding stdout gets its
+// lines dropped past the token bucket, with the drop count surfaced, instead
+// of saturating the host log sink line-for-line.
+func TestPipeToLog_RateLimitsFloods(t *testing.T) {
+	var forwarded, droppedSummaries int
+	var droppedTotal int64
+	h := slogHandlerFunc(func(rec slog.Record) {
+		switch rec.Message {
+		case "tenant output":
+			forwarded++
+		case "tenant output rate-limited; lines dropped":
+			droppedSummaries++
+			rec.Attrs(func(a slog.Attr) bool {
+				if a.Key == "dropped" {
+					droppedTotal += a.Value.Int64()
+				}
+				return true
+			})
+		}
+	})
+
+	const total = 500
+	input := strings.Repeat("spam line\n", total)
+	// Effectively no refill during the test; only the burst of 10 is forwarded.
+	pipeToLogRate(strings.NewReader(input), slog.New(h), "acme", slog.LevelInfo, 0.0001, 10)
+
+	if forwarded != 10 {
+		t.Errorf("forwarded %d lines, want the burst of 10", forwarded)
+	}
+	if droppedSummaries == 0 {
+		t.Error("expected a dropped-lines summary record")
+	}
+	if got := int64(total) - int64(forwarded); droppedTotal != got {
+		t.Errorf("summaries account for %d dropped lines, want %d", droppedTotal, got)
+	}
+}
+
+// slogHandlerFunc adapts a func to slog.Handler for test capture.
+type slogHandlerFunc func(slog.Record)
+
+func (f slogHandlerFunc) Enabled(context.Context, slog.Level) bool { return true }
+func (f slogHandlerFunc) Handle(_ context.Context, r slog.Record) error {
+	f(r)
+	return nil
+}
+func (f slogHandlerFunc) WithAttrs([]slog.Attr) slog.Handler { return f }
+func (f slogHandlerFunc) WithGroup(string) slog.Handler      { return f }

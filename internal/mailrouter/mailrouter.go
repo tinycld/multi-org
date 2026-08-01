@@ -31,6 +31,7 @@ import (
 	"io"
 	"log/slog"
 	"net"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -269,9 +270,6 @@ func (r *Router) handleTLSConn(raw net.Conn, svc string) {
 		return
 	}
 
-	release := tenant.TrackConn()
-	defer release()
-
 	back, err := net.Dial("unix", path)
 	if err != nil {
 		r.cfg.Logger.Error("mailrouter dial tenant socket failed",
@@ -280,7 +278,13 @@ func (r *Router) handleTLSConn(raw net.Conn, svc string) {
 		return
 	}
 
-	splice(tconn, back)
+	// TrackConn is granted by the splice itself, once it observes the tenant
+	// accept the client's credentials — never at accept time (H5): a tracked
+	// connection pins the org resident, so tracking unauthenticated clients
+	// let a prober hold every org it could name and starve admission under
+	// MaxResident. Until auth, the connection rides on lastUsed alone and the
+	// org stays evictable.
+	splice(tconn, back, newAuthDetector(svc), tenant.TrackConn)
 }
 
 // refuse writes one uniform protocol goodbye and closes. The SAME bytes for
@@ -307,40 +311,80 @@ func (r *Router) refuse(conn net.Conn, svc string) {
 // (which re-issues within 29 minutes) is never cut. Var for tests.
 var spliceIdleTimeout = 30 * time.Minute
 
+// preAuthTimeout is how long a spliced connection may exist WITHOUT observed
+// authentication before the router closes it. Real clients authenticate
+// within seconds of the greeting; a session still unauthenticated minutes in
+// is a prober or a stalled scanner, and pre-auth sessions are exactly the
+// ones H5 says must stay cheap. Var for tests.
+var preAuthTimeout = 3 * time.Minute
+
 // splice copies both directions until each side's read half is done,
 // half-closing the opposite write half so in-flight bytes still flush —
 // an IMAP LOGOUT's tagged response must reach the client even though the
 // client's sending side finished first. A connection idle in both directions
-// past spliceIdleTimeout is closed outright (see the const).
-func splice(a, b net.Conn) {
+// past spliceIdleTimeout — or unauthenticated past preAuthTimeout — is closed
+// outright (see the two vars).
+//
+// The splice owns TrackConn (H5): det watches the byte stream, and only when
+// it reports the tenant accepted the client's credentials is track() taken,
+// released when the splice ends.
+func splice(a, b net.Conn, det authDetector, track func() func()) {
+	// Captured once so this connection's watchdog sees consistent deadlines
+	// (the vars exist to be swapped in tests).
+	idleTimeout, preAuth := spliceIdleTimeout, preAuthTimeout
+
 	var lastActivity atomic.Int64
 	lastActivity.Store(time.Now().UnixNano())
+	start := time.Now()
+
+	var authed atomic.Bool
+	var trackMu sync.Mutex
+	var release func()
+	markAuthed := func() {
+		trackMu.Lock()
+		defer trackMu.Unlock()
+		if release == nil {
+			release = track()
+		}
+		authed.Store(true)
+	}
 
 	type closeWriter interface{ CloseWrite() error }
 	done := make(chan struct{}, 1)
 	stop := make(chan struct{})
-	cp := func(dst, src net.Conn) {
-		_, _ = io.Copy(dst, &activityReader{conn: src, last: &lastActivity})
+	cp := func(dst net.Conn, src *activityReader) {
+		_, _ = io.Copy(dst, src)
 		if cw, ok := dst.(closeWriter); ok {
 			_ = cw.CloseWrite()
 		} else {
 			_ = dst.Close()
 		}
 	}
+	// a is the client side, b the tenant side: the tenant's responses carry
+	// the auth verdict, the client's bytes give the IMAP detector its tags.
+	clientRd := &activityReader{conn: a, last: &lastActivity, observe: det.clientData}
+	serverRd := &activityReader{conn: b, last: &lastActivity, observe: func(p []byte) {
+		if !authed.Load() && det.serverData(p) {
+			markAuthed()
+		}
+	}}
 
 	// The watchdog closes both conns when the splice has been silent past the
-	// deadline, which unblocks both copies. Polling beats per-read
-	// SetReadDeadline juggling: two goroutines share the two conns, and a
-	// deadline set by one direction would clip the other's in-flight read.
+	// deadline (or unauthenticated past its budget), which unblocks both
+	// copies. Polling beats per-read SetReadDeadline juggling: two goroutines
+	// share the two conns, and a deadline set by one direction would clip the
+	// other's in-flight read.
 	go func() {
-		ticker := time.NewTicker(spliceIdleTimeout / 4)
+		ticker := time.NewTicker(min(idleTimeout, preAuth) / 4)
 		defer ticker.Stop()
 		for {
 			select {
 			case <-stop:
 				return
 			case <-ticker.C:
-				if time.Since(time.Unix(0, lastActivity.Load())) > spliceIdleTimeout {
+				idle := time.Since(time.Unix(0, lastActivity.Load())) > idleTimeout
+				overdue := !authed.Load() && time.Since(start) > preAuth
+				if idle || overdue {
 					_ = a.Close()
 					_ = b.Close()
 					return
@@ -350,27 +394,37 @@ func splice(a, b net.Conn) {
 	}()
 
 	go func() {
-		cp(a, b)
+		cp(a, serverRd)
 		done <- struct{}{}
 	}()
-	cp(b, a)
+	cp(b, clientRd)
 	<-done
 	close(stop)
 	_ = a.Close()
 	_ = b.Close()
+	trackMu.Lock()
+	if release != nil {
+		release()
+	}
+	trackMu.Unlock()
 }
 
 // activityReader stamps the shared last-activity clock on every successful
-// read, so traffic in either direction pushes the idle deadline out.
+// read — so traffic in either direction pushes the idle deadline out — and
+// taps the bytes for the auth detector.
 type activityReader struct {
-	conn net.Conn
-	last *atomic.Int64
+	conn    net.Conn
+	last    *atomic.Int64
+	observe func([]byte)
 }
 
 func (r *activityReader) Read(p []byte) (int, error) {
 	n, err := r.conn.Read(p)
 	if n > 0 {
 		r.last.Store(time.Now().UnixNano())
+		if r.observe != nil {
+			r.observe(p[:n])
+		}
 	}
 	return n, err
 }

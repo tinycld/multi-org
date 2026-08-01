@@ -47,6 +47,12 @@ type OrgInstance struct {
 	proxy   *httputil.ReverseProxy
 	handler http.Handler // proxy wrapped in the in-flight tracking middleware
 
+	// readyAt is when the child completed its readiness handshake. The
+	// supervisor compares the exit time against it: crash backoff resets only
+	// after sustained health, never on the handshake alone (M1). Written once
+	// in spawn, before the instance is published.
+	readyAt time.Time
+
 	lastUsed atomic.Int64 // unix nanos; seeded at load, updated per proxied request
 
 	// activeConns counts long-lived non-HTTP connections (mail relays) open

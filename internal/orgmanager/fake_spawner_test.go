@@ -29,6 +29,9 @@ type fakeSpawner struct {
 	dieBeforeReady bool
 	// hangForever makes the child never report readiness, forcing the timeout.
 	hangForever bool
+	// forgeReady makes the child report ok:true WITHOUT binding its socket —
+	// the M2 forgery: readiness as a bare self-report.
+	forgeReady bool
 	// ignoreSIGTERM makes the child refuse to stop politely, forcing the kill.
 	ignoreSIGTERM bool
 
@@ -95,6 +98,12 @@ func (f *fakeSpawner) Spawn(ctx context.Context, req SpawnRequest, log *slog.Log
 		// Go through die() so the exitOnce guards this like any other exit —
 		// the host may still call Kill() on the failure path.
 		proc.die(fmt.Errorf("exit status 1"))
+		f.record(proc)
+		return proc, nil
+	}
+
+	if f.forgeReady {
+		writeReady(req.ReadyFile, readyMsg{OK: true, PID: proc.pid})
 		f.record(proc)
 		return proc, nil
 	}

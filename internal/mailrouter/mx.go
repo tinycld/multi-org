@@ -174,6 +174,11 @@ func (r *Router) relayToOrg(slug, from string, opts *smtp.MailOptions, rcpts []s
 		return fmt.Errorf("org %s has a registered mail domain but no mail listener", slug)
 	}
 
+	// Tracked without an auth gate, unlike the spliced sessions (H5): MX is
+	// server-to-server and never authenticates. The hold here is not
+	// client-controlled — the message is fully buffered before this runs, the
+	// relay is bounded by relayTimeout, and per-transaction fan-out is capped
+	// by mxMaxTargetOrgs.
 	release := tenant.TrackConn()
 	defer release()
 

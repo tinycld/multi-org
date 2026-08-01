@@ -224,8 +224,10 @@ func TestDeploy_RevertsOnFailedRespawn(t *testing.T) {
 	d := newDeployer(h.cp.App, h.root, &fakeArtifactBuilder{hash: hashNew},
 		func(string) {}, verify, quietTestLogger())
 
-	if _, err := d.Deploy(context.Background(), "acme", nextLock, "job_9"); err != nil {
-		t.Fatalf("Deploy: %v", err)
+	// Tenant-proposed: the downs ran behind the snapshot, so the revert
+	// restores it.
+	if _, err := d.DeployProposed(context.Background(), "acme", nextLock, "job_9"); err != nil {
+		t.Fatalf("DeployProposed: %v", err)
 	}
 
 	waitUntil(t, "deployment reverted", func() bool {
@@ -266,6 +268,99 @@ func TestDeploy_RevertsOnFailedRespawn(t *testing.T) {
 	// The failed boot plus the post-revert respawn.
 	if verifies.Load() != 2 {
 		t.Fatalf("verify ran %d times, want 2 (commit decision + respawn)", verifies.Load())
+	}
+}
+
+// An OPERATOR deploy has no proposing tenant and took no downs, so its revert
+// must never restore .deploy/backup.db: any snapshot present is
+// tenant-planted, not this deploy's (M3).
+func TestDeploy_OperatorRevertIgnoresPlantedSnapshot(t *testing.T) {
+	h := newDeployHarness(t)
+
+	dbPath := filepath.Join(h.orgDir, "pb_data", "data.db")
+	if err := os.WriteFile(dbPath, []byte("live"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(h.orgDir, ".deploy"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(snapshotPath(h.orgDir), []byte("planted"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	verify := func(ctx context.Context, slug string) error {
+		rec, err := h.cp.App.FindFirstRecordByData("orgs", "slug", slug)
+		if err != nil {
+			return err
+		}
+		if rec.GetString("recipe_hash") == hashNew {
+			return fmt.Errorf("boot failed")
+		}
+		return nil
+	}
+	d := newDeployer(h.cp.App, h.root, &fakeArtifactBuilder{hash: hashNew},
+		func(string) {}, verify, quietTestLogger())
+
+	if _, err := d.Deploy(context.Background(), "acme", nextLock, ""); err != nil {
+		t.Fatalf("Deploy: %v", err)
+	}
+	waitUntil(t, "deployment reverted", func() bool {
+		return h.lastDeployment(t).GetString("status") == "reverted"
+	})
+
+	if db, err := os.ReadFile(dbPath); err != nil || string(db) != "live" {
+		t.Fatalf("operator revert adopted a planted snapshot: db=%q err=%v", db, err)
+	}
+}
+
+// A tenant-proposed deploy restores ONLY the snapshot fingerprinted at
+// proposal time: a file swapped in afterwards is refused (M3).
+func TestDeploy_ProposedRevertRefusesSwappedSnapshot(t *testing.T) {
+	h := newDeployHarness(t)
+
+	dbPath := filepath.Join(h.orgDir, "pb_data", "data.db")
+	if err := os.WriteFile(dbPath, []byte("post-downs"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(h.orgDir, ".deploy"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(snapshotPath(h.orgDir), []byte("pre-deploy"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// The evict hook runs after the fingerprint capture and before the failed
+	// verify — the window a live tenant would use to swap the file.
+	evict := func(string) {
+		if err := os.Remove(snapshotPath(h.orgDir)); err != nil {
+			t.Errorf("swap snapshot: %v", err)
+		}
+		if err := os.WriteFile(snapshotPath(h.orgDir), []byte("swapped-in"), 0o644); err != nil {
+			t.Errorf("swap snapshot: %v", err)
+		}
+	}
+	verify := func(ctx context.Context, slug string) error {
+		rec, err := h.cp.App.FindFirstRecordByData("orgs", "slug", slug)
+		if err != nil {
+			return err
+		}
+		if rec.GetString("recipe_hash") == hashNew {
+			return fmt.Errorf("boot failed")
+		}
+		return nil
+	}
+	d := newDeployer(h.cp.App, h.root, &fakeArtifactBuilder{hash: hashNew},
+		evict, verify, quietTestLogger())
+
+	if _, err := d.DeployProposed(context.Background(), "acme", nextLock, "job_3"); err != nil {
+		t.Fatalf("DeployProposed: %v", err)
+	}
+	waitUntil(t, "deployment reverted", func() bool {
+		return h.lastDeployment(t).GetString("status") == "reverted"
+	})
+
+	if db, err := os.ReadFile(dbPath); err != nil || string(db) != "post-downs" {
+		t.Fatalf("revert adopted a swapped snapshot: db=%q err=%v", db, err)
 	}
 }
 

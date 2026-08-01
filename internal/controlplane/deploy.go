@@ -12,6 +12,7 @@ import (
 	"regexp"
 	"sort"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/pocketbase/pocketbase/core"
@@ -235,13 +236,29 @@ func (d *Deployer) BuildSet(ctx context.Context, lock map[string]string) (builde
 	return d.builds.Build(ctx, refs, slogSink{log: d.log})
 }
 
-// Deploy runs D6 steps 3–5 for one org: authoritative compat check + build
-// (both inside BuildSet), record the proposed deployment, repoint the org
-// row, then asynchronously evict → respawn → commit or revert. It returns as
-// soon as the proposal is durably recorded — the caller (a tenant that
-// already ran its downs and is waiting to be killed, or the operator API)
-// gets an accept/refuse answer, never a half-applied deploy.
+// Deploy runs D6 steps 3–5 for an OPERATOR-driven deploy: authoritative
+// compat check + build (both inside BuildSet), record the deployment, repoint
+// the org row, then asynchronously evict → respawn → commit or revert. It
+// returns as soon as the proposal is durably recorded — the caller gets an
+// accept/refuse answer, never a half-applied deploy.
+//
+// An operator deploy has no proposing tenant and took no downs, so its revert
+// path NEVER restores .deploy/backup.db: any snapshot present is
+// tenant-planted, not this deploy's (M3).
 func (d *Deployer) Deploy(ctx context.Context, slug string, next map[string]string, jobID string) (string, error) {
+	return d.deploy(ctx, slug, next, jobID, false)
+}
+
+// DeployProposed is Deploy for a tenant-proposed set (ctl.sock /v1/deploy).
+// The proposing tenant has already run its downs behind a VACUUM INTO
+// snapshot (D6 step 2), so a failed deploy restores that snapshot — and only
+// that one: the file is fingerprinted at proposal time, and a snapshot
+// planted or swapped afterwards refuses to restore (M3).
+func (d *Deployer) DeployProposed(ctx context.Context, slug string, next map[string]string, jobID string) (string, error) {
+	return d.deploy(ctx, slug, next, jobID, true)
+}
+
+func (d *Deployer) deploy(ctx context.Context, slug string, next map[string]string, jobID string, proposed bool) (string, error) {
 	if err := d.begin(slug); err != nil {
 		return "", err
 	}
@@ -299,8 +316,20 @@ func (d *Deployer) Deploy(ctx context.Context, slug string, next map[string]stri
 		return "", fmt.Errorf("repoint org row: %w", err)
 	}
 
+	// The snapshot a failed TENANT-PROPOSED deploy may restore is the one on
+	// disk NOW, at proposal time — fingerprinted so the restore refuses any
+	// file swapped in later. Operator deploys get the zero ref: restore-never.
+	// (The proposing tenant stays alive until the eviction and could rewrite
+	// its snapshot in place — but the snapshot is its own database, which it
+	// can write directly anyway; the binding exists so no OTHER deploy's
+	// revert ever adopts a tenant-planted file.)
+	var snap snapshotRef
+	if proposed {
+		snap = captureSnapshot(filepath.Join(d.root, "pb_orgs", slug))
+	}
+
 	settled = true
-	go d.finish(slug, dep, prev, res.RecipeHash, jobID)
+	go d.finish(slug, dep, prev, res.RecipeHash, jobID, snap)
 	return res.RecipeHash, nil
 }
 
@@ -312,8 +341,10 @@ type orgBuildState struct {
 }
 
 // finish is the async tail of a deploy: the readiness handshake of the
-// respawned org is the commit/revert decision (D6 steps 4–5).
-func (d *Deployer) finish(slug string, dep *core.Record, prev orgBuildState, recipeHash, jobID string) {
+// respawned org is the commit/revert decision (D6 steps 4–5). snap is the
+// snapshot fingerprint captured at proposal — the zero ref for operator
+// deploys, which never restore.
+func (d *Deployer) finish(slug string, dep *core.Record, prev orgBuildState, recipeHash, jobID string, snap snapshotRef) {
 	defer d.end(slug)
 	defer d.untrackHash(recipeHash)
 
@@ -355,7 +386,7 @@ func (d *Deployer) finish(slug string, dep *core.Record, prev orgBuildState, rec
 	} else {
 		d.log.Error("could not load org row for revert", "slug", slug, "error", err)
 	}
-	if err := restoreSnapshot(orgDir); err != nil {
+	if err := restoreSnapshot(orgDir, snap); err != nil {
 		d.log.Error("could not restore pre-deploy database snapshot", "slug", slug, "error", err)
 	}
 	d.setDeploymentStatus(dep, "reverted", bootErr)
@@ -440,20 +471,59 @@ func snapshotPath(orgDir string) string {
 	return filepath.Join(orgDir, ".deploy", "backup.db")
 }
 
+// snapshotRef fingerprints the pre-deploy snapshot as it existed at proposal
+// time, so the restore path can refuse any file that is not that one (M3).
+// The zero value means "no snapshot may be restored" — the operator-deploy
+// case, and the proposed-with-no-snapshot case.
+type snapshotRef struct {
+	exists  bool
+	ino     uint64
+	size    int64
+	modTime time.Time
+}
+
+// captureSnapshot fingerprints .deploy/backup.db via Lstat: a symlink or any
+// other irregular file is treated as absent, so it can never be adopted.
+func captureSnapshot(orgDir string) snapshotRef {
+	fi, err := os.Lstat(snapshotPath(orgDir))
+	if err != nil || !fi.Mode().IsRegular() {
+		return snapshotRef{}
+	}
+	ref := snapshotRef{exists: true, size: fi.Size(), modTime: fi.ModTime()}
+	if sys, ok := fi.Sys().(*syscall.Stat_t); ok {
+		ref.ino = sys.Ino
+	}
+	return ref
+}
+
 // restoreSnapshot puts the tenant's pre-deploy snapshot back as the live
 // database. The tenant process is dead by the time this runs, so the files
 // are cold. The WAL sidecars must go with it — SQLite would replay
 // post-snapshot frames over the restored file and silently undo the restore
-// (the same lesson as World A's rollbackFn). No snapshot is a no-op: an
-// operator-driven deploy has no proposing tenant and took no downs, so the
-// database was never mutated ahead of the swap.
-func restoreSnapshot(orgDir string) error {
+// (the same lesson as World A's rollbackFn).
+//
+// Only the snapshot fingerprinted at proposal restores (M3): a zero snap —
+// operator deploy, or nothing on disk when the tenant proposed — is a no-op
+// even when a backup.db exists, and a file that no longer matches the
+// fingerprint (planted after the proposal, or not a regular file) is refused.
+func restoreSnapshot(orgDir string, snap snapshotRef) error {
 	backup := snapshotPath(orgDir)
-	if _, err := os.Stat(backup); err != nil {
+	if !snap.exists {
+		return nil
+	}
+	fi, err := os.Lstat(backup)
+	if err != nil {
 		if os.IsNotExist(err) {
 			return nil
 		}
 		return err
+	}
+	if !fi.Mode().IsRegular() {
+		return fmt.Errorf("refusing snapshot restore: %s is not a regular file", backup)
+	}
+	sys, ok := fi.Sys().(*syscall.Stat_t)
+	if !ok || sys.Ino != snap.ino || fi.Size() != snap.size || !fi.ModTime().Equal(snap.modTime) {
+		return fmt.Errorf("refusing snapshot restore: %s is not the file fingerprinted at proposal", backup)
 	}
 	dbPath := filepath.Join(orgDir, "pb_data", "data.db")
 	if err := os.Rename(backup, dbPath); err != nil {
@@ -692,7 +762,7 @@ func (d *Deployer) Handler(slug string) http.Handler {
 		if !ok {
 			return
 		}
-		recipeHash, err := d.Deploy(context.Background(), slug, p.Lockfile, p.JobID)
+		recipeHash, err := d.DeployProposed(context.Background(), slug, p.Lockfile, p.JobID)
 		switch {
 		case errors.Is(err, errDeployBusy):
 			writeCtlJSON(w, http.StatusConflict, map[string]any{"error": err.Error()})

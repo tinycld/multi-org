@@ -578,22 +578,95 @@ func TestBackoff_FailedSpawnCountsOnce(t *testing.T) {
 	}
 }
 
-// A successful boot must clear prior crash history.
-func TestBackoff_ClearedOnSuccessfulBoot(t *testing.T) {
+// Readiness is a self-report; the manager must corroborate it by probing the
+// socket (M2). A child that writes ok:true but never serves would otherwise
+// pass the deploy verifier and forge a commit.
+func TestSpawn_ForgedReadinessFailsTheProbe(t *testing.T) {
+	origProbe := probeReadyTimeout
+	t.Cleanup(func() { probeReadyTimeout = origProbe })
+	probeReadyTimeout = 200 * time.Millisecond
+
+	sp := &fakeSpawner{forgeReady: true}
+	mgr := newTestManager(t, sp)
+
+	_, err := mgr.Get(context.Background(), "acme")
+	if !errors.Is(err, orgerr.ErrOrgUnavailable) {
+		t.Fatalf("err = %v, want ErrOrgUnavailable", err)
+	}
+	if !strings.Contains(err.Error(), "not serving") {
+		t.Fatalf("err = %v, want the readiness-probe refusal", err)
+	}
+	if proc := sp.lastProc(); proc == nil || !proc.killed.Load() {
+		t.Fatal("the forging child was not killed")
+	}
+	mgr.mu.RLock()
+	defer mgr.mu.RUnlock()
+	if len(mgr.orgs) != 0 {
+		t.Fatal("a non-serving instance was published")
+	}
+	if cs := mgr.crashes["acme"]; cs == nil || cs.consecutive != 1 {
+		t.Fatalf("crash state = %+v, want exactly one recorded crash", mgr.crashes["acme"])
+	}
+}
+
+// Readiness alone must NOT reset crash history (M1): a child that reports
+// ready and exits immediately would otherwise re-earn the 1s backoff floor
+// forever. Each ready→exit cycle keeps escalating.
+func TestBackoff_ReadyThenExitKeepsEscalating(t *testing.T) {
 	sp := &fakeSpawner{}
 	mgr := newTestManager(t, sp)
 
-	mgr.noteCrash("acme")
-	mgr.clearCrash("acme")
+	mgr.mu.Lock()
+	mgr.crashes["acme"] = &crashState{consecutive: 3}
+	mgr.mu.Unlock()
 
 	if _, err := mgr.Get(context.Background(), "acme"); err != nil {
-		t.Fatalf("Get after cleared backoff: %v", err)
+		t.Fatalf("Get: %v", err)
 	}
-	mgr.mu.RLock()
-	_, stillTracked := mgr.crashes["acme"]
-	mgr.mu.RUnlock()
-	if stillTracked {
-		t.Fatal("crash state survived a successful boot")
+	sp.lastProc().crash()
+
+	if !waitFor(3*time.Second, func() bool {
+		mgr.mu.RLock()
+		defer mgr.mu.RUnlock()
+		cs := mgr.crashes["acme"]
+		return cs != nil && cs.consecutive == 4
+	}) {
+		mgr.mu.RLock()
+		cs := mgr.crashes["acme"]
+		mgr.mu.RUnlock()
+		t.Fatalf("crash state = %+v, want consecutive 4 — readiness must not reset history", cs)
+	}
+}
+
+// An exit after sustained healthy uptime is a fresh crash, not a continuation
+// of old history: backoff restarts at the floor.
+func TestBackoff_SustainedUptimeResetsHistory(t *testing.T) {
+	origUptime := healthyUptime
+	t.Cleanup(func() { healthyUptime = origUptime })
+	healthyUptime = 0 // any uptime counts as sustained
+
+	sp := &fakeSpawner{}
+	mgr := newTestManager(t, sp)
+
+	mgr.mu.Lock()
+	mgr.crashes["acme"] = &crashState{consecutive: 3}
+	mgr.mu.Unlock()
+
+	if _, err := mgr.Get(context.Background(), "acme"); err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	sp.lastProc().crash()
+
+	if !waitFor(3*time.Second, func() bool {
+		mgr.mu.RLock()
+		defer mgr.mu.RUnlock()
+		cs := mgr.crashes["acme"]
+		return cs != nil && cs.consecutive == 1
+	}) {
+		mgr.mu.RLock()
+		cs := mgr.crashes["acme"]
+		mgr.mu.RUnlock()
+		t.Fatalf("crash state = %+v, want consecutive 1 after a healthy run", cs)
 	}
 }
 

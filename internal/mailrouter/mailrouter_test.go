@@ -16,6 +16,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -232,12 +233,70 @@ func TestTLSDemux_RefusalsAreUniform(t *testing.T) {
 	}
 }
 
-// A relayed connection must keep the org resident (TrackConn held) exactly as
-// long as it is open.
-func TestTLSDemux_TracksConnLifetime(t *testing.T) {
+// serveIMAPStub serves a minimal IMAP dialog on a unix socket: greeting, NO
+// for a LOGIN naming user "wrong", OK for any other LOGIN/AUTHENTICATE, and a
+// tagged OK for everything else.
+func serveIMAPStub(t *testing.T, path string) {
+	t.Helper()
+	ln, err := net.Listen("unix", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = ln.Close() })
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func(c net.Conn) {
+				defer c.Close()
+				_, _ = io.WriteString(c, "* OK stub ready\r\n")
+				rd := bufio.NewReader(c)
+				for {
+					line, err := rd.ReadString('\n')
+					if err != nil {
+						return
+					}
+					fields := strings.Fields(line)
+					if len(fields) < 2 {
+						continue
+					}
+					tag, cmd := fields[0], strings.ToUpper(fields[1])
+					switch {
+					case cmd == "LOGIN" && len(fields) > 2 && fields[2] == "wrong":
+						_, _ = fmt.Fprintf(c, "%s NO credentials rejected\r\n", tag)
+					case cmd == "LOGIN" || cmd == "AUTHENTICATE":
+						_, _ = fmt.Fprintf(c, "%s OK authenticated\r\n", tag)
+					default:
+						_, _ = fmt.Fprintf(c, "%s OK done\r\n", tag)
+					}
+				}
+			}(conn)
+		}
+	}()
+}
+
+// waitTracked polls the tenant's tracked-connection count.
+func waitTracked(t *testing.T, tenant *fakeTenant, want int64, what string) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for tenant.tracked.Load() != want {
+		if time.Now().After(deadline) {
+			t.Fatalf("%s: tracked = %d, want %d", what, tenant.tracked.Load(), want)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+// TrackConn is granted only once the tenant accepts the client's credentials
+// (H5): an unauthenticated connection — including one whose login the tenant
+// refused — must not pin the org resident. Once authenticated it is tracked
+// exactly as long as it stays open.
+func TestTLSDemux_TracksOnlyAuthenticatedConns(t *testing.T) {
 	dir := shortSockDir(t)
 	imapSock := filepath.Join(dir, "imap.sock")
-	serveGreetingEcho(t, imapSock, "* OK hello\r\n")
+	serveIMAPStub(t, imapSock)
 	acme := &fakeTenant{socks: orgmanager.MailSockets{IMAP: imapSock}}
 	r := startRouter(t, Config{
 		IMAPSAddr: "127.0.0.1:0",
@@ -248,17 +307,144 @@ func TestTLSDemux_TracksConnLifetime(t *testing.T) {
 	if _, err := rd.ReadString('\n'); err != nil {
 		t.Fatal(err)
 	}
-	if got := acme.tracked.Load(); got != 1 {
-		t.Fatalf("open connection tracked = %d, want 1", got)
+	if got := acme.tracked.Load(); got != 0 {
+		t.Fatalf("unauthenticated connection tracked = %d, want 0", got)
 	}
 
+	// Pre-auth commands and a REFUSED login must not track either.
+	if _, err := conn.Write([]byte("a1 CAPABILITY\r\n")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := rd.ReadString('\n'); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := conn.Write([]byte("a2 LOGIN wrong pass\r\n")); err != nil {
+		t.Fatal(err)
+	}
+	if line, err := rd.ReadString('\n'); err != nil || !strings.HasPrefix(line, "a2 NO") {
+		t.Fatalf("refused login reply = %q, err=%v", line, err)
+	}
+	if got := acme.tracked.Load(); got != 0 {
+		t.Fatalf("refused login tracked = %d, want 0", got)
+	}
+
+	// A successful login tracks…
+	if _, err := conn.Write([]byte("a3 LOGIN user pass\r\n")); err != nil {
+		t.Fatal(err)
+	}
+	if line, err := rd.ReadString('\n'); err != nil || !strings.HasPrefix(line, "a3 OK") {
+		t.Fatalf("login reply = %q, err=%v", line, err)
+	}
+	waitTracked(t, acme, 1, "after successful login")
+
+	// …exactly as long as the connection lives.
 	_ = conn.Close()
+	waitTracked(t, acme, 0, "after close")
+}
+
+// The SMTP submission splice tracks on the tenant's 235 auth-success reply.
+func TestTLSDemux_TracksSMTPAfter235(t *testing.T) {
+	dir := shortSockDir(t)
+	smtpSock := filepath.Join(dir, "smtp.sock")
+	serveGreetingEcho(t, smtpSock, "220 stub ready\r\n")
+	acme := &fakeTenant{socks: orgmanager.MailSockets{SMTP: smtpSock}}
+	r := startRouter(t, Config{
+		SMTPSAddr: "127.0.0.1:0",
+		GetOrg:    func(_ context.Context, _ string) (Tenant, error) { return acme, nil },
+	})
+
+	conn, rd := dialSNI(t, r.SMTPSListenerAddr(), "acme."+testBaseDomain)
+	if _, err := rd.ReadString('\n'); err != nil {
+		t.Fatal(err)
+	}
+	if got := acme.tracked.Load(); got != 0 {
+		t.Fatalf("unauthenticated connection tracked = %d, want 0", got)
+	}
+
+	// The echo server reflects client bytes as "server" output, so writing a
+	// 235 line stands in for the tenant's auth-success reply.
+	if _, err := conn.Write([]byte("235 2.7.0 accepted\r\n")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := rd.ReadString('\n'); err != nil {
+		t.Fatal(err)
+	}
+	waitTracked(t, acme, 1, "after 235")
+
+	_ = conn.Close()
+	waitTracked(t, acme, 0, "after close")
+}
+
+// An unauthenticated splice must not live past preAuthTimeout: pre-auth
+// sessions are exactly the ones that must stay cheap (H5).
+func TestSplice_ClosesUnauthenticatedConnsAfterDeadline(t *testing.T) {
+	origPre := preAuthTimeout
+	preAuthTimeout = 150 * time.Millisecond
+	defer func() { preAuthTimeout = origPre }()
+
+	dir := shortSockDir(t)
+	imapSock := filepath.Join(dir, "imap.sock")
+	serveIMAPStub(t, imapSock)
+	acme := &fakeTenant{socks: orgmanager.MailSockets{IMAP: imapSock}}
+	r := startRouter(t, Config{
+		IMAPSAddr: "127.0.0.1:0",
+		GetOrg:    func(_ context.Context, _ string) (Tenant, error) { return acme, nil },
+	})
+
+	conn, rd := dialSNI(t, r.IMAPSListenerAddr(), "acme."+testBaseDomain)
+	if _, err := rd.ReadString('\n'); err != nil {
+		t.Fatal(err)
+	}
+
+	// Keep the connection ACTIVE but unauthenticated: the pre-auth deadline
+	// is absolute, not idle-based, so trickling traffic must not extend it.
 	deadline := time.Now().Add(5 * time.Second)
-	for acme.tracked.Load() != 0 {
+	for {
 		if time.Now().After(deadline) {
-			t.Fatalf("connection still tracked after close: %d", acme.tracked.Load())
+			t.Fatal("unauthenticated splice survived the pre-auth deadline")
 		}
-		time.Sleep(10 * time.Millisecond)
+		_, _ = conn.Write([]byte("a1 NOOP\r\n"))
+		_ = conn.SetReadDeadline(time.Now().Add(time.Second))
+		if _, err := rd.ReadString('\n'); err != nil {
+			return // closed by the router: what H5 requires
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+// An AUTHENTICATED splice must survive the pre-auth deadline.
+func TestSplice_AuthenticatedConnOutlivesPreAuthDeadline(t *testing.T) {
+	origPre := preAuthTimeout
+	preAuthTimeout = 150 * time.Millisecond
+	defer func() { preAuthTimeout = origPre }()
+
+	dir := shortSockDir(t)
+	imapSock := filepath.Join(dir, "imap.sock")
+	serveIMAPStub(t, imapSock)
+	acme := &fakeTenant{socks: orgmanager.MailSockets{IMAP: imapSock}}
+	r := startRouter(t, Config{
+		IMAPSAddr: "127.0.0.1:0",
+		GetOrg:    func(_ context.Context, _ string) (Tenant, error) { return acme, nil },
+	})
+
+	conn, rd := dialSNI(t, r.IMAPSListenerAddr(), "acme."+testBaseDomain)
+	if _, err := rd.ReadString('\n'); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := conn.Write([]byte("a1 LOGIN user pass\r\n")); err != nil {
+		t.Fatal(err)
+	}
+	if line, err := rd.ReadString('\n'); err != nil || !strings.HasPrefix(line, "a1 OK") {
+		t.Fatalf("login reply = %q, err=%v", line, err)
+	}
+
+	// Well past several pre-auth deadlines, the session must still serve.
+	time.Sleep(400 * time.Millisecond)
+	if _, err := conn.Write([]byte("a2 NOOP\r\n")); err != nil {
+		t.Fatal(err)
+	}
+	if line, err := rd.ReadString('\n'); err != nil || !strings.HasPrefix(line, "a2 OK") {
+		t.Fatalf("post-deadline command = %q, err=%v — authenticated splice was cut", line, err)
 	}
 }
 
@@ -366,7 +552,7 @@ func TestSplice_TearsDownIdleConnections(t *testing.T) {
 
 	done := make(chan struct{})
 	go func() {
-		splice(routerSide, backSide)
+		splice(routerSide, backSide, newAuthDetector(svcIMAP), func() func() { return func() {} })
 		close(done)
 	}()
 

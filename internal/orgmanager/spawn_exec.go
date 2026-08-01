@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"syscall"
+	"time"
 )
 
 // readyFD is the child descriptor the readiness pipe lands on. Go places the
@@ -159,13 +160,50 @@ func buildCmd(req SpawnRequest, log *slog.Logger) *exec.Cmd {
 	return cmd
 }
 
+// Tenant log forwarding is token-bucket rate-limited per stream: stdout is
+// tenant-controlled, and an unmetered print loop would saturate the host's one
+// log sink for every org (M5). The bucket refills at logLinesPerSec with
+// logLineBurst headroom for legitimate startup chatter.
+const (
+	logLinesPerSec = 20.0
+	logLineBurst   = 200.0
+)
+
 // pipeToLog forwards a child's output into the host logger, tagged by slug, so
-// tenant output is attributable and never interleaves mid-line.
+// tenant output is attributable and never interleaves mid-line. Lines beyond
+// the rate limit are read and DROPPED, never left in the pipe: blocking here
+// would fill the pipe and wedge the child's writes, handing the tenant a way
+// to stall itself mid-request. Drops are counted and surfaced in one summary
+// line once the limiter admits output again (and at stream end).
 func pipeToLog(r io.Reader, log *slog.Logger, slug string, level slog.Level) {
+	pipeToLogRate(r, log, slug, level, logLinesPerSec, logLineBurst)
+}
+
+// pipeToLogRate is pipeToLog with the bucket parameters explicit, for tests.
+func pipeToLogRate(r io.Reader, log *slog.Logger, slug string, level slog.Level, linesPerSec, burst float64) {
 	scanner := bufio.NewScanner(r)
 	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+
+	bucket := burst
+	last := time.Now()
+	var dropped int64
 	for scanner.Scan() {
+		now := time.Now()
+		bucket = min(burst, bucket+now.Sub(last).Seconds()*linesPerSec)
+		last = now
+		if bucket < 1 {
+			dropped++
+			continue
+		}
+		bucket--
+		if dropped > 0 {
+			log.Warn("tenant output rate-limited; lines dropped", "slug", slug, "dropped", dropped)
+			dropped = 0
+		}
 		log.Log(context.Background(), level, "tenant output", "slug", slug, "line", scanner.Text())
+	}
+	if dropped > 0 {
+		log.Warn("tenant output rate-limited; lines dropped", "slug", slug, "dropped", dropped)
 	}
 }
 

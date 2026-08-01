@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"math"
 	"math/rand"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -58,6 +59,13 @@ const (
 	backoffMin = 1 * time.Second
 	backoffMax = 30 * time.Second
 )
+
+// healthyUptime is how long a child must have served after readiness for its
+// exit to reset crash history instead of escalating it. Readiness alone is
+// not enough (M1): a child that reports ready and exits immediately would
+// re-earn the 1s backoff floor forever, making its crash loop as cheap as the
+// floor instead of converging on backoffMax. Var for tests.
+var healthyUptime = time.Minute
 
 // OrgRecord is the subset of an org's control-plane record the manager needs to
 // load it.
@@ -588,19 +596,34 @@ func (m *OrgManager) spawn(ctx context.Context, slug, orgDir string, src bootSou
 	// must close `dead` so the failure path below can complete.
 	go m.supervise(inst)
 
-	if err := awaitReady(ctx, readyR, inst); err != nil {
-		// Host-initiated teardown of a spawn that never went live: mark it so
-		// the supervisor doesn't ALSO account for the exit — the caller
-		// records exactly one crash for the failed load, and a child the host
-		// itself killed must not be logged as an unexpected exit.
+	// abort is the host-initiated teardown of a spawn that never went live:
+	// closing `closed` first marks it so the supervisor doesn't ALSO account
+	// for the exit — the caller records exactly one crash for the failed load,
+	// and a child the host itself killed must not be logged as an unexpected
+	// exit. Kill rather than TERM — it is either unresponsive or already
+	// broken — and reap it, or a late-successful child would keep holding the
+	// socket.
+	abort := func(err error) (*OrgInstance, error) {
 		close(inst.closed)
-		// Kill rather than TERM — it is either unresponsive or already broken —
-		// and reap it, or a late-successful child would keep holding the socket.
 		_ = proc.Kill()
 		<-inst.dead
 		_ = os.Remove(sockPath)
 		ctl.close(log, slug)
 		return nil, err
+	}
+
+	if err := awaitReady(ctx, readyR, inst); err != nil {
+		return abort(err)
+	}
+
+	// Readiness is the child's own report, and it is the deploy verifier's
+	// commit/revert decision — so it must be corroborated (M2): dial the
+	// socket and require an actual HTTP response before treating the spawn as
+	// live. A build that writes the ready line but never serves fails here
+	// instead of forging a deploy commit.
+	if err := probeServing(ctx, sockPath); err != nil {
+		return abort(fmt.Errorf("%w: %s reported ready but is not serving: %v",
+			orgerr.ErrOrgUnavailable, slug, err))
 	}
 
 	// Record which socket files the child bound, so a later teardown can tell
@@ -615,7 +638,11 @@ func (m *OrgManager) spawn(ctx context.Context, slug, orgDir string, src bootSou
 		}
 	}
 
-	m.clearCrash(slug)
+	// Deliberately NOT clearing crash history here: readiness is the child's
+	// own report, and resetting on it would let a ready→exit child re-earn the
+	// backoff floor forever. The supervisor resets history only when the exit
+	// follows healthyUptime of actual service.
+	inst.readyAt = time.Now()
 	return inst, nil
 }
 
@@ -895,6 +922,52 @@ func awaitReady(ctx context.Context, r *os.File, inst *OrgInstance) error {
 	}
 }
 
+// probeReadyTimeout bounds the readiness probe. Short on purpose: the tenant
+// binds its listener BEFORE reporting ready, so by the time the probe runs a
+// healthy child answers on the first attempt — a socket still refusing
+// connections seconds after the ready line is a broken or lying child, and
+// failing fast is what keeps the crash-loop backoff responsive. Var for tests.
+var probeReadyTimeout = 5 * time.Second
+
+// probeServing dials the tenant's HTTP socket and requires one complete HTTP
+// response. Any status code counts: the probe asserts "a server is answering
+// on this socket", not application health — the tenant binds its listener
+// before reporting ready, so the kernel queues the connection until Accept
+// starts. Errors are retried within probeReadyTimeout to absorb the child's
+// last startup instants.
+func probeServing(ctx context.Context, sockPath string) error {
+	ctx, cancel := context.WithTimeout(ctx, probeReadyTimeout)
+	defer cancel()
+	transport := &http.Transport{
+		DisableKeepAlives: true,
+		DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+			var d net.Dialer
+			return d.DialContext(ctx, "unix", sockPath)
+		},
+	}
+	defer transport.CloseIdleConnections()
+	client := &http.Client{Transport: transport}
+
+	var lastErr error
+	for {
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://tenant/api/health", nil)
+		if err != nil {
+			return err
+		}
+		resp, err := client.Do(req)
+		if err == nil {
+			_ = resp.Body.Close()
+			return nil
+		}
+		lastErr = err
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("no HTTP response on tenant socket: %v", lastErr)
+		case <-time.After(50 * time.Millisecond):
+		}
+	}
+}
+
 // supervise reaps the child and, if it died unexpectedly, drops it from the map
 // so the next Get respawns it.
 func (m *OrgManager) supervise(inst *OrgInstance) {
@@ -926,6 +999,14 @@ func (m *OrgManager) supervise(inst *OrgInstance) {
 	}
 	m.mu.Unlock()
 
+	// A child that served for a sustained window before dying is not
+	// crash-looping: forget its history so this exit backs off from the floor.
+	// An org that boots fine and later crashes once must not inherit history
+	// from a bad deploy an hour ago — but the reset is earned by uptime
+	// measured HERE, at exit, never by the readiness handshake (M1).
+	if time.Since(inst.readyAt) >= healthyUptime {
+		m.clearCrash(inst.slug)
+	}
 	m.noteCrash(inst.slug)
 	_ = os.Remove(inst.sockPath)
 	for _, ref := range inst.mailSockRefs {
@@ -968,9 +1049,8 @@ func (m *OrgManager) noteCrash(slug string) {
 	cs.until = time.Now().Add(backoff + jitter)
 }
 
-// clearCrash resets backoff after a successful boot. Reset-on-success rather
-// than on a timer: an org that boots fine and later crashes once should not
-// inherit history from a bad deploy an hour ago.
+// clearCrash forgets a slug's crash history. Called by the supervisor when an
+// exit follows sustained healthy uptime — never on readiness alone (M1).
 func (m *OrgManager) clearCrash(slug string) {
 	m.mu.Lock()
 	delete(m.crashes, slug)

@@ -29,9 +29,13 @@ plan, this is the hard backstop against package Go bypassing `app.Save`).
 `.runtime/packages.json` is retired — nothing consumes the resolved slug list
 tenant-side (the artifact links exactly its set and reconciles its registry
 from its own recipe.json/manifests); the router keeps the in-memory list only
-for the mail-socket decision. **Step 5's structural work is complete** and every
-audit finding is closed; the browser-level hosted install suite (goal 2's
-"same UX" finish line) is the remaining test-infra item.
+for the mail-socket decision. **Step 5 is COMPLETE** (2026-07-31): every audit
+finding is closed and the browser-level hosted install suite landed —
+`tests/install/run-hosted-install.sh` drives the todo-install phases against
+an org subdomain end-to-end (see §7 step 5 for what it surfaced and fixed:
+tenant SPA serving, the ctl-socket build write-deadline, the read-throttle
+burst, npm-warning-proof version discovery, and the refused-proposal restore
+corruption).
 **Motivates:** letting a tenant's own admin manage that org's packages —
 install, uninstall, upgrade, including third-party packages the operator has
 never heard of — while a new org can still be spun up from a default set in
@@ -303,7 +307,7 @@ moment it is copied, which is the fork semantics we want. The append-only
 | shared `serve-org` binary | per-recipe artifact; `serve-org` main folds into the dual-mode binary |
 | `internal/store` (package store) + `internal/materialize` symlink farms | demoted to the build-artifact cache (`builds/<hash>/`, bind-mounted read-only); per-file CAS optional later |
 | `transpileForStore` / publish-time manifest eval / `POST /api/store/packages` | deleted — packages are fetched and validated by `pkgbuild` in the builder; the paired esbuild goldens with the fork lose the router-side member |
-| `.runtime/{carddav,caldav,webdav}.json` materialized DAV config | candidate for deletion — a per-org build always contains exactly the org's features, so tenant mode can mount DAV from feature registration like the host does (port listeners stay router-owned via injected sockets). Decide during implementation, not by drift. |
+| `.runtime/{carddav,caldav,webdav}.json` materialized DAV config | DECIDED (taken with the single-`Register` contract): tenant mode mounts DAV from feature registration like the host — each package's one `Register` self-mounts in both compositions, hooks riding the Source directly. New cores ignore these files; the router keeps writing them because pre-single-Register artifact binaries still read theirs. Port listeners stay router-owned via injected sockets (`coreserver.TenantContext.Mail`). |
 | `.runtime/quota.json`, `packages.json`, `app.json` | quota stays host-authoritative; `packages.json` becomes redundant with the built-in set (the artifact *is* the gate) |
 | `orgs.lockfile` flat map | stays, plus per-entry integrity/provenance and the org's current recipe hash |
 
@@ -488,12 +492,11 @@ idle sweep, and the readiness protocol are untouched.
    hosted uninstall over the org socket, and the test asserts the DOWNs
    ran, the respawn committed, job-status reads "success", and the
    registry row is gone. The browser-level goal — the single-tenant
-   install suite (`tinycld/tests/install/todo-install.spec.ts`) verbatim
-   against an org subdomain — additionally needs an npm-published todo
-   fixture (or a registry-fronting runner) plus hosted org onboarding in
-   the runner; it remains the step-5-era finish line for goal 2's "same
-   UX". `multiorg-deploy.spec.ts` (runner `run-multiorg-deploy.sh`) keeps
-   covering the store-path provisioning routes over real HTTP.
+   install suite's phases against an org subdomain — landed with step 5's
+   `run-hosted-install.sh` (see below). `multiorg-deploy.spec.ts` and its
+   runner were DELETED with the store path they exercised
+   (`/api/store/packages`, `serve-org`); the hosted runner's org create
+   over real HTTP supersedes their provisioning-route coverage.
 5. **Deletions** (§5) + hostile-child audit + kernel quotas + docs
    (append-only migration rule).
    **IN PROGRESS 2026-07-31.** Landed: the legacy store/materialize
@@ -536,8 +539,80 @@ idle sweep, and the readiness protocol are untouched.
    (`MT_TENANT_DISK_MAX` → `quotactl` block limit on the tenant uid, warn-not-
    fail). `.runtime/packages.json` is retired — the artifact is the gate, and
    the router keeps the in-memory slug list only for the mail-socket decision.
-   **The structural step-5 work is complete.** Remaining: the browser-level
-   hosted install suite (goal 2's finish line).
+   **The browser-level hosted install suite (goal 2's "same UX" finish line)
+   landed 2026-07-31**: `tinycld/tests/install/run-hosted-install.sh` boots a
+   real serve-multi + a fixture npm registry
+   (`hosted-npm-registry.mjs` — multi-version packuments from the base
+   sibling and the todo repo's tags; `MT_NPM_REGISTRY` →
+   `builder.Config.NpmRegistry`, also honored by `/v1/versions`), creates the
+   org over the control-plane API, onboards the tenant superuser
+   (suspend → the artifact binary's own `superuser upsert` → resume), and
+   drives the todo-install.spec.ts phases against `http://acme.localhost` —
+   install v1 → verify (+ add a todo) → upgrade v2 → verify (+ tag) →
+   downgrade v1 (drop report, typed confirm, in-tenant DOWNs) → verify →
+   uninstall → verify — everything through the org's own SPA. Phases with no
+   hosted counterpart stay runner-unselected: the /admin bootstrap wizard
+   (host-only; onboarding above replaces it), the buggy-fixture entrypoint
+   rollbacks (hosted revert is covered at protocol level by
+   TestHostedDeployE2E), build-history revert (`pkg_build` archives are
+   single-tenant machinery), OTA assertions (§6 "Native OTA per org" stays
+   open; `PW_SKIP_OTA`), and the git-remote core phases (the hosted base
+   rides the npm lockfile). Getting it green surfaced and fixed real product
+   gaps, each with a regression guard where testable:
+   - **Tenants served no SPA at all** — `registerStaticServe` was host-only
+     and the router only proxies. `RegisterTenant` now mounts the org's
+     materialized `pb_public` (the artifact's own web release) with the
+     app.html fallback + /api JSON-404 guard (`registerTenantStaticServe`).
+   - **`/v1/build` EOF'd every novel build**: the ctl-socket server's 30s
+     slow-loris write deadline killed the synchronous minutes-long build
+     response (the Go e2e masked it by serving the handler timeout-less).
+     The build handler now extends its own request's write deadline to the
+     build budget after the bounded body is decoded.
+   - **The read throttle refused one legitimate UI interaction**: the
+     Packages screen fires a /v1/versions per registry row per mount and the
+     install's /v1/resolve lands right behind them; the strict 1/s floor is
+     now a token bucket (burst 10, same sustained rate), and the tenant
+     caches /v1/versions per spec for 60s (parity with the single-tenant
+     handler's pkgbuild cache).
+   - **npm warnings broke version discovery everywhere**: `ListNpmVersions`
+     parsed RunCmd's combined output, so any `npm warn` line in front of the
+     JSON failed the parse (latent single-tenant bug too). Discovery now
+     parses stdout only (`RunCmdStdout`).
+   - **A refused proposal after downs CORRUPTED the org DB**: the
+     back-to-back upgrade→downgrade tripped the 30s deploy floor, and the
+     tenant's in-process snapshot restore copied over the live data.db under
+     open WAL connections — the org crash-looped on "database disk image is
+     malformed". Two fixes: rate-limited proposals are typed
+     (`ErrCtlRateLimited`) and retried through the floor
+     (`proposeWithRetry`), and the restore now quiesces the pools
+     (`ResetBootstrapState`) before copying, reopening after.
+   - Operability: build-job failures now carry the failing command's output
+     tail in the error (`pnpm install`/`go build` — a bare "exit status 1"
+     was all that left the confined job child), the job child warns when its
+     TMPDIR is long enough to break unix-socket creation (tsx's IPC pipe vs
+     sun_path — an obscure EINVAL deep in pnpm install otherwise), and
+     finished job dirs are actually removed (the go tool's read-only module
+     cache defeated the plain RemoveAll on non-root hosts).
+   - **Degraded-mode control sockets are opt-in for dev**: the L2 refusal
+     (no ctl.sock without a confining spawner) still stands by default;
+     `MT_ALLOW_UNCONFINED_CONTROL=true` (manager
+     `AllowUnconfinedControl`) re-enables them on unconfined dev hosts —
+     loudly warned, never for production — which is what lets the suite run
+     on macOS at all.
+   - **Feature packages must export `RegisterTenant`** — this finding led to
+     the SINGLE-`Register` CONTRACT (landed right after): the generated
+     tenant registrar called `RegisterTenant` unconditionally, so the todo
+     fixture (which predates the entry) broke every workspace `go build`.
+     Now ONE `Register(app)` serves both compositions: the generator emits
+     one registrar, `coreserver.RegisterTenant` stamps a `TenantContext`
+     into the app store before it runs, and the rare package that must
+     differ hosted detects it (`coreserver.GetTenantContext`/`IsTenant` —
+     mail picks injected listeners over binding ports; everything else
+     needs no conditional). DAV packages self-mount in both modes (the §5
+     materialized-DAV row's deletion candidate, taken), which also deleted
+     drive's `RegisterSourceHooks` closure bridge. Third-party packages
+     with only `Register` — the todo fixture's public tags as-is — now
+     build in every mode.
 
 Each step lands green on its own; the pinned menu and materialize path worked
 until step 5 removed them.

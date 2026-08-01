@@ -80,10 +80,12 @@ func quietLogger() *slog.Logger { return slog.New(slog.NewTextHandler(io.Discard
 // provision two orgs from it → seed each tenant DB → REPORT each org's CardDAV
 // endpoint through its proxy and confirm each serves ONLY its own contact.
 //
-// With per-process isolation this exercises the real path end to end: the host
-// reads the artifact's staged manifest, writes the sources to the org's runtime
-// dir, the tenant process reads them and mounts its own CardDAV routes against
-// its own DB, and the response travels back over the unix socket.
+// With per-process isolation this exercises the real path end to end: under
+// the single-Register contract the tenant's own linked contacts Go mounts
+// /carddav (feature self-mount — the router still materializes the manifest's
+// carddav block into the org's runtime dir, but only pre-single-Register
+// artifact binaries read it), the mount serves against the org's own DB, and
+// the response travels back over the unix socket.
 func TestIntegration_MultiOrgCardDAV(t *testing.T) {
 	root := t.TempDir()
 	mgr, p, artifactDir := setupCardDAVOrgs(t, root)

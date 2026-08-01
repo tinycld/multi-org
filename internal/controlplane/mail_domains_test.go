@@ -111,3 +111,136 @@ func TestOrgMailDomains_RejectsNonCanonicalDomains(t *testing.T) {
 		}
 	}
 }
+
+// mailDomainProvisioner pairs the mail-domain fixture with a Provisioner. The
+// domain operations touch only the orgs/org_mail_domains rows, so no builder
+// is needed.
+func mailDomainProvisioner(t *testing.T) (*ControlPlane, *Provisioner) {
+	t.Helper()
+	cp := mailDomainFixture(t)
+	return cp, NewProvisioner(cp.App, t.TempDir(), func(string) {}, nil)
+}
+
+func TestAddMailDomain_RegistersAndLists(t *testing.T) {
+	cp, p := mailDomainProvisioner(t)
+
+	if _, err := p.AddMailDomain("acme", "acme-corp.com"); err != nil {
+		t.Fatalf("AddMailDomain: %v", err)
+	}
+	if slug, ok := MailDomainLookup(cp.App)("acme-corp.com"); !ok || slug != "acme" {
+		t.Fatalf("lookup = (%q, %v), want (acme, true)", slug, ok)
+	}
+
+	domains, err := p.ListMailDomains("acme")
+	if err != nil {
+		t.Fatalf("ListMailDomains: %v", err)
+	}
+	if len(domains) != 1 || domains[0] != "acme-corp.com" {
+		t.Fatalf("domains = %v, want [acme-corp.com]", domains)
+	}
+}
+
+// The collection's pattern rejects uppercase outright, so the route must
+// canonicalize before the write or an operator typing "Acme-Corp.com" gets a
+// validation error for input the relay would have matched fine.
+func TestAddMailDomain_CanonicalizesInput(t *testing.T) {
+	cp, p := mailDomainProvisioner(t)
+
+	rec, err := p.AddMailDomain("acme", "  Acme-Corp.COM  ")
+	if err != nil {
+		t.Fatalf("AddMailDomain: %v", err)
+	}
+	if got := rec.GetString("domain"); got != "acme-corp.com" {
+		t.Fatalf("stored domain = %q, want acme-corp.com", got)
+	}
+	if _, ok := MailDomainLookup(cp.App)("acme-corp.com"); !ok {
+		t.Fatal("canonicalized domain must resolve")
+	}
+}
+
+// The unique index is the anti-theft guard; the route must surface it as an
+// error rather than silently repointing the domain at the new claimant.
+func TestAddMailDomain_RefusesDomainOwnedByAnotherOrg(t *testing.T) {
+	cp, p := mailDomainProvisioner(t)
+	createActiveOrg(t, cp.App, "rival")
+
+	if _, err := p.AddMailDomain("acme", "shared.example.com"); err != nil {
+		t.Fatalf("first claim: %v", err)
+	}
+	if _, err := p.AddMailDomain("rival", "shared.example.com"); err == nil {
+		t.Fatal("a second org claiming an owned domain would steal its mail; must be refused")
+	}
+	if slug, _ := MailDomainLookup(cp.App)("shared.example.com"); slug != "acme" {
+		t.Fatalf("domain still owned by %q, want acme", slug)
+	}
+}
+
+func TestAddMailDomain_UnknownOrgErrors(t *testing.T) {
+	_, p := mailDomainProvisioner(t)
+	if _, err := p.AddMailDomain("ghost", "ghost.example.com"); err == nil {
+		t.Fatal("registering a domain to a nonexistent org must fail")
+	}
+}
+
+func TestRemoveMailDomain_ReleasesDomain(t *testing.T) {
+	cp, p := mailDomainProvisioner(t)
+	if _, err := p.AddMailDomain("acme", "acme-corp.com"); err != nil {
+		t.Fatalf("AddMailDomain: %v", err)
+	}
+
+	// Case-insensitive, matching the add path.
+	if err := p.RemoveMailDomain("acme", "ACME-Corp.com"); err != nil {
+		t.Fatalf("RemoveMailDomain: %v", err)
+	}
+	if _, ok := MailDomainLookup(cp.App)("acme-corp.com"); ok {
+		t.Fatal("removed domain must stop resolving")
+	}
+	// Released, so another org may now claim it.
+	createActiveOrg(t, cp.App, "rival")
+	if _, err := p.AddMailDomain("rival", "acme-corp.com"); err != nil {
+		t.Fatalf("released domain should be claimable: %v", err)
+	}
+}
+
+// A mistyped slug must not delete a domain belonging to someone else.
+func TestRemoveMailDomain_RefusesForeignDomain(t *testing.T) {
+	cp, p := mailDomainProvisioner(t)
+	createActiveOrg(t, cp.App, "rival")
+	if _, err := p.AddMailDomain("acme", "acme-corp.com"); err != nil {
+		t.Fatalf("AddMailDomain: %v", err)
+	}
+
+	if err := p.RemoveMailDomain("rival", "acme-corp.com"); err == nil {
+		t.Fatal("removing a domain owned by another org must be refused")
+	}
+	if slug, ok := MailDomainLookup(cp.App)("acme-corp.com"); !ok || slug != "acme" {
+		t.Fatalf("owner changed to (%q,%v) — the refused delete must be a no-op", slug, ok)
+	}
+}
+
+func TestRemoveMailDomain_UnregisteredErrors(t *testing.T) {
+	_, p := mailDomainProvisioner(t)
+	if err := p.RemoveMailDomain("acme", "nobody.example.com"); err == nil {
+		t.Fatal("removing an unregistered domain must fail")
+	}
+}
+
+// Archiving an org cascades its domain rows away (CascadeDelete on the
+// relation), which releases them for reuse rather than stranding them.
+func TestMailDomains_CascadeOnOrgDelete(t *testing.T) {
+	cp, p := mailDomainProvisioner(t)
+	if _, err := p.AddMailDomain("acme", "acme-corp.com"); err != nil {
+		t.Fatalf("AddMailDomain: %v", err)
+	}
+
+	org, err := cp.App.FindFirstRecordByData("orgs", "slug", "acme")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cp.App.Delete(org); err != nil {
+		t.Fatalf("delete org: %v", err)
+	}
+	if _, ok := MailDomainLookup(cp.App)("acme-corp.com"); ok {
+		t.Fatal("domain must not resolve after its org is deleted")
+	}
+}

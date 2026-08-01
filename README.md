@@ -141,6 +141,32 @@ and tenant-dialed, so identity is the filesystem):
 
 Per-org deploys are serialized (busy → 409) and rate-limited (→ 429).
 
+### Mail domains
+
+Inbound MX routing is keyed by the `org_mail_domains` registry — which org owns
+a recipient domain. The provisioning API takes a **slug**, not the underlying
+orgs relation id:
+
+```sh
+curl -X POST .../api/orgs/acme/mail-domains -d '{"domain":"acme-corp.com"}'   # 201
+curl      -X GET    .../api/orgs/acme/mail-domains                            # {"domains":[…]}
+curl      -X DELETE .../api/orgs/acme/mail-domains/acme-corp.com              # 204
+```
+
+Superuser-only, like every other provisioning route: a domain claim is
+exclusive (unique index), so letting an org claim its own would let it deny
+that domain to every other org — and claiming a sibling's domain would steal
+its mail. Input is lowercased before the write (the collection's pattern
+*rejects* uppercase rather than normalizing, since the relay compares
+case-folded against canonical storage). Removal is scoped to the owning org, so
+a mistyped slug cannot release someone else's domain.
+
+This governs **inbound MX (`:25`) only**. IMAPS/SMTPS still demux by TLS SNI on
+`<slug>.<base>`, so an org receiving mail at `@acme-corp.com` still connects its
+clients to `acme.tinycld.org`. Pointing the domain's MX record at
+`MT_MX_HOSTNAME` is the customer's DNS work — registering the domain here does
+not do it.
+
 ## Tenant security boundary
 
 **The boundary is the OS process.** Each org runs in its own artifact binary

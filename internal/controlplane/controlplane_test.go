@@ -16,7 +16,7 @@ func TestControlPlane_BootstrapsWithOrgsCollection(t *testing.T) {
 	if err := cp.App.Bootstrap(); err != nil {
 		t.Fatalf("bootstrap: %v", err)
 	}
-	defer cp.App.ResetBootstrapState()
+	defer func() { WaitForAppDeploys(cp.App); _ = cp.App.ResetBootstrapState() }()
 
 	if err := cpInitForTest(cp); err != nil {
 		t.Fatalf("migrations: %v", err)

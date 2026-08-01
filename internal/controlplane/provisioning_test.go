@@ -25,7 +25,7 @@ func newProvCP(t *testing.T) (*ControlPlane, string) {
 	if err := cp.App.Bootstrap(); err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = cp.App.ResetBootstrapState() })
+	t.Cleanup(func() { WaitForAppDeploys(cp.App); _ = cp.App.ResetBootstrapState() })
 	if err := cpInitForTest(cp); err != nil {
 		t.Fatal(err)
 	}

@@ -155,7 +155,7 @@ func TestIntegration_CreateOrgToLoadWithSchema(t *testing.T) {
 	if err := cp.App.Bootstrap(); err != nil {
 		t.Fatal(err)
 	}
-	defer cp.App.ResetBootstrapState()
+	defer func() { WaitForAppDeploys(cp.App); _ = cp.App.ResetBootstrapState() }()
 	if err := cpInitForTest(cp); err != nil {
 		t.Fatal(err)
 	}
@@ -216,7 +216,7 @@ func TestIntegration_MaliciousMigrationCannotExec(t *testing.T) {
 	if err := cp.App.Bootstrap(); err != nil {
 		t.Fatal(err)
 	}
-	defer cp.App.ResetBootstrapState()
+	defer func() { WaitForAppDeploys(cp.App); _ = cp.App.ResetBootstrapState() }()
 	if err := cpInitForTest(cp); err != nil {
 		t.Fatal(err)
 	}
@@ -269,7 +269,7 @@ func assertTenantHasWidgets(t *testing.T, dataDir string) {
 	if err := tenant.Bootstrap(); err != nil {
 		t.Fatalf("bootstrap tenant DB: %v", err)
 	}
-	defer tenant.App.ResetBootstrapState()
+	defer func() { WaitForAppDeploys(tenant.App); _ = tenant.App.ResetBootstrapState() }()
 	if _, err := tenant.App.FindCollectionByNameOrId("widgets"); err != nil {
 		t.Fatalf("tenant DB missing 'widgets' collection from package migration: %v", err)
 	}
@@ -289,7 +289,7 @@ func TestIntegration_TenantHasNoControlPlaneCollections(t *testing.T) {
 	if err := cp.App.Bootstrap(); err != nil {
 		t.Fatal(err)
 	}
-	defer cp.App.ResetBootstrapState()
+	defer func() { WaitForAppDeploys(cp.App); _ = cp.App.ResetBootstrapState() }()
 	if err := cpInitForTest(cp); err != nil {
 		t.Fatal(err)
 	}
@@ -319,7 +319,7 @@ func TestIntegration_TenantHasNoControlPlaneCollections(t *testing.T) {
 	if err := tenant.Bootstrap(); err != nil {
 		t.Fatalf("bootstrap tenant DB: %v", err)
 	}
-	defer tenant.App.ResetBootstrapState()
+	defer func() { WaitForAppDeploys(tenant.App); _ = tenant.App.ResetBootstrapState() }()
 
 	for _, name := range []string{"orgs", "deployments", "control_settings", "org_mail_domains"} {
 		if _, err := tenant.App.FindCollectionByNameOrId(name); err == nil {
@@ -346,7 +346,7 @@ func TestIntegration_MaliciousHookCannotCrashControlPlane(t *testing.T) {
 	if err := cp.App.Bootstrap(); err != nil {
 		t.Fatal(err)
 	}
-	defer cp.App.ResetBootstrapState()
+	defer func() { WaitForAppDeploys(cp.App); _ = cp.App.ResetBootstrapState() }()
 	if err := cpInitForTest(cp); err != nil {
 		t.Fatal(err)
 	}

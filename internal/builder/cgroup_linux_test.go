@@ -14,6 +14,10 @@ import (
 	"tinycld.org/multi-org/internal/cgrouplimits"
 )
 
+// These tests must be named TestConfinement* — the CI job that runs the suite
+// as root filters with `-run TestConfinement`, and anything outside that prefix
+// silently skips (the unprivileged pass cannot write cgroups). A test that only
+// ever skips is how the bug this file covers reached production.
 func requireCgroupTestEnv(t *testing.T) string {
 	t.Helper()
 	if os.Geteuid() != 0 {
@@ -49,7 +53,7 @@ func startSleeper(t *testing.T) int {
 // configured builder limits must actually reach the kernel. Readback asserts
 // the kernel's canonical form, so this cannot pass on bytes merely landing in a
 // file the kernel rejected.
-func TestPlaceJobInCgroup_LimitsApplied(t *testing.T) {
+func TestConfinementBuilderJob_CgroupLimitsApplied(t *testing.T) {
 	root := requireCgroupTestEnv(t)
 	const buildID = "recipe-test"
 	t.Cleanup(func() {
@@ -93,7 +97,7 @@ func TestPlaceJobInCgroup_LimitsApplied(t *testing.T) {
 // rejects must not cost the job its memory and pids caps. Placement reports the
 // rejected limit but still puts the pid in the group, so the build stays
 // confined by whatever the kernel did accept.
-func TestPlaceJobInCgroup_RejectedLimitStillPlacesPid(t *testing.T) {
+func TestConfinementBuilderJob_RejectedLimitStillPlacesPid(t *testing.T) {
 	root := requireCgroupTestEnv(t)
 	const buildID = "recipe-badcpu"
 	t.Cleanup(func() {

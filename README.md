@@ -120,6 +120,29 @@ capability wiring from the artifact's staged
 by construction; an hourly sweep removes artifacts no org's current or
 previous build references.
 
+Provisioning **requires an owner**: `POST /api/orgs` takes `owner_email`, and
+mints both identities the single-tenant `/setup` wizard creates — a PocketBase
+`_superusers` record (the `/_/` admin) and a `users` record with `role=owner`
+plus its `super_admins` grant (the app login). A tenant never serves the setup
+wizard (those routes are bound in the host composition only), so an org created
+without this would boot, serve, and have no account able to log in.
+
+`owner_password` is optional: supply one to pre-fill a known secret, or omit it
+and a random password is generated and returned as `owner_password` in the
+response — the only time it is ever visible, since it is stored hashed.
+
+```jsonc
+// POST /api/orgs
+{ "slug": "acme", "display_name": "Acme", "owner_email": "you@example.com" }
+// → { "slug": "acme", "status": "active",
+//      "owner_email": "you@example.com", "owner_password": "<generated>" }
+```
+
+The account is created after the tenant's boot verification, because that boot
+is what runs the org's migrations — `users` and `super_admins` do not exist
+before it. The router runs `create-owner` on the org's **own artifact binary**
+(the same mechanism the deploy path uses), so it never links tenant code.
+
 `POST /api/orgs` with **no** lockfile copies the operator-editable template
 (`PUT /api/settings/default-lockfile`) — the default set is just a warm cache
 entry, so provisioning costs seconds. A lockfile that omits the app shell is

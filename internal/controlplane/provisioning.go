@@ -2,12 +2,16 @@ package controlplane
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/base64"
 	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
+	"strings"
 	"time"
 
 	"github.com/pocketbase/pocketbase/apis"
@@ -42,6 +46,13 @@ type Provisioner struct {
 	// protocol. Nil until EnableBuilds — a router without a builder can serve
 	// existing orgs but refuses to provision or deploy.
 	deployer *Deployer
+
+	// createOwnerFn mints the org's operator. Nil means the real path: run
+	// `create-owner` on the artifact's own binary. Tests substitute it —
+	// unit tests have no compiled artifact to execute, and the behaviour
+	// worth asserting there is the ORCHESTRATION (that it runs after
+	// verification, that a failure is reported), not exec plumbing.
+	createOwnerFn func(slug, orgDir, artifactDir, email, password string) error
 }
 
 // NewProvisioner builds a Provisioner. verify may be nil, in which case
@@ -82,23 +93,59 @@ var reservedSlugs = map[string]bool{"admin": true, "www": true}
 
 func validSlug(s string) bool { return slugRe.MatchString(s) && !reservedSlugs[s] }
 
+// OwnerAccount is the org's first operator, minted during provisioning.
+//
+// Email is REQUIRED: a hosted org has no other way to get an account. The
+// /setup wizard that bootstraps a single-tenant deployment is bound in the
+// HOST composition only, so a tenant never serves it — an org provisioned
+// without an owner boots, serves, and has zero users, leaving nobody able to
+// log in. Requiring it makes that state unreachable rather than a trap.
+//
+// Password is optional: supply one to pre-fill a known secret, or leave it
+// empty and provisioning generates a random one and returns it (the only time
+// it is ever visible — it is stored hashed).
+//
+// Both identities the setup wizard creates are minted from these credentials:
+// the PocketBase `_superusers` record behind /_/, and the `users` record with
+// role=owner plus its `super_admins` grant that the APP authenticates against.
+type OwnerAccount struct {
+	Email    string
+	Password string
+}
+
 // CreateOrg provisions a new org, or resumes a previously half-provisioned one.
 // If an org row for the slug already exists and is still active, it errors; if
 // the existing row is in a non-active (e.g. stranded "provisioning") state, it
 // resumes: re-builds the set (a cache hit), re-verifies the tenant boot, and
 // flips to active.
-func (p *Provisioner) CreateOrg(slug, displayName string, lock map[string]string) (*core.Record, error) {
+//
+// The org's owner account is created before the org is returned, so a
+// provisioned org is immediately usable. The returned password is the one that
+// was set — the caller's, or the generated one when owner.Password was empty.
+// It is the only time the password is visible; it is stored hashed.
+func (p *Provisioner) CreateOrg(slug, displayName string, lock map[string]string, owner OwnerAccount) (*core.Record, string, error) {
 	if !validSlug(slug) {
-		return nil, fmt.Errorf("invalid slug %q", slug)
+		return nil, "", fmt.Errorf("invalid slug %q", slug)
+	}
+	if strings.TrimSpace(owner.Email) == "" {
+		return nil, "", fmt.Errorf("owner email is required: an org without one has no account that can log in")
+	}
+	ownerPassword := owner.Password
+	if ownerPassword == "" {
+		generated, err := generateOwnerPassword()
+		if err != nil {
+			return nil, "", fmt.Errorf("generate owner password: %w", err)
+		}
+		ownerPassword = generated
 	}
 	col, err := p.app.FindCollectionByNameOrId("orgs")
 	if err != nil {
-		return nil, fmt.Errorf("find orgs collection: %w", err)
+		return nil, "", fmt.Errorf("find orgs collection: %w", err)
 	}
 
 	existing, _ := p.app.FindFirstRecordByData("orgs", "slug", slug)
 	if existing != nil && existing.GetString("status") == "active" {
-		return nil, fmt.Errorf("org %q already exists", slug)
+		return nil, "", fmt.Errorf("org %q already exists", slug)
 	}
 
 	// D7: no explicit lockfile ⇒ copy the control-plane template. The org
@@ -108,7 +155,7 @@ func (p *Provisioner) CreateOrg(slug, displayName string, lock map[string]string
 		var err error
 		lock, err = DefaultLockfile(p.app)
 		if err != nil {
-			return nil, fmt.Errorf("default lockfile: %w", err)
+			return nil, "", fmt.Errorf("default lockfile: %w", err)
 		}
 	}
 
@@ -118,25 +165,25 @@ func (p *Provisioner) CreateOrg(slug, displayName string, lock map[string]string
 	// the artifact at load — nothing is materialized here. A base-bearing
 	// default set is a cache hit, so provisioning costs seconds (D4).
 	if !IsArtifactSet(lock) {
-		return nil, fmt.Errorf("lockfile must include the app shell (%q): every org boots from a built artifact", pkgbuild.BaseMemberSlug)
+		return nil, "", fmt.Errorf("lockfile must include the app shell (%q): every org boots from a built artifact", pkgbuild.BaseMemberSlug)
 	}
 	if p.deployer == nil {
-		return nil, fmt.Errorf("no builder is configured (MT_SCAFFOLD_ROOT); cannot provision orgs")
+		return nil, "", fmt.Errorf("no builder is configured (MT_SCAFFOLD_ROOT); cannot provision orgs")
 	}
 
 	orgDir := filepath.Join(p.root, "pb_orgs", slug)
 	if err := os.MkdirAll(filepath.Join(orgDir, "pb_data"), 0o755); err != nil {
-		return nil, fmt.Errorf("create org dir: %w", err)
+		return nil, "", fmt.Errorf("create org dir: %w", err)
 	}
 
 	lfBytes, err := lockfile.OrgLockfile(lock).Marshal()
 	if err != nil {
-		return nil, fmt.Errorf("marshal lockfile: %w", err)
+		return nil, "", fmt.Errorf("marshal lockfile: %w", err)
 	}
 
 	res, err := p.deployer.BuildSet(context.Background(), lock)
 	if err != nil {
-		return nil, fmt.Errorf("build package set: %w", err)
+		return nil, "", fmt.Errorf("build package set: %w", err)
 	}
 	recipeHash := res.RecipeHash
 	p.deployer.trackHash(recipeHash)
@@ -153,7 +200,7 @@ func (p *Provisioner) CreateOrg(slug, displayName string, lock map[string]string
 	rec.Set("lockfile", string(lfBytes))
 	rec.Set("recipe_hash", recipeHash)
 	if err := p.app.Save(rec); err != nil {
-		return nil, fmt.Errorf("save org record: %w", err)
+		return nil, "", fmt.Errorf("save org record: %w", err)
 	}
 
 	// Activate BEFORE verifying: the manager's load path refuses a non-active
@@ -166,7 +213,7 @@ func (p *Provisioner) CreateOrg(slug, displayName string, lock map[string]string
 	// collapses into the same singleflight spawn the verification drives.
 	rec.Set("status", "active")
 	if err := p.app.Save(rec); err != nil {
-		return nil, fmt.Errorf("activate org record: %w", err)
+		return nil, "", fmt.Errorf("activate org record: %w", err)
 	}
 
 	if p.verify != nil {
@@ -175,13 +222,100 @@ func (p *Provisioner) CreateOrg(slug, displayName string, lock map[string]string
 		if err := p.verify(ctx, slug); err != nil {
 			rec.Set("status", "provisioning")
 			if saveErr := p.app.Save(rec); saveErr != nil {
-				return nil, fmt.Errorf("tenant bootstrap: %w (and rollback to provisioning failed: %v)", err, saveErr)
+				return nil, "", fmt.Errorf("tenant bootstrap: %w (and rollback to provisioning failed: %v)", err, saveErr)
 			}
-			return nil, fmt.Errorf("tenant bootstrap: %w", err)
+			return nil, "", fmt.Errorf("tenant bootstrap: %w", err)
 		}
 	}
-	return rec, nil
+
+	// Owner account LAST: it must run after verification, because verification
+	// is the boot that runs the org's migrations — `users` and `super_admins`
+	// do not exist before it. A failure here leaves the org active and serving
+	// (it is a real, working org) but with no way in, so it is reported rather
+	// than swallowed; a retried CreateOrg re-runs the step idempotently.
+	createOwner := p.createOwnerFn
+	if createOwner == nil {
+		createOwner = p.createOwner
+	}
+	if err := createOwner(slug, orgDir, res.Dir, owner.Email, ownerPassword); err != nil {
+		return nil, "", fmt.Errorf("org %q provisioned but owner account failed: %w", slug, err)
+	}
+	return rec, ownerPassword, nil
 }
+
+// createOwner mints the org's first app account by running the artifact's own
+// binary against the org's pb_data.
+//
+// It runs the binary rather than opening the DB here for two reasons. The
+// schema belongs to the tenant's package set, not the router — only the
+// artifact knows how to bootstrap its own app. And the router deliberately
+// never links tenant code: executing the artifact keeps that boundary, exactly
+// as the deploy path does.
+//
+// The tenant is evicted first: SQLite is held open by the running process, and
+// a second writer risks corruption. The next request respawns it.
+func (p *Provisioner) createOwner(slug, orgDir, artifactDir, email, password string) error {
+	binary := filepath.Join(artifactDir, ownerBinaryName)
+	if _, err := os.Stat(binary); err != nil {
+		return fmt.Errorf("artifact binary not found at %s: %w", binary, err)
+	}
+
+	if p.evict != nil {
+		p.evict(slug)
+		// Give the evicted tenant a moment to finish its drain and release
+		// the database before a second process opens it for writing.
+		time.Sleep(evictDrainGrace)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), ownerCreateTimeout)
+	defer cancel()
+
+	// The password rides in a flag rather than positionally so it is never
+	// mistaken for the email; both are visible in the process table either way,
+	// which is acceptable for a root-only host but worth knowing.
+	cmd := exec.CommandContext(ctx, binary, "create-owner", email,
+		"--password", password,
+		"--dir", filepath.Join(orgDir, "pb_data"))
+	cmd.Dir = orgDir
+	// Scrubbed environment, same posture as a build job: the artifact is
+	// tenant-supplied code and has no business reading the router's env
+	// (MT_SUPERUSER_PASSWORD, TLS key paths, the Cloudflare token).
+	cmd.Env = []string{"HOME=" + orgDir, "PATH=/usr/bin:/bin"}
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("create-owner: %w: %s", err, strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
+// ownerBinaryName is the server binary's name inside an artifact. It matches
+// builder.Config.BinaryName's default; a deployment that renames one must
+// rename both.
+const ownerBinaryName = "tinycld"
+
+// generateOwnerPassword returns a URL-safe random password for a provisioned
+// org's operator: 24 random bytes, base64url-encoded to 32 characters.
+//
+// Deliberately duplicated rather than imported from coreserver: that package
+// pulls the whole app framework (Sentry, Postmark, webpush, websockets) into
+// the router's dependency graph, and the router links no tenant code by
+// design. Twenty lines of crypto/rand is the cheaper side of that trade.
+func generateOwnerPassword() (string, error) {
+	b := make([]byte, 24)
+	if _, err := rand.Read(b); err != nil {
+		return "", err
+	}
+	return base64.RawURLEncoding.EncodeToString(b), nil
+}
+
+// evictDrainGrace is how long to wait after evicting a tenant before opening
+// its database from another process. The manager's own drain is bounded; this
+// is the small margin on top of it.
+const evictDrainGrace = 3 * time.Second
+
+// ownerCreateTimeout bounds the create-owner subprocess. It opens the DB and
+// writes two records — seconds of work — so this only fires if it wedges.
+const ownerCreateTimeout = 60 * time.Second
 
 // tenantVerifyTimeout bounds the provision-time boot verification. It only
 // caps how long CreateOrg waits: the manager bounds the spawn itself with its
@@ -217,15 +351,33 @@ func (p *Provisioner) RegisterRoutes() {
 				Slug        string            `json:"slug"`
 				DisplayName string            `json:"display_name"`
 				Lockfile    map[string]string `json:"lockfile"`
+				// The org's first operator. Email is REQUIRED — a tenant
+				// serves no setup wizard, so an org without one has no
+				// account that can log in. Password is optional: omit it and
+				// a random one is generated and returned.
+				OwnerEmail    string `json:"owner_email"`
+				OwnerPassword string `json:"owner_password"`
 			}
 			if err := re.BindBody(&body); err != nil {
 				return re.BadRequestError("invalid body", err)
 			}
-			rec, err := p.CreateOrg(body.Slug, body.DisplayName, body.Lockfile)
+			rec, password, err := p.CreateOrg(body.Slug, body.DisplayName, body.Lockfile,
+				OwnerAccount{Email: body.OwnerEmail, Password: body.OwnerPassword})
 			if err != nil {
 				return re.BadRequestError(err.Error(), err)
 			}
-			return re.JSON(200, map[string]any{"slug": rec.GetString("slug"), "status": rec.GetString("status")})
+			resp := map[string]any{
+				"slug":        rec.GetString("slug"),
+				"status":      rec.GetString("status"),
+				"owner_email": body.OwnerEmail,
+			}
+			// Return the password ONLY when we generated it: echoing one the
+			// caller already sent back over the wire buys nothing and widens
+			// where it can be logged.
+			if body.OwnerPassword == "" {
+				resp["owner_password"] = password
+			}
+			return re.JSON(200, resp)
 		}).Bind(apis.RequireSuperuserAuth())
 
 		g.POST("/orgs/{slug}/deploy", func(re *core.RequestEvent) error {

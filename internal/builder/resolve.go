@@ -197,6 +197,11 @@ func (b *Builder) resolve(refs []PackageRef) (*resolvedInput, error) {
 			return nil, fmt.Errorf("resolve %s: %w", ref.Spec, err)
 		}
 		member.Integrity = integrity
+		// Record what this member was fetched FROM, not just what it turned
+		// out to be. Version discovery needs it: a git-installed member's
+		// upgrades come from its remote's tags, and its npm name alone would
+		// send the lookup to a registry that may not carry it at all.
+		member.Spec = ref.Spec
 		if _, dup := res.Dirs[member.Slug]; dup {
 			return nil, fmt.Errorf("resolve: two specs resolve to member %q", member.Slug)
 		}

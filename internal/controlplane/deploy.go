@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"sort"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -259,6 +260,16 @@ func IsArtifactSet(lock map[string]string) bool {
 // validated separately BEFORE concatenation into an npm spec (the
 // pkg_version_change lesson: constrain the tokens, not just the joined
 // string), and sorted so equal sets share the builder's singleflight key.
+//
+// A lockfile value is either a bare version ("0.4.0" → "<name>@0.4.0", the
+// registry form) or a complete git spec ("github:tinycld/tinycld#main"), which
+// passes through verbatim. The two are told apart by GitSpecPattern rather than
+// by a prefix convention, so the accepted git forms are exactly the ones
+// ValidatePackageSpec already allows downstream — there is no second, looser
+// notion of "looks like git" to keep in sync. Note the resulting spec's member
+// identity (slug, name, version, peerVersions) is still DISCOVERED from the
+// fetched bytes by the builder, never taken from the lockfile key: a git spec
+// cannot claim to be a package it isn't.
 func refsFor(lock map[string]string) ([]builder.PackageRef, error) {
 	if len(lock) == 0 {
 		return nil, fmt.Errorf("empty package set")
@@ -273,16 +284,49 @@ func refsFor(lock map[string]string) ([]builder.PackageRef, error) {
 	sort.Strings(names)
 	refs := make([]builder.PackageRef, 0, len(names))
 	for _, name := range names {
-		version := lock[name]
+		value := lock[name]
 		if !pkgbuild.NpmPackagePattern.MatchString(name) {
 			return nil, fmt.Errorf("invalid package name %q", name)
 		}
-		if !pkgbuild.VersionTokenPattern.MatchString(version) {
-			return nil, fmt.Errorf("invalid version %q for %s", version, name)
+		spec, err := specForLockEntry(name, value)
+		if err != nil {
+			return nil, err
 		}
-		refs = append(refs, builder.PackageRef{Spec: name + "@" + version})
+		refs = append(refs, builder.PackageRef{Spec: spec})
 	}
 	return refs, nil
+}
+
+// specForLockEntry resolves one lockfile entry to an npm fetch spec. A git-form
+// value is its own complete spec; anything else must be a bare version token
+// that is concatenated onto the package name.
+func specForLockEntry(name, value string) (string, error) {
+	if isGitSpecValue(value) {
+		// Re-validate the whole thing: GitSpecPattern matched the bare part,
+		// but ValidatePackageSpec is what also rejects unsafe characters and a
+		// malformed #ref, and is the same gate the builder applies.
+		if err := pkgbuild.ValidatePackageSpec(value); err != nil {
+			return "", fmt.Errorf("invalid git spec for %s: %w", name, err)
+		}
+		return value, nil
+	}
+	if !pkgbuild.VersionTokenPattern.MatchString(value) {
+		return "", fmt.Errorf("invalid version %q for %s", value, name)
+	}
+	return name + "@" + value, nil
+}
+
+// isGitSpecValue reports whether a lockfile value should be read as a complete
+// git spec rather than a bare version. A version token can never contain `:` or
+// `/`, so the two forms are unambiguous; the `#<ref>` suffix is stripped first
+// because GitSpecPattern deliberately does not cover it (ValidatePackageSpec
+// validates the ref separately).
+func isGitSpecValue(value string) bool {
+	bare := value
+	if hash := strings.Index(bare, "#"); hash >= 0 {
+		bare = bare[:hash]
+	}
+	return pkgbuild.GitSpecPattern.MatchString(bare)
 }
 
 // BuildSet builds (or cache-hits) the artifact for a proposed set. This is

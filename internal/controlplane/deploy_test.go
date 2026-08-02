@@ -589,6 +589,85 @@ func TestControlHandler_MetadataSurfaceRefusesNonRegistrySpecs(t *testing.T) {
 	}
 }
 
+// A git-installed org must be able to discover its upgrades — its versions
+// come from its remote's tags, not a registry. The spec is allowed ONLY
+// because it is already in that org's lockfile, i.e. a remote an operator
+// vetted by provisioning or deploying the org with it. Every other git spec
+// stays refused, so a tenant still cannot aim the router at a remote of its
+// choosing (the SSRF the blanket ban existed for).
+func TestControlHandler_AllowsGitSpecsFromTheOrgLockfile(t *testing.T) {
+	h := newDeployHarness(t)
+
+	// The harness org ships a registry lockfile; give it a git-installed set.
+	rec := h.org(t)
+	rec.Set("lockfile", `{"tinycld":"github:tinycld/tinycld#v1.0.0","todo":"git+ssh://git@github.com/acme/todo.git#main"}`)
+	if err := h.cp.App.Save(rec); err != nil {
+		t.Fatal(err)
+	}
+
+	d := newDeployer(h.cp.App, h.root, &fakeArtifactBuilder{hash: hashNew},
+		func(string) {}, nil, quietTestLogger())
+	d.readMin = 0
+	handler := d.Handler("acme")
+
+	post := func(path, body string) int {
+		w := httptest.NewRecorder()
+		handler.ServeHTTP(w, httptest.NewRequest(http.MethodPost, path, strings.NewReader(body)))
+		return w.Code
+	}
+
+	// In the lockfile → admitted past the gate. (The subprocess then runs for
+	// real; what is asserted here is only that it was not refused with 400.)
+	for _, spec := range []string{
+		"github:tinycld/tinycld#v1.0.0",
+		"git+ssh://git@github.com/acme/todo.git#main",
+		// Same remote, different ref: discovery is ABOUT finding other refs,
+		// so the bare remote is what authorizes the call.
+		"github:tinycld/tinycld#v2.0.0",
+	} {
+		if code := post("/v1/versions", `{"spec":`+jsonString(spec)+`}`); code == http.StatusBadRequest {
+			t.Errorf("/v1/versions %q = 400, want it admitted (the spec is in the org's lockfile)", spec)
+		}
+	}
+
+	// NOT in the lockfile → still refused, including a near-miss on the same
+	// host. Resembling a vetted spec must not be enough.
+	for _, spec := range []string{
+		"github:evil/pkg",
+		"github:tinycld/other-repo",
+		"git+ssh://git@github.com/acme/different.git#main",
+		"https://169.254.169.254/latest/meta-data",
+		"git+file:///root/secret",
+	} {
+		if code := post("/v1/versions", `{"spec":`+jsonString(spec)+`}`); code != http.StatusBadRequest {
+			t.Errorf("/v1/versions %q = %d, want 400 (not in the org's lockfile)", spec, code)
+		}
+	}
+}
+
+// The gate reads the org row, so an org whose lockfile is missing or corrupt
+// must REFUSE rather than fall open — unable to confirm is not permission.
+func TestControlHandler_GitSpecGateFailsClosed(t *testing.T) {
+	h := newDeployHarness(t)
+	rec := h.org(t)
+	rec.Set("lockfile", "{not json")
+	if err := h.cp.App.Save(rec); err != nil {
+		t.Fatal(err)
+	}
+
+	d := newDeployer(h.cp.App, h.root, &fakeArtifactBuilder{hash: hashNew},
+		func(string) {}, nil, quietTestLogger())
+	d.readMin = 0
+	handler := d.Handler("acme")
+
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, httptest.NewRequest(http.MethodPost, "/v1/versions",
+		strings.NewReader(`{"spec":"github:tinycld/tinycld#v1.0.0"}`)))
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("/v1/versions with an unreadable lockfile = %d, want 400", w.Code)
+	}
+}
+
 func jsonString(s string) string {
 	b, _ := json.Marshal(s)
 	return string(b)

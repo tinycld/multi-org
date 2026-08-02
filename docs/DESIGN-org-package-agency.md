@@ -342,6 +342,20 @@ idle sweep, and the readiness protocol are untouched.
   an `active.json` the pre-bridge loader reads), so each org keeps its own
   bundle instead of the two thrashing over one slot. `run-hosted-install.sh` no
   longer sets `PW_SKIP_OTA`.
+  **Verified end-to-end 2026-08-02** against a live org (`run-hosted-install.sh`,
+  all eight phases green): the builder wrote `bundles` + `runtimeVersion` into
+  `recipe.json` (both empty before this work), the tenant served a `200` manifest
+  where it previously 404'd, the `.hbc` downloaded with a SHA-256 matching the
+  manifest exactly, and up-to-date / runtime-mismatch / traversal returned
+  `204` / `204` / `404`. Install→upgrade→downgrade produced three distinct
+  content-addressed ids, and the downgrade was a **cache hit** — no fourth
+  artifact, the org returning to the byte-identical bundle it served before the
+  upgrade (D4's sharing guarantee, observable as 28.6s vs the upgrade's 2.2m).
+  One trap worth recording: `runtimeVersion` must come from `app.json`'s
+  `expo.version` ONLY. The shell's `package.json` (a deliberately different
+  number) and the recipe's base member (`@tinycld/core`) are both wrong, and
+  either would stamp bundles no device can match — a silent, permanent "updates
+  never arrive". A miss now fails the build instead of falling back.
 - **Builder capacity.** One host initially (concurrency-capped); the queue
   is the seam if it ever needs to be a fleet.
 - **Multiple templates** (plans/tiers): D7 trivially extends to named

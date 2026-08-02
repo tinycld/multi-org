@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"tinycld.org/core/pkgbuild"
+	"tinycld.org/multi-org/internal/cgrouplimits"
 )
 
 // Subcommand is the hidden argv[1] serve-multi dispatches to ServeJobStdio —
@@ -86,17 +87,22 @@ type JobConfinement struct {
 	// disables cgroup placement.
 	CgroupRoot string
 
-	// MemoryMax / PidsMax / CPUMax are cgroup v2 limit strings written into
-	// the job's cgroup before the child starts work. Empty writes nothing.
-	MemoryMax string
-	PidsMax   string
-	CPUMax    string
+	// Limits are the cgroup v2 payloads written into the job's cgroup before
+	// the child starts work, already canonicalized by cgrouplimits. An empty
+	// field writes nothing.
+	Limits cgrouplimits.Limits
 }
 
 // JobConfinementFromEnv reads the builder confinement settings:
 // MT_BUILDER_UID, MT_BUILDER_CGROUP_ROOT, MT_BUILDER_MEMORY_MAX,
 // MT_BUILDER_PIDS_MAX, MT_BUILDER_CPU_MAX.
-func JobConfinementFromEnv() JobConfinement {
+//
+// The limits go through cgrouplimits rather than reaching the kernel raw.
+// MT_BUILDER_CPU_MAX is a CORE COUNT, but cpu.max wants "<quota> <period>", so
+// passing it through unparsed made the kernel reject the write — and because
+// placeJobInCgroup stops at the first failed limit, that one rejection left
+// build jobs with no memory or pids cap either.
+func JobConfinementFromEnv(log *slog.Logger) JobConfinement {
 	uid := 0
 	if v := os.Getenv("MT_BUILDER_UID"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil {
@@ -106,9 +112,8 @@ func JobConfinementFromEnv() JobConfinement {
 	return JobConfinement{
 		UID:        uid,
 		CgroupRoot: os.Getenv("MT_BUILDER_CGROUP_ROOT"),
-		MemoryMax:  os.Getenv("MT_BUILDER_MEMORY_MAX"),
-		PidsMax:    os.Getenv("MT_BUILDER_PIDS_MAX"),
-		CPUMax:     os.Getenv("MT_BUILDER_CPU_MAX"),
+		Limits: cgrouplimits.FromEnv(log,
+			"MT_BUILDER_MEMORY_MAX", "MT_BUILDER_PIDS_MAX", "MT_BUILDER_CPU_MAX"),
 	}
 }
 

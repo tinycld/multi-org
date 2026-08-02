@@ -12,7 +12,7 @@ import (
 func TestOrgLookup_ReturnsActiveOrgRecord(t *testing.T) {
 	cp, root := newProvCP(t)
 	p := newFakeProvisioner(cp, root, func(string) {}, nil)
-	if _, err := p.CreateOrg("acme", "Acme", baseLock); err != nil {
+	if _, _, err := p.CreateOrg("acme", "Acme", baseLock, OwnerAccount{Email: "owner@example.com"}); err != nil {
 		t.Fatal(err)
 	}
 

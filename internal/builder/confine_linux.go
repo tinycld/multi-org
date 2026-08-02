@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"syscall"
 )
 
@@ -100,12 +101,20 @@ func chownShallow(path string, uid int) error {
 // its group. The group dir is per-job and removed by the kernel's rmdir once
 // empty; a failed placement is the caller's warning — the job then runs
 // outside any cgroup, stated honestly.
+//
+// A limit the kernel rejects does NOT abort placement. Bailing out on the
+// first bad write is how one unparsable value (MT_BUILDER_CPU_MAX as a bare
+// core count) used to strip the memory and pids caps too: the pid write never
+// ran, so the job escaped its cgroup entirely. Partial confinement beats none,
+// so the rejected limits are collected and reported while the pid still goes
+// in. cgrouplimits should reject a bad value long before it reaches here; this
+// is the backstop for the ones only the kernel can refuse.
 func placeJobInCgroup(conf JobConfinement, buildID string, pid int) error {
 	root := conf.CgroupRoot
 	limits := []struct{ name, val, ctrl string }{
-		{"memory.max", conf.MemoryMax, "+memory"},
-		{"pids.max", conf.PidsMax, "+pids"},
-		{"cpu.max", conf.CPUMax, "+cpu"},
+		{"memory.max", conf.Limits.MemoryMax, "+memory"},
+		{"pids.max", conf.Limits.PidsMax, "+pids"},
+		{"cpu.max", conf.Limits.CPUMax, "+cpu"},
 	}
 	var ctrls []byte
 	for _, l := range limits {
@@ -124,13 +133,23 @@ func placeJobInCgroup(conf JobConfinement, buildID string, pid int) error {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return err
 	}
+	var rejected []string
 	for _, l := range limits {
 		if l.val == "" {
 			continue
 		}
 		if err := os.WriteFile(filepath.Join(dir, l.name), []byte(l.val), 0o644); err != nil {
-			return fmt.Errorf("write %s: %w", l.name, err)
+			rejected = append(rejected, fmt.Sprintf("%s=%q (%v)", l.name, l.val, err))
 		}
 	}
-	return os.WriteFile(filepath.Join(dir, "cgroup.procs"), []byte(strconv.Itoa(pid)), 0o644)
+	// The pid write is what actually confines the job, so it happens whatever
+	// the limits did. Its failure is the only one that means "not confined".
+	if err := os.WriteFile(filepath.Join(dir, "cgroup.procs"), []byte(strconv.Itoa(pid)), 0o644); err != nil {
+		return fmt.Errorf("write cgroup.procs: %w", err)
+	}
+	if len(rejected) > 0 {
+		return fmt.Errorf("job placed, but the kernel rejected %d limit(s), which are UNLIMITED: %s",
+			len(rejected), strings.Join(rejected, "; "))
+	}
+	return nil
 }

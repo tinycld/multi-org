@@ -86,7 +86,7 @@ func run() error {
 		if selfErr == nil {
 			runner = builder.SubprocessRunner{
 				Argv:        []string{selfExe, builder.Subcommand},
-				Confinement: builder.JobConfinementFromEnv(),
+				Confinement: builder.JobConfinementFromEnv(slog.Default()),
 			}
 		} else {
 			log.Printf("builder jobs stay in-process (no self exe): %v", selfErr)

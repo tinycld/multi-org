@@ -667,6 +667,50 @@ func TestRefsFor_RejectsOverCapLockfile(t *testing.T) {
 	}
 }
 
+// A lockfile value is either a bare version (registry form) or a complete git
+// spec. Both must survive refsFor unchanged in the ways the builder relies on:
+// the registry form gets the package name concatenated, the git form does not.
+func TestRefsFor_GitAndRegistrySpecs(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		value string
+		want  string
+	}{
+		{"tinycld", "0.4.0", "tinycld@0.4.0"},
+		{"tinycld", "github:tinycld/tinycld#main", "github:tinycld/tinycld#main"},
+		{"tinycld", "github:tinycld/tinycld", "github:tinycld/tinycld"},
+		{"tinycld", "git+ssh://git@github.com/tinycld/tinycld.git#v0.4.0", "git+ssh://git@github.com/tinycld/tinycld.git#v0.4.0"},
+		{"tinycld", "git+https://github.com/tinycld/tinycld.git", "git+https://github.com/tinycld/tinycld.git"},
+		{"tinycld", "git+file:///srv/tinycld-mt/tinycld", "git+file:///srv/tinycld-mt/tinycld"},
+	} {
+		refs, err := refsFor(map[string]string{tc.name: tc.value})
+		if err != nil {
+			t.Fatalf("refsFor(%q: %q) errored: %v", tc.name, tc.value, err)
+		}
+		if len(refs) != 1 || refs[0].Spec != tc.want {
+			t.Errorf("refsFor(%q: %q) = %+v, want spec %q", tc.name, tc.value, refs, tc.want)
+		}
+	}
+}
+
+// The git-spec passthrough must not become a hole around spec validation: a
+// value that looks git-ish but carries an unsafe ref or characters is refused
+// here rather than reaching `npm pack`.
+func TestRefsFor_RejectsUnsafeSpecs(t *testing.T) {
+	for _, value := range []string{
+		"github:tinycld/tinycld#--upload-pack=touch /tmp/pwned",
+		"github:tinycld/tinycld#$(whoami)",
+		"github:tinycld/tinycld#a;b",
+		"../../etc/passwd",
+		"-S/tmp/evil",
+		"0.4.0 --registry=http://evil",
+	} {
+		if _, err := refsFor(map[string]string{"tinycld": value}); err == nil {
+			t.Errorf("refsFor(tinycld: %q) was accepted; want a refusal", value)
+		}
+	}
+}
+
 func TestLiveRecipeHashes_CoversRowsAndInflight(t *testing.T) {
 	h := newDeployHarness(t)
 	org := h.org(t)

@@ -107,7 +107,7 @@ func validSlug(s string) bool { return slugRe.MatchString(s) && !reservedSlugs[s
 //
 // Both identities the setup wizard creates are minted from these credentials:
 // the PocketBase `_superusers` record behind /_/, and the `users` record with
-// role=owner plus its `super_admins` grant that the APP authenticates against.
+// role=owner that the APP authenticates against.
 type OwnerAccount struct {
 	Email    string
 	Password string
@@ -229,8 +229,8 @@ func (p *Provisioner) CreateOrg(slug, displayName string, lock map[string]string
 	}
 
 	// Owner account LAST: it must run after verification, because verification
-	// is the boot that runs the org's migrations — `users` and `super_admins`
-	// do not exist before it. A failure here leaves the org active and serving
+	// is the boot that runs the org's migrations — `users` does not exist
+	// before it. A failure here leaves the org active and serving
 	// (it is a real, working org) but with no way in, so it is reported rather
 	// than swallowed; a retried CreateOrg re-runs the step idempotently.
 	createOwner := p.createOwnerFn

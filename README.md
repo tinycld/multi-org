@@ -124,8 +124,7 @@ previous build references.
 Provisioning **requires an owner**: `POST /api/orgs` takes `owner_email`, and
 mints both identities the single-tenant `/setup` wizard creates — a PocketBase
 `_superusers` record (the `/_/` admin) and a `users` record with `role=owner`
-plus its `super_admins` grant (the app login). A tenant never serves the setup
-wizard (those routes are bound in the host composition only), so an org created
+(the app login). A tenant never serves the setup wizard (those routes are bound in the host composition only), so an org created
 without this would boot, serve, and have no account able to log in.
 
 `owner_password` is optional: supply one to pre-fill a known secret, or omit it
@@ -140,7 +139,7 @@ response — the only time it is ever visible, since it is stored hashed.
 ```
 
 The account is created after the tenant's boot verification, because that boot
-is what runs the org's migrations — `users` and `super_admins` do not exist
+is what runs the org's migrations — `users` does not exist
 before it. The router runs `create-owner` on the org's **own artifact binary**
 (the same mechanism the deploy path uses), so it never links tenant code.
 

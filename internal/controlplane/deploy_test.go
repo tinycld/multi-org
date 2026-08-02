@@ -589,6 +589,85 @@ func TestControlHandler_MetadataSurfaceRefusesNonRegistrySpecs(t *testing.T) {
 	}
 }
 
+// A git-installed org must be able to discover its upgrades — its versions
+// come from its remote's tags, not a registry. The spec is allowed ONLY
+// because it is already in that org's lockfile, i.e. a remote an operator
+// vetted by provisioning or deploying the org with it. Every other git spec
+// stays refused, so a tenant still cannot aim the router at a remote of its
+// choosing (the SSRF the blanket ban existed for).
+func TestControlHandler_AllowsGitSpecsFromTheOrgLockfile(t *testing.T) {
+	h := newDeployHarness(t)
+
+	// The harness org ships a registry lockfile; give it a git-installed set.
+	rec := h.org(t)
+	rec.Set("lockfile", `{"tinycld":"github:tinycld/tinycld#v1.0.0","todo":"git+ssh://git@github.com/acme/todo.git#main"}`)
+	if err := h.cp.App.Save(rec); err != nil {
+		t.Fatal(err)
+	}
+
+	d := newDeployer(h.cp.App, h.root, &fakeArtifactBuilder{hash: hashNew},
+		func(string) {}, nil, quietTestLogger())
+	d.readMin = 0
+	handler := d.Handler("acme")
+
+	post := func(path, body string) int {
+		w := httptest.NewRecorder()
+		handler.ServeHTTP(w, httptest.NewRequest(http.MethodPost, path, strings.NewReader(body)))
+		return w.Code
+	}
+
+	// In the lockfile → admitted past the gate. (The subprocess then runs for
+	// real; what is asserted here is only that it was not refused with 400.)
+	for _, spec := range []string{
+		"github:tinycld/tinycld#v1.0.0",
+		"git+ssh://git@github.com/acme/todo.git#main",
+		// Same remote, different ref: discovery is ABOUT finding other refs,
+		// so the bare remote is what authorizes the call.
+		"github:tinycld/tinycld#v2.0.0",
+	} {
+		if code := post("/v1/versions", `{"spec":`+jsonString(spec)+`}`); code == http.StatusBadRequest {
+			t.Errorf("/v1/versions %q = 400, want it admitted (the spec is in the org's lockfile)", spec)
+		}
+	}
+
+	// NOT in the lockfile → still refused, including a near-miss on the same
+	// host. Resembling a vetted spec must not be enough.
+	for _, spec := range []string{
+		"github:evil/pkg",
+		"github:tinycld/other-repo",
+		"git+ssh://git@github.com/acme/different.git#main",
+		"https://169.254.169.254/latest/meta-data",
+		"git+file:///root/secret",
+	} {
+		if code := post("/v1/versions", `{"spec":`+jsonString(spec)+`}`); code != http.StatusBadRequest {
+			t.Errorf("/v1/versions %q = %d, want 400 (not in the org's lockfile)", spec, code)
+		}
+	}
+}
+
+// The gate reads the org row, so an org whose lockfile is missing or corrupt
+// must REFUSE rather than fall open — unable to confirm is not permission.
+func TestControlHandler_GitSpecGateFailsClosed(t *testing.T) {
+	h := newDeployHarness(t)
+	rec := h.org(t)
+	rec.Set("lockfile", "{not json")
+	if err := h.cp.App.Save(rec); err != nil {
+		t.Fatal(err)
+	}
+
+	d := newDeployer(h.cp.App, h.root, &fakeArtifactBuilder{hash: hashNew},
+		func(string) {}, nil, quietTestLogger())
+	d.readMin = 0
+	handler := d.Handler("acme")
+
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, httptest.NewRequest(http.MethodPost, "/v1/versions",
+		strings.NewReader(`{"spec":"github:tinycld/tinycld#v1.0.0"}`)))
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("/v1/versions with an unreadable lockfile = %d, want 400", w.Code)
+	}
+}
+
 func jsonString(s string) string {
 	b, _ := json.Marshal(s)
 	return string(b)
@@ -667,6 +746,50 @@ func TestRefsFor_RejectsOverCapLockfile(t *testing.T) {
 	}
 }
 
+// A lockfile value is either a bare version (registry form) or a complete git
+// spec. Both must survive refsFor unchanged in the ways the builder relies on:
+// the registry form gets the package name concatenated, the git form does not.
+func TestRefsFor_GitAndRegistrySpecs(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		value string
+		want  string
+	}{
+		{"tinycld", "0.4.0", "tinycld@0.4.0"},
+		{"tinycld", "github:tinycld/tinycld#main", "github:tinycld/tinycld#main"},
+		{"tinycld", "github:tinycld/tinycld", "github:tinycld/tinycld"},
+		{"tinycld", "git+ssh://git@github.com/tinycld/tinycld.git#v0.4.0", "git+ssh://git@github.com/tinycld/tinycld.git#v0.4.0"},
+		{"tinycld", "git+https://github.com/tinycld/tinycld.git", "git+https://github.com/tinycld/tinycld.git"},
+		{"tinycld", "git+file:///srv/tinycld-mt/tinycld", "git+file:///srv/tinycld-mt/tinycld"},
+	} {
+		refs, err := refsFor(map[string]string{tc.name: tc.value})
+		if err != nil {
+			t.Fatalf("refsFor(%q: %q) errored: %v", tc.name, tc.value, err)
+		}
+		if len(refs) != 1 || refs[0].Spec != tc.want {
+			t.Errorf("refsFor(%q: %q) = %+v, want spec %q", tc.name, tc.value, refs, tc.want)
+		}
+	}
+}
+
+// The git-spec passthrough must not become a hole around spec validation: a
+// value that looks git-ish but carries an unsafe ref or characters is refused
+// here rather than reaching `npm pack`.
+func TestRefsFor_RejectsUnsafeSpecs(t *testing.T) {
+	for _, value := range []string{
+		"github:tinycld/tinycld#--upload-pack=touch /tmp/pwned",
+		"github:tinycld/tinycld#$(whoami)",
+		"github:tinycld/tinycld#a;b",
+		"../../etc/passwd",
+		"-S/tmp/evil",
+		"0.4.0 --registry=http://evil",
+	} {
+		if _, err := refsFor(map[string]string{"tinycld": value}); err == nil {
+			t.Errorf("refsFor(tinycld: %q) was accepted; want a refusal", value)
+		}
+	}
+}
+
 func TestLiveRecipeHashes_CoversRowsAndInflight(t *testing.T) {
 	h := newDeployHarness(t)
 	org := h.org(t)
@@ -713,8 +836,12 @@ func TestCreateOrg_DefaultTemplateBuildsArtifact(t *testing.T) {
 	fake := &fakeArtifactBuilder{hash: hashNew}
 	p := NewProvisioner(cp.App, root, func(string) {}, nil)
 	p.deployer = newDeployer(cp.App, root, fake, func(string) {}, nil, quietTestLogger())
+	stubOwnerStep(p)
+	// No compiled artifact behind the fake builder's Dir, so the real owner
+	// step cannot run; this test is about the default-template build.
+	p.createOwnerFn = func(_, _, _, _, _ string) error { return nil }
 
-	rec, err := p.CreateOrg("acme", "Acme", nil)
+	rec, _, err := p.CreateOrg("acme", "Acme", nil, OwnerAccount{Email: "owner@example.com"})
 	if err != nil {
 		t.Fatalf("CreateOrg: %v", err)
 	}
@@ -730,7 +857,7 @@ func TestCreateOrg_DefaultTemplateBuildsArtifact(t *testing.T) {
 
 	// An explicit empty map is not buildable (no app shell) — refused, and the
 	// builder never runs for it.
-	if _, err := p.CreateOrg("lean", "Lean", map[string]string{}); err == nil || !strings.Contains(err.Error(), "app shell") {
+	if _, _, err := p.CreateOrg("lean", "Lean", map[string]string{}, OwnerAccount{Email: "owner@example.com"}); err == nil || !strings.Contains(err.Error(), "app shell") {
 		t.Fatalf("CreateOrg(lean) = %v, want the app-shell refusal", err)
 	}
 	if fake.calls.Load() != 1 {
@@ -753,7 +880,7 @@ func TestCreateOrg_ArtifactSetWithoutBuilderRefuses(t *testing.T) {
 		t.Fatal(err)
 	}
 	p := NewProvisioner(cp.App, root, func(string) {}, nil)
-	if _, err := p.CreateOrg("acme", "Acme", map[string]string{"tinycld": "1.0.0"}); err == nil || !strings.Contains(err.Error(), "no builder") {
+	if _, _, err := p.CreateOrg("acme", "Acme", map[string]string{"tinycld": "1.0.0"}, OwnerAccount{Email: "owner@example.com"}); err == nil || !strings.Contains(err.Error(), "no builder") {
 		t.Fatalf("CreateOrg = %v, want no-builder refusal", err)
 	}
 }

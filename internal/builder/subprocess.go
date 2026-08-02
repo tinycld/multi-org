@@ -153,6 +153,24 @@ func (r SubprocessRunner) Run(ctx context.Context, spec JobSpec, sink pkgbuild.P
 		"HOME=" + jobDir,
 		"TMPDIR=" + jobTmp,
 		"PATH=" + os.Getenv("PATH"),
+		// A git-spec member is cloned by `npm pack` inside the job. When the
+		// job is confined its uid is mapped to 0 in a user namespace, so every
+		// file outside the mapping — including an operator's local checkout —
+		// appears owned by the unmapped overflow uid (65534). git reads that as
+		// "dubious ownership" and refuses, failing the fetch. HOME is a fresh
+		// per-job dir with no gitconfig, so the exemption cannot come from a
+		// user's config; it has to ride in the environment. Scoped to git's
+		// own config mechanism rather than a global setting on the host.
+		//
+		// This is safe here in a way it would not be on a developer box: the
+		// specs reaching a build are operator- or tenant-proposed strings that
+		// ValidatePackageSpec already constrained, the clone runs confined, and
+		// --ignore-scripts means the cloned tree is never executed. The check
+		// git is performing (does another *user* own this repo) is answering a
+		// question the job's confinement already answers differently.
+		"GIT_CONFIG_COUNT=1",
+		"GIT_CONFIG_KEY_0=safe.directory",
+		"GIT_CONFIG_VALUE_0=*",
 	}, r.extraEnv...)
 	if err := os.MkdirAll(jobTmp, 0o755); err != nil {
 		return err
@@ -211,7 +229,14 @@ func (r SubprocessRunner) Run(ctx context.Context, spec JobSpec, sink pkgbuild.P
 		return fmt.Errorf("build job timed out or was canceled: %w", ctx.Err())
 	case result != nil && !result.OK:
 		// The child reported its own failure before exiting nonzero — its
-		// structured reason beats the bare exit status.
+		// structured reason beats the bare exit status. Append whatever the
+		// child wrote to stderr: the structured reason is one wrapped line
+		// ("assemble: fetch X: exit status 1") while the underlying tool's
+		// actual complaint (a permission denial, a git refusal) only ever
+		// reaches stderr. Dropping it turns a one-look diagnosis into a hunt.
+		if msg := strings.TrimSpace(stderr.String()); msg != "" {
+			return fmt.Errorf("build failed: %s\njob stderr:\n%s", result.Error, firstLines(msg, 20))
+		}
 		return fmt.Errorf("build failed: %s", result.Error)
 	case waitErr != nil:
 		msg := strings.TrimSpace(stderr.String())

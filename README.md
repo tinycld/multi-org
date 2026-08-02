@@ -97,7 +97,8 @@ MT_ROOT=./mt_data MT_BASE_DOMAIN=tinycld.org MT_ADDR=:443 ./bin/serve-multi
 | `MT_MAIL_TLS_CERT`, `MT_MAIL_TLS_KEY` | falls back to `MT_TLS_CERT`/`MT_TLS_KEY` | Wildcard cert the router terminates mail TLS with. Tenants never hold this key. |
 | `MT_IMAPS_ADDR`, `MT_SMTPS_ADDR`, `MT_MX_ADDR` | `:993`, `:465`, `:25` | Mail listener addresses; the literal value `off` disables that one listener. |
 | `MT_MX_HOSTNAME` | `MT_BASE_DOMAIN` | Identity the `:25` greeting announces and the HELO name toward tenants. |
-| `MT_SCAFFOLD_ROOT` | — | Enables the **trusted builder**: an operator-provisioned workspace scaffold root (`package-versions.json`, `scripts/link-members.ts`, …; bootstrap is its source of truth). Set, package sets are built into shared artifacts under `<root>/builds/<recipe-hash>/`. **Required to provision or deploy** — unset, the router still serves orgs whose artifacts were built earlier but refuses any new build. |
+| `MT_SCAFFOLD_ROOT` | — | Enables the **trusted builder**: an operator-provisioned workspace scaffold root (`package-versions.json`, `scripts/link-members.ts`, …; bootstrap is its source of truth). Set, package sets are built into shared artifacts under `<root>/builds/<recipe-hash>/`. **Required to provision or deploy** — unset, the router still serves orgs whose artifacts were built earlier but refuses any new build. Note a scaffold root alone is not sufficient: a build also needs its members to be *fetchable*, i.e. a registry that serves them (`MT_NPM_REGISTRY`) or git specs in the lockfile. |
+| `MT_NPM_REGISTRY` | npm's default | Registry `npm pack` fetches member specs from, and the source `/v1/versions` lists installable versions from. One registry for every spec — there is no per-scope mapping — so it must also serve (or upstream-proxy) any third-party dep. Unset, members resolve against `registry.npmjs.org`, where unpublished `@tinycld/*` packages do not exist. |
 | `MT_BUILDER_MAX_CONCURRENT` | `1` | Cap on simultaneously-running build jobs; excess queue. Builds are minutes of CPU-saturating work — the queue is the capacity seam. |
 | `MT_BUILDER_UID` | — | **Linux.** Dedicated host uid build jobs run as (outside the tenant uid window). Unset ⇒ jobs run unconfined. |
 | `MT_BUILDER_CGROUP_ROOT` | — | **Linux.** cgroup v2 dir to place build jobs under. |
@@ -120,10 +121,59 @@ capability wiring from the artifact's staged
 by construction; an hourly sweep removes artifacts no org's current or
 previous build references.
 
+Provisioning **requires an owner**: `POST /api/orgs` takes `owner_email`, and
+mints both identities the single-tenant `/setup` wizard creates — a PocketBase
+`_superusers` record (the `/_/` admin) and a `users` record with `role=owner`
+(the app login). A tenant never serves the setup wizard (those routes are bound in the host composition only), so an org created
+without this would boot, serve, and have no account able to log in.
+
+`owner_password` is optional: supply one to pre-fill a known secret, or omit it
+and a random password is generated and returned as `owner_password` in the
+response — the only time it is ever visible, since it is stored hashed.
+
+```jsonc
+// POST /api/orgs
+{ "slug": "acme", "display_name": "Acme", "owner_email": "you@example.com" }
+// → { "slug": "acme", "status": "active",
+//      "owner_email": "you@example.com", "owner_password": "<generated>" }
+```
+
+The account is created after the tenant's boot verification, because that boot
+is what runs the org's migrations — `users` does not exist
+before it. The router runs `create-owner` on the org's **own artifact binary**
+(the same mechanism the deploy path uses), so it never links tenant code.
+
 `POST /api/orgs` with **no** lockfile copies the operator-editable template
 (`PUT /api/settings/default-lockfile`) — the default set is just a warm cache
 entry, so provisioning costs seconds. A lockfile that omits the app shell is
 rejected: there is no package set that isn't built.
+
+A lockfile value is either a **bare version** (`"tinycld": "0.4.0"` → the
+registry spec `tinycld@0.4.0`) or a **complete git spec**, which passes through
+verbatim:
+
+```jsonc
+{
+  "tinycld": "0.4.0",                          // registry
+  "mail":    "github:tinycld/mail#v1.2.0",     // git, pinned to a tag
+  "todo":    "git+ssh://git@github.com/acme/todo.git#main"
+}
+```
+
+Accepted git forms are exactly those `ValidatePackageSpec` allows —
+`github:`/`gitlab:`/`bitbucket:` shorthand, bare `owner/repo`, and
+`git+https`/`git+ssh`/`git+file` URLs — each with an optional `#<ref>` pinning a
+tag, branch or commit. Member identity (slug, name, version, `peerVersions`) is
+still **discovered from the fetched bytes**, never taken from the lockfile key,
+so a git spec cannot claim to be a package it isn't.
+
+Two caveats for git specs. They are fetched with `--ignore-scripts`, because a
+git dep has no published tarball and npm would otherwise run the package's
+`prepare`/`prepack` **as root** in the router process (`resolve` runs before the
+confined build job) — so a member whose published shape genuinely depends on a
+prepare script will pack incomplete. And the build job's environment is scrubbed
+to `HOME`/`TMPDIR`/`PATH`, so there is no SSH agent or token for a **private**
+git remote.
 
 Deploys (operator `POST /api/orgs/{slug}/deploy`, or the tenant itself over
 its **control socket** — `ctl.sock` in the org's 0700 socket dir, router-bound

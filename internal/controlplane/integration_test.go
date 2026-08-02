@@ -126,6 +126,7 @@ func newVerifiedProvisioner(t *testing.T, cp *ControlPlane, root, recipeHash str
 	}
 	p := NewProvisioner(cp.App, root, mgr.Evict, verify)
 	p.deployer = newDeployer(cp.App, root, &fakeArtifactBuilder{hash: recipeHash}, mgr.Evict, verify, quietTestLogger())
+	stubOwnerStep(p)
 	return mgr, p, spawner
 }
 
@@ -168,7 +169,7 @@ func TestIntegration_CreateOrgToLoadWithSchema(t *testing.T) {
 	}, []pkgbuild.ResolvedMember{baseMember()})
 
 	mgr, p, spawner := newVerifiedProvisioner(t, cp, root, hash)
-	if _, err := p.CreateOrg("acme", "Acme", map[string]string{"tinycld": "1.0.0"}); err != nil {
+	if _, _, err := p.CreateOrg("acme", "Acme", map[string]string{"tinycld": "1.0.0"}, OwnerAccount{Email: "owner@example.com"}); err != nil {
 		t.Fatalf("CreateOrg: %v", err)
 	}
 
@@ -227,7 +228,7 @@ func TestIntegration_MaliciousMigrationCannotExec(t *testing.T) {
 	}, []pkgbuild.ResolvedMember{baseMember()})
 
 	_, p, _ := newVerifiedProvisioner(t, cp, root, hash)
-	_, err = p.CreateOrg("evilorg", "Evil", map[string]string{"tinycld": "1.0.0"})
+	_, _, err = p.CreateOrg("evilorg", "Evil", map[string]string{"tinycld": "1.0.0"}, OwnerAccount{Email: "owner@example.com"})
 	if err == nil {
 		t.Fatal("expected provisioning to fail for a migration touching $os under sandbox")
 	}
@@ -305,7 +306,7 @@ func TestIntegration_TenantHasNoControlPlaneCollections(t *testing.T) {
 		"pb_migrations/1700000000_widgets.js": widgetsMigration,
 	}, []pkgbuild.ResolvedMember{baseMember()})
 	mgr, p, _ := newVerifiedProvisioner(t, cp, root, hash)
-	if _, err := p.CreateOrg("acme", "Acme", map[string]string{"tinycld": "1.0.0"}); err != nil {
+	if _, _, err := p.CreateOrg("acme", "Acme", map[string]string{"tinycld": "1.0.0"}, OwnerAccount{Email: "owner@example.com"}); err != nil {
 		t.Fatalf("CreateOrg: %v", err)
 	}
 	// Quiesce the tenant the verification boot left running before opening its
@@ -361,7 +362,7 @@ func TestIntegration_MaliciousHookCannotCrashControlPlane(t *testing.T) {
 			t.Fatalf("provisioning panicked on a load-throwing hook: %v", r)
 		}
 	}()
-	if _, err := p.CreateOrg("evilhook", "EvilHook", map[string]string{"tinycld": "1.0.0"}); err == nil {
+	if _, _, err := p.CreateOrg("evilhook", "EvilHook", map[string]string{"tinycld": "1.0.0"}, OwnerAccount{Email: "owner@example.com"}); err == nil {
 		t.Fatal("expected provisioning to fail for a load-throwing hook, got nil")
 	}
 }

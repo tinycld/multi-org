@@ -163,6 +163,7 @@ func setupCardDAVOrgs(t *testing.T, root string) (*orgmanager.OrgManager, *Provi
 
 	p := NewProvisioner(cp.App, root, func(string) {}, nil)
 	p.deployer = newDeployer(cp.App, root, &fakeArtifactBuilder{hash: hash}, func(string) {}, nil, quietTestLogger())
+	stubOwnerStep(p)
 
 	mgr := orgmanager.New(orgmanager.Config{
 		Root:           root,
@@ -192,7 +193,7 @@ func setupCardDAVOrgs(t *testing.T, root string) (*orgmanager.OrgManager, *Provi
 func seedOrg(t *testing.T, p *Provisioner, root, artifactDir, slug, email, first, orgName string) {
 	t.Helper()
 	lock := map[string]string{"tinycld": "1.0.0", "@tinycld/contacts": "1.0.0"}
-	if _, err := p.CreateOrg(slug, orgName, lock); err != nil {
+	if _, _, err := p.CreateOrg(slug, orgName, lock, OwnerAccount{Email: "owner@example.com"}); err != nil {
 		t.Fatalf("CreateOrg(%s): %v", slug, err)
 	}
 
@@ -297,7 +298,7 @@ func TestIntegration_MultiOrgCardDAV_Challenges401(t *testing.T) {
 	mgr, p, _ := setupCardDAVOrgs(t, root)
 	defer mgr.Shutdown()
 
-	if _, err := p.CreateOrg("acme", "Acme", map[string]string{"tinycld": "1.0.0", "@tinycld/contacts": "1.0.0"}); err != nil {
+	if _, _, err := p.CreateOrg("acme", "Acme", map[string]string{"tinycld": "1.0.0", "@tinycld/contacts": "1.0.0"}, OwnerAccount{Email: "owner@example.com"}); err != nil {
 		t.Fatalf("CreateOrg: %v", err)
 	}
 

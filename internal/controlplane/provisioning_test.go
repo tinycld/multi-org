@@ -39,14 +39,24 @@ func newProvCP(t *testing.T) (*ControlPlane, string) {
 func newFakeProvisioner(cp *ControlPlane, root string, evict EvictFunc, verify VerifyFunc) *Provisioner {
 	p := NewProvisioner(cp.App, root, evict, verify)
 	p.deployer = newDeployer(cp.App, root, &fakeArtifactBuilder{hash: hashOld}, evict, verify, quietTestLogger())
+	stubOwnerStep(p)
 	return p
+}
+
+// stubOwnerStep neutralizes the owner-account step for tests backed by a fake
+// builder. Those artifact dirs hold no compiled binary, so the real step —
+// which execs `create-owner` on the artifact — could never run; what these
+// tests assert is provisioning's orchestration around it. Tests that care
+// about the step itself override createOwnerFn with their own assertion.
+func stubOwnerStep(p *Provisioner) {
+	p.createOwnerFn = func(_, _, _, _, _ string) error { return nil }
 }
 
 func TestProvision_CreatesOrgRowAndDirs(t *testing.T) {
 	cp, root := newProvCP(t)
 	p := newFakeProvisioner(cp, root, func(string) {}, nil)
 
-	rec, err := p.CreateOrg("acme", "Acme Inc", baseLock)
+	rec, _, err := p.CreateOrg("acme", "Acme Inc", baseLock, OwnerAccount{Email: "owner@example.com"})
 	if err != nil {
 		t.Fatalf("CreateOrg: %v", err)
 	}
@@ -76,7 +86,7 @@ func TestCreateOrg_RefusesNonBaseLockfile(t *testing.T) {
 	cp, root := newProvCP(t)
 	p := newFakeProvisioner(cp, root, func(string) {}, nil)
 
-	if _, err := p.CreateOrg("acme", "Acme", map[string]string{"@tinycld/core": "1.0.0"}); err == nil || !strings.Contains(err.Error(), "app shell") {
+	if _, _, err := p.CreateOrg("acme", "Acme", map[string]string{"@tinycld/core": "1.0.0"}, OwnerAccount{Email: "owner@example.com"}); err == nil || !strings.Contains(err.Error(), "app shell") {
 		t.Fatalf("CreateOrg = %v, want the app-shell refusal", err)
 	}
 	if rec, _ := cp.App.FindFirstRecordByData("orgs", "slug", "acme"); rec != nil {
@@ -102,7 +112,7 @@ func TestCreateOrg_VerifiesTenantBootBeforeReturning(t *testing.T) {
 		return nil
 	}
 	p := newFakeProvisioner(cp, root, func(string) {}, verify)
-	rec, err := p.CreateOrg("acme", "Acme", baseLock)
+	rec, _, err := p.CreateOrg("acme", "Acme", baseLock, OwnerAccount{Email: "owner@example.com"})
 	if err != nil {
 		t.Fatalf("CreateOrg: %v", err)
 	}
@@ -119,6 +129,104 @@ func TestCreateOrg_VerifiesTenantBootBeforeReturning(t *testing.T) {
 	}
 }
 
+// An owner email is REQUIRED. Without it the org would boot, serve, and have
+// no account able to log in — the exact trap this refusal makes unreachable.
+// It is checked before any work, so no org row or directory is left behind.
+func TestCreateOrg_RequiresOwnerEmail(t *testing.T) {
+	cp, root := newProvCP(t)
+	p := newFakeProvisioner(cp, root, func(string) {}, nil)
+
+	_, _, err := p.CreateOrg("acme", "Acme", baseLock, OwnerAccount{})
+	if err == nil || !strings.Contains(err.Error(), "owner email is required") {
+		t.Fatalf("CreateOrg without an owner = %v, want the required-email refusal", err)
+	}
+	if rec, _ := cp.App.FindFirstRecordByData("orgs", "slug", "acme"); rec != nil {
+		t.Fatal("refused CreateOrg must leave no org row behind")
+	}
+}
+
+// With no password supplied, provisioning generates one and RETURNS it — the
+// only time it is ever visible, since it is stored hashed. The same value must
+// reach the owner step, or the operator would be handed a password that was
+// never set.
+func TestCreateOrg_GeneratesAndReturnsPassword(t *testing.T) {
+	cp, root := newProvCP(t)
+	p := newFakeProvisioner(cp, root, func(string) {}, nil)
+
+	var gotEmail, gotPassword string
+	p.createOwnerFn = func(_, _, _, email, password string) error {
+		gotEmail, gotPassword = email, password
+		return nil
+	}
+
+	_, password, err := p.CreateOrg("acme", "Acme", baseLock, OwnerAccount{Email: "o@example.com"})
+	if err != nil {
+		t.Fatalf("CreateOrg: %v", err)
+	}
+	if password == "" {
+		t.Fatal("CreateOrg returned an empty password; want a generated one")
+	}
+	if gotPassword != password {
+		t.Fatalf("owner step got password %q but caller was returned %q", gotPassword, password)
+	}
+	if gotEmail != "o@example.com" {
+		t.Fatalf("owner step got email %q", gotEmail)
+	}
+	// Two orgs must not share a password.
+	_, second, err := p.CreateOrg("other", "Other", baseLock, OwnerAccount{Email: "o@example.com"})
+	if err != nil {
+		t.Fatalf("second CreateOrg: %v", err)
+	}
+	if second == password {
+		t.Fatal("two provisions generated the same password")
+	}
+}
+
+// A supplied password is used as-is and handed to the owner step unchanged.
+func TestCreateOrg_UsesSuppliedPassword(t *testing.T) {
+	cp, root := newProvCP(t)
+	p := newFakeProvisioner(cp, root, func(string) {}, nil)
+
+	var gotPassword string
+	p.createOwnerFn = func(_, _, _, _, password string) error {
+		gotPassword = password
+		return nil
+	}
+
+	_, returned, err := p.CreateOrg("acme", "Acme", baseLock,
+		OwnerAccount{Email: "o@example.com", Password: "pre-filled-secret"})
+	if err != nil {
+		t.Fatalf("CreateOrg: %v", err)
+	}
+	if gotPassword != "pre-filled-secret" || returned != "pre-filled-secret" {
+		t.Fatalf("supplied password not used: owner step got %q, returned %q", gotPassword, returned)
+	}
+}
+
+// A failed owner step is REPORTED, not swallowed: an org nobody can log into
+// is not a successful provision. The org itself stays active — it booted and
+// serves — so a retry resumes it rather than tripping "already exists".
+func TestCreateOrg_OwnerFailureIsReported(t *testing.T) {
+	cp, root := newProvCP(t)
+	p := newFakeProvisioner(cp, root, func(string) {}, func(context.Context, string) error { return nil })
+	p.createOwnerFn = func(_, _, _, _, _ string) error { return errors.New("artifact binary missing") }
+
+	_, _, err := p.CreateOrg("acme", "Acme", baseLock, OwnerAccount{Email: "o@example.com"})
+	if err == nil {
+		t.Fatal("CreateOrg succeeded despite a failing owner step; want an error")
+	}
+	if !strings.Contains(err.Error(), "owner account failed") {
+		t.Fatalf("error = %v, want it to name the owner step", err)
+	}
+	rec, ferr := cp.App.FindFirstRecordByData("orgs", "slug", "acme")
+	if ferr != nil {
+		t.Fatalf("org row missing after owner failure: %v", ferr)
+	}
+	if got := rec.GetString("status"); got != "active" {
+		t.Fatalf("org status = %s, want active (the org booted; only the owner step failed)", got)
+	}
+}
+
 // TestCreateOrg_VerifyFailureRollsBackActivation proves a failed tenant boot
 // (e.g. a broken migration, reported through the readiness handshake) fails
 // provisioning with the child's reason and leaves the org resumable — never
@@ -130,7 +238,7 @@ func TestCreateOrg_VerifyFailureRollsBackActivation(t *testing.T) {
 	failing := func(ctx context.Context, slug string) error { return bootErr }
 	p := newFakeProvisioner(cp, root, func(string) {}, failing)
 
-	if _, err := p.CreateOrg("acme", "Acme", baseLock); err == nil {
+	if _, _, err := p.CreateOrg("acme", "Acme", baseLock, OwnerAccount{Email: "owner@example.com"}); err == nil {
 		t.Fatal("expected CreateOrg to fail when the tenant never became ready")
 	} else if !errors.Is(err, bootErr) {
 		t.Fatalf("expected the child's boot failure as the cause, got: %v", err)
@@ -147,7 +255,7 @@ func TestCreateOrg_VerifyFailureRollsBackActivation(t *testing.T) {
 	// Once the boot succeeds (fixed artifact), the same CreateOrg resumes the
 	// stranded row to active.
 	p2 := newFakeProvisioner(cp, root, func(string) {}, func(context.Context, string) error { return nil })
-	rec2, err := p2.CreateOrg("acme", "Acme", baseLock)
+	rec2, _, err := p2.CreateOrg("acme", "Acme", baseLock, OwnerAccount{Email: "owner@example.com"})
 	if err != nil {
 		t.Fatalf("expected resume after fixed boot, got: %v", err)
 	}
@@ -163,7 +271,7 @@ func TestCreateOrg_VerifyFailureRollsBackActivation(t *testing.T) {
 func TestProvision_DeployEvicts(t *testing.T) {
 	cp, root := newProvCP(t)
 	p := newFakeProvisioner(cp, root, func(string) {}, nil)
-	if _, err := p.CreateOrg("acme", "Acme", baseLock); err != nil {
+	if _, _, err := p.CreateOrg("acme", "Acme", baseLock, OwnerAccount{Email: "owner@example.com"}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -182,7 +290,7 @@ func TestProvision_DeployEvicts(t *testing.T) {
 func TestProvision_SuspendResumeArchive(t *testing.T) {
 	cp, root := newProvCP(t)
 	p := newFakeProvisioner(cp, root, func(string) {}, nil)
-	if _, err := p.CreateOrg("acme", "Acme", baseLock); err != nil {
+	if _, _, err := p.CreateOrg("acme", "Acme", baseLock, OwnerAccount{Email: "owner@example.com"}); err != nil {
 		t.Fatal(err)
 	}
 	for _, tc := range []struct {
@@ -209,10 +317,10 @@ func TestProvision_SuspendResumeArchive(t *testing.T) {
 func TestProvision_DuplicateSlugErrors(t *testing.T) {
 	cp, root := newProvCP(t)
 	p := newFakeProvisioner(cp, root, func(string) {}, nil)
-	if _, err := p.CreateOrg("acme", "Acme", baseLock); err != nil {
+	if _, _, err := p.CreateOrg("acme", "Acme", baseLock, OwnerAccount{Email: "owner@example.com"}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := p.CreateOrg("acme", "Acme2", baseLock); err == nil {
+	if _, _, err := p.CreateOrg("acme", "Acme2", baseLock, OwnerAccount{Email: "owner@example.com"}); err == nil {
 		t.Fatal("expected duplicate slug to error")
 	}
 }
@@ -220,7 +328,7 @@ func TestProvision_DuplicateSlugErrors(t *testing.T) {
 func TestProvision_InvalidSlugErrors(t *testing.T) {
 	cp, root := newProvCP(t)
 	p := newFakeProvisioner(cp, root, func(string) {}, nil)
-	if _, err := p.CreateOrg("Acme_Bad!", "x", baseLock); err == nil {
+	if _, _, err := p.CreateOrg("Acme_Bad!", "x", baseLock, OwnerAccount{Email: "owner@example.com"}); err == nil {
 		t.Fatal("expected invalid slug to error")
 	}
 }
@@ -228,7 +336,7 @@ func TestProvision_InvalidSlugErrors(t *testing.T) {
 func TestProvision_CreateOrgResumesStrandedRow(t *testing.T) {
 	cp, root := newProvCP(t)
 	p := newFakeProvisioner(cp, root, func(string) {}, nil)
-	rec, err := p.CreateOrg("acme", "Acme", baseLock)
+	rec, _, err := p.CreateOrg("acme", "Acme", baseLock, OwnerAccount{Email: "owner@example.com"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -238,7 +346,7 @@ func TestProvision_CreateOrgResumesStrandedRow(t *testing.T) {
 		t.Fatal(err)
 	}
 	// re-run must RESUME (not error) and end active
-	rec2, err := p.CreateOrg("acme", "Acme", baseLock)
+	rec2, _, err := p.CreateOrg("acme", "Acme", baseLock, OwnerAccount{Email: "owner@example.com"})
 	if err != nil {
 		t.Fatalf("expected resume, got error: %v", err)
 	}
@@ -246,7 +354,7 @@ func TestProvision_CreateOrgResumesStrandedRow(t *testing.T) {
 		t.Fatalf("expected resumed org active, got %s", rec2.GetString("status"))
 	}
 	// and an ACTIVE org still rejects duplicate create
-	if _, err := p.CreateOrg("acme", "Acme", baseLock); err == nil {
+	if _, _, err := p.CreateOrg("acme", "Acme", baseLock, OwnerAccount{Email: "owner@example.com"}); err == nil {
 		t.Fatal("expected duplicate active org to error")
 	}
 }
@@ -257,7 +365,7 @@ func TestProvision_CreateOrgResumesStrandedRow(t *testing.T) {
 func TestProvision_DeployWritesAuditRecord(t *testing.T) {
 	cp, root := newProvCP(t)
 	p := newFakeProvisioner(cp, root, func(string) {}, nil)
-	if _, err := p.CreateOrg("acme", "Acme", baseLock); err != nil {
+	if _, _, err := p.CreateOrg("acme", "Acme", baseLock, OwnerAccount{Email: "owner@example.com"}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -284,7 +392,7 @@ func TestProvision_DeployWritesAuditRecord(t *testing.T) {
 func TestProvision_DeployRejectsArchivedOrg(t *testing.T) {
 	cp, root := newProvCP(t)
 	p := newFakeProvisioner(cp, root, func(string) {}, nil)
-	if _, err := p.CreateOrg("acme", "Acme", baseLock); err != nil {
+	if _, _, err := p.CreateOrg("acme", "Acme", baseLock, OwnerAccount{Email: "owner@example.com"}); err != nil {
 		t.Fatal(err)
 	}
 	if err := p.Archive("acme"); err != nil {

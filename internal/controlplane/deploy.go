@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"sort"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -259,6 +260,16 @@ func IsArtifactSet(lock map[string]string) bool {
 // validated separately BEFORE concatenation into an npm spec (the
 // pkg_version_change lesson: constrain the tokens, not just the joined
 // string), and sorted so equal sets share the builder's singleflight key.
+//
+// A lockfile value is either a bare version ("0.4.0" → "<name>@0.4.0", the
+// registry form) or a complete git spec ("github:tinycld/tinycld#main"), which
+// passes through verbatim. The two are told apart by GitSpecPattern rather than
+// by a prefix convention, so the accepted git forms are exactly the ones
+// ValidatePackageSpec already allows downstream — there is no second, looser
+// notion of "looks like git" to keep in sync. Note the resulting spec's member
+// identity (slug, name, version, peerVersions) is still DISCOVERED from the
+// fetched bytes by the builder, never taken from the lockfile key: a git spec
+// cannot claim to be a package it isn't.
 func refsFor(lock map[string]string) ([]builder.PackageRef, error) {
 	if len(lock) == 0 {
 		return nil, fmt.Errorf("empty package set")
@@ -273,16 +284,49 @@ func refsFor(lock map[string]string) ([]builder.PackageRef, error) {
 	sort.Strings(names)
 	refs := make([]builder.PackageRef, 0, len(names))
 	for _, name := range names {
-		version := lock[name]
+		value := lock[name]
 		if !pkgbuild.NpmPackagePattern.MatchString(name) {
 			return nil, fmt.Errorf("invalid package name %q", name)
 		}
-		if !pkgbuild.VersionTokenPattern.MatchString(version) {
-			return nil, fmt.Errorf("invalid version %q for %s", version, name)
+		spec, err := specForLockEntry(name, value)
+		if err != nil {
+			return nil, err
 		}
-		refs = append(refs, builder.PackageRef{Spec: name + "@" + version})
+		refs = append(refs, builder.PackageRef{Spec: spec})
 	}
 	return refs, nil
+}
+
+// specForLockEntry resolves one lockfile entry to an npm fetch spec. A git-form
+// value is its own complete spec; anything else must be a bare version token
+// that is concatenated onto the package name.
+func specForLockEntry(name, value string) (string, error) {
+	if isGitSpecValue(value) {
+		// Re-validate the whole thing: GitSpecPattern matched the bare part,
+		// but ValidatePackageSpec is what also rejects unsafe characters and a
+		// malformed #ref, and is the same gate the builder applies.
+		if err := pkgbuild.ValidatePackageSpec(value); err != nil {
+			return "", fmt.Errorf("invalid git spec for %s: %w", name, err)
+		}
+		return value, nil
+	}
+	if !pkgbuild.VersionTokenPattern.MatchString(value) {
+		return "", fmt.Errorf("invalid version %q for %s", value, name)
+	}
+	return name + "@" + value, nil
+}
+
+// isGitSpecValue reports whether a lockfile value should be read as a complete
+// git spec rather than a bare version. A version token can never contain `:` or
+// `/`, so the two forms are unambiguous; the `#<ref>` suffix is stripped first
+// because GitSpecPattern deliberately does not cover it (ValidatePackageSpec
+// validates the ref separately).
+func isGitSpecValue(value string) bool {
+	bare := value
+	if hash := strings.Index(bare, "#"); hash >= 0 {
+		bare = bare[:hash]
+	}
+	return pkgbuild.GitSpecPattern.MatchString(bare)
 }
 
 // BuildSet builds (or cache-hits) the artifact for a proposed set. This is
@@ -703,15 +747,23 @@ func (d *Deployer) Handler(slug string) http.Handler {
 	// subprocess (npm/git) sees it — same stance as refsFor: constrain the
 	// token, don't sanitize.
 	//
-	// REGISTRY SPECS ONLY. /v1/resolve and /v1/versions run their subprocess
-	// (`npm pack`, `npm view`, `git ls-remote`) inline in the ROUTER process,
-	// outside every confinement. `npm pack` on a git spec runs the package's
-	// prepare/prepack scripts, and `git ls-remote` on a URL spec is an SSRF
-	// with the router's credentials — both as root. A confined tenant may
-	// legitimately propose only npm-published packages anyway (the org
-	// lockfile is {npm name: version} with nowhere to carry git provenance —
-	// the same gate coreserver/pkg_hosted enforces tenant-side), so refuse
-	// anything that is not a registry spec here, before the subprocess.
+	// /v1/resolve and /v1/versions run their subprocess (`npm pack`, `npm
+	// view`, `git ls-remote`) inline in the ROUTER process, outside every
+	// confinement and as root. A registry spec is safe there: npm talks only
+	// to the configured registry. A GIT spec is not, in general — `git
+	// ls-remote` on an arbitrary tenant-supplied URL is an SSRF with the
+	// router's credentials and network position.
+	//
+	// So a git spec is accepted only when it ALREADY APPEARS IN THIS ORG'S
+	// LOCKFILE: a remote an operator vetted by provisioning or deploying the
+	// org with it. That is what makes tag-based upgrades work for a
+	// git-installed org — the case this exists for — while leaving a tenant
+	// unable to point the router at any remote of its choosing. Novel git
+	// specs still belong to the operator API, where the caller is an admin
+	// rather than tenant-controlled code.
+	//
+	// (`npm pack` on a git spec running prepare/prepack as root is handled
+	// separately, by --ignore-scripts in the builder's pack path.)
 	decodeSpec := func(w http.ResponseWriter, r *http.Request) (string, bool) {
 		var body struct {
 			Spec string `json:"spec"`
@@ -725,8 +777,12 @@ func (d *Deployer) Handler(slug string) http.Handler {
 			return "", false
 		}
 		if src, _ := pkgbuild.ClassifySpec(body.Spec); src != pkgbuild.SourceNpm {
-			writeCtlJSON(w, http.StatusBadRequest, map[string]any{"error": "only npm-published packages may be resolved here; git and URL specs are not supported"})
-			return "", false
+			if !d.specInOrgLockfile(slug, body.Spec) {
+				writeCtlJSON(w, http.StatusBadRequest, map[string]any{
+					"error": "only npm-published packages, or a git spec already in this org's lockfile, may be resolved here",
+				})
+				return "", false
+			}
 		}
 		return body.Spec, true
 	}
@@ -855,6 +911,48 @@ func (d *Deployer) Handler(slug string) http.Handler {
 		}
 	})
 	return mux
+}
+
+// specInOrgLockfile reports whether spec is one of the org's CURRENT lockfile
+// values, byte for byte.
+//
+// This is the authorization behind letting a tenant resolve a git spec at all:
+// every value in the lockfile got there through the operator API (provisioning
+// or a deploy), so the set of remotes the router will contact for an org is
+// exactly the set an operator already chose for it. The comparison is exact on
+// purpose — normalizing (stripping a #ref, canonicalizing a URL) would admit
+// specs that merely resemble a vetted one, which is the whole thing being
+// prevented. Refreshing tags for a spec already in the lockfile does not need
+// the ref to match, since the ref is what discovery is about, so the bare
+// remote is compared too.
+//
+// A read failure is a refusal: unable to confirm is not permission.
+func (d *Deployer) specInOrgLockfile(slug, spec string) bool {
+	rec, err := d.app.FindFirstRecordByData("orgs", "slug", slug)
+	if err != nil || rec == nil {
+		return false
+	}
+	raw := rec.GetString("lockfile")
+	if raw == "" {
+		return false
+	}
+	lock, err := lockfile.Parse([]byte(raw))
+	if err != nil {
+		return false
+	}
+	bare := func(s string) string {
+		if i := strings.Index(s, "#"); i >= 0 {
+			return s[:i]
+		}
+		return s
+	}
+	want := bare(spec)
+	for _, have := range lock {
+		if have == spec || bare(have) == want {
+			return true
+		}
+	}
+	return false
 }
 
 func writeCtlJSON(w http.ResponseWriter, code int, body any) {

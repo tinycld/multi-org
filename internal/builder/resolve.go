@@ -62,20 +62,60 @@ type packFn func(spec, workDir string) (extractedDir, tarball string, err error)
 
 // npmPackWith returns the production packFn: `npm pack <spec>` in workDir,
 // untarring the result there and returning the extracted package/ dir plus
-// the tarball path. registry (Config.NpmRegistry) overrides the fetch
-// registry for the spec when non-empty. For a registry spec this executes
-// nothing of the package's own (npm downloads the published tarball); git and
-// directory specs run the package's prepare/prepack scripts, which is why
-// production resolution of those belongs inside the per-job confinement (see
-// the confined runner) — the router only passes registry specs today.
+// the tarball path. registry (Config.NpmRegistry) overrides the fetch registry
+// for the spec when non-empty.
+//
+// A registry spec executes nothing of the package's own — npm downloads the
+// published tarball. A git spec has no published tarball, so npm clones and
+// BUILDS it, running the package's prepare/prepack scripts; pnpm behaves the
+// same way (this is inherent to git deps, not an npm quirk). resolve() runs in
+// the router process, which is root — it has to be, since that is what lets it
+// give each tenant its own uid and namespaces — so those scripts would run as
+// root, outside the very confinement the builder establishes for the build
+// itself. --ignore-scripts is what closes that: npm still clones and packs, but
+// executes nothing.
+//
+// This is a mitigation, not the finished shape. The right fix is to move the
+// whole fetch behind the confined job boundary (MT_BUILDER_UID, its own
+// cgroup) that already exists a few steps later — it sits upstream only
+// because the recipe hash must be known before the job is spawned. Until then
+// a git member whose published shape genuinely depends on a prepare script
+// will pack incomplete; every tinycld member is compiled by the build pipeline
+// and defines no lifecycle scripts, so today this is a no-op for them.
 func npmPackWith(registry string) packFn {
 	return func(spec, workDir string) (string, string, error) {
-		args := []string{"pack", spec}
-		if registry != "" {
-			args = append(args, "--registry", registry)
-		}
-		return npmPackArgs(spec, workDir, args)
+		return npmPackArgs(spec, workDir, packArgs(spec, registry))
 	}
+}
+
+// packArgs builds the `npm pack` argv for one spec. Split out from npmPackWith
+// so the --ignore-scripts decision is assertable without shelling out to npm.
+func packArgs(spec, registry string) []string {
+	args := []string{"pack", spec}
+	if registry != "" {
+		args = append(args, "--registry", registry)
+	}
+	if !isRegistrySpec(spec) {
+		args = append(args, "--ignore-scripts")
+	}
+	return args
+}
+
+// isRegistrySpec reports whether a spec names a published package (rather than
+// a git remote or a local directory). Registry fetches download a prebuilt
+// tarball and run nothing, so they need no script suppression; everything else
+// builds from source and does.
+func isRegistrySpec(spec string) bool {
+	if strings.Contains(spec, "#") {
+		return false // only git forms carry a #ref
+	}
+	if filepath.IsAbs(spec) {
+		return false // AllowDirSpecs local directory
+	}
+	if pkgbuild.GitSpecPattern.MatchString(spec) {
+		return false
+	}
+	return pkgbuild.NpmPackagePattern.MatchString(spec) || pkgbuild.NpmVersionedPattern.MatchString(spec)
 }
 
 func npmPackArgs(spec, workDir string, args []string) (string, string, error) {
@@ -157,6 +197,11 @@ func (b *Builder) resolve(refs []PackageRef) (*resolvedInput, error) {
 			return nil, fmt.Errorf("resolve %s: %w", ref.Spec, err)
 		}
 		member.Integrity = integrity
+		// Record what this member was fetched FROM, not just what it turned
+		// out to be. Version discovery needs it: a git-installed member's
+		// upgrades come from its remote's tags, and its npm name alone would
+		// send the lookup to a registry that may not carry it at all.
+		member.Spec = ref.Spec
 		if _, dup := res.Dirs[member.Slug]; dup {
 			return nil, fmt.Errorf("resolve: two specs resolve to member %q", member.Slug)
 		}

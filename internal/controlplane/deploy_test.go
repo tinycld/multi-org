@@ -757,8 +757,12 @@ func TestCreateOrg_DefaultTemplateBuildsArtifact(t *testing.T) {
 	fake := &fakeArtifactBuilder{hash: hashNew}
 	p := NewProvisioner(cp.App, root, func(string) {}, nil)
 	p.deployer = newDeployer(cp.App, root, fake, func(string) {}, nil, quietTestLogger())
+	stubOwnerStep(p)
+	// No compiled artifact behind the fake builder's Dir, so the real owner
+	// step cannot run; this test is about the default-template build.
+	p.createOwnerFn = func(_, _, _, _, _ string) error { return nil }
 
-	rec, err := p.CreateOrg("acme", "Acme", nil)
+	rec, _, err := p.CreateOrg("acme", "Acme", nil, OwnerAccount{Email: "owner@example.com"})
 	if err != nil {
 		t.Fatalf("CreateOrg: %v", err)
 	}
@@ -774,7 +778,7 @@ func TestCreateOrg_DefaultTemplateBuildsArtifact(t *testing.T) {
 
 	// An explicit empty map is not buildable (no app shell) — refused, and the
 	// builder never runs for it.
-	if _, err := p.CreateOrg("lean", "Lean", map[string]string{}); err == nil || !strings.Contains(err.Error(), "app shell") {
+	if _, _, err := p.CreateOrg("lean", "Lean", map[string]string{}, OwnerAccount{Email: "owner@example.com"}); err == nil || !strings.Contains(err.Error(), "app shell") {
 		t.Fatalf("CreateOrg(lean) = %v, want the app-shell refusal", err)
 	}
 	if fake.calls.Load() != 1 {
@@ -797,7 +801,7 @@ func TestCreateOrg_ArtifactSetWithoutBuilderRefuses(t *testing.T) {
 		t.Fatal(err)
 	}
 	p := NewProvisioner(cp.App, root, func(string) {}, nil)
-	if _, err := p.CreateOrg("acme", "Acme", map[string]string{"tinycld": "1.0.0"}); err == nil || !strings.Contains(err.Error(), "no builder") {
+	if _, _, err := p.CreateOrg("acme", "Acme", map[string]string{"tinycld": "1.0.0"}, OwnerAccount{Email: "owner@example.com"}); err == nil || !strings.Contains(err.Error(), "no builder") {
 		t.Fatalf("CreateOrg = %v, want no-builder refusal", err)
 	}
 }

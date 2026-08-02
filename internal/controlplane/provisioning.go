@@ -285,7 +285,29 @@ func (p *Provisioner) createOwner(slug, orgDir, artifactDir, email, password str
 	if err != nil {
 		return fmt.Errorf("create-owner: %w: %s", err, strings.TrimSpace(string(out)))
 	}
+	// Exit status alone does NOT prove the account exists. PocketBase's root
+	// command exits 0 on an unknown subcommand — an artifact built before
+	// create-owner existed prints `unknown command "create-owner"` and returns
+	// success, which would silently hand the operator a password for an org
+	// with no accounts. Require the command's own confirmation line instead of
+	// trusting the status.
+	text := string(out)
+	if !strings.Contains(text, "owner: ") {
+		return fmt.Errorf("create-owner did not confirm the account (artifact may predate the command): %s",
+			strings.TrimSpace(firstLine(text)))
+	}
 	return nil
+}
+
+// firstLine returns s's first non-empty line, for quoting a subprocess's
+// complaint into an error without dragging in a whole help dump.
+func firstLine(s string) string {
+	for _, line := range strings.Split(s, "\n") {
+		if t := strings.TrimSpace(line); t != "" {
+			return t
+		}
+	}
+	return "(no output)"
 }
 
 // ownerBinaryName is the server binary's name inside an artifact. It matches

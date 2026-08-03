@@ -233,3 +233,39 @@ func TestServeApex_NonAPIPathsStillServeThePage(t *testing.T) {
 		}
 	}
 }
+
+// The apex marker is a CROSS-REPO WIRE CONTRACT, not an internal name. The app
+// shell matches this exact string (APEX_MARKER in core/lib/apex.ts) to tell an
+// apex apart from a host that is merely wrong or down.
+//
+// Asserted as a LITERAL rather than against the constant on purpose: a test
+// that reads `body.Data.Kind != ApexMarker` passes no matter what the constant
+// is changed to, so renaming the value would silently break every client while
+// the suite stayed green. Changing this string is a breaking protocol change —
+// old apps must keep working, so ship the new value alongside the old one and
+// only retire it once no deployed client relies on it.
+func TestApexMarker_WireValueIsStable(t *testing.T) {
+	const wireValue = "multi_org_apex"
+
+	if ApexMarker != wireValue {
+		t.Fatalf("ApexMarker = %q, want %q — the app shell matches this literal "+
+			"(core/lib/apex.ts APEX_MARKER); changing it breaks every deployed client",
+			ApexMarker, wireValue)
+	}
+
+	// And the value actually reaches the wire in the field the client reads.
+	rec := httptest.NewRecorder()
+	ServeApex(rec, apiReq("http://tinycld.org/api/org-info"), "tinycld.org")
+
+	var body map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("apex API body is not valid JSON: %v", err)
+	}
+	data, ok := body["data"].(map[string]any)
+	if !ok {
+		t.Fatalf("no `data` object in apex API body: %s", rec.Body.String())
+	}
+	if data["kind"] != wireValue {
+		t.Fatalf("data.kind = %v, want %q", data["kind"], wireValue)
+	}
+}

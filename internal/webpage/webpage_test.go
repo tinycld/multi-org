@@ -158,3 +158,78 @@ func TestServeApex_DerivesURLsFromOwnHost(t *testing.T) {
 		t.Fatal("apex page must not read a url field out of the cookie")
 	}
 }
+
+// The apex used to answer the org-finder page with 200 for EVERY path, /api/*
+// included. That made it indistinguishable from a healthy server: a client
+// probing /api/health got 200 back, admitted the apex as its server, and then
+// fed every subsequent API call HTML instead of JSON.
+func TestServeApex_APIPathsAreNotThePage(t *testing.T) {
+	for _, path := range []string{"/api/health", "/api/org-info", "/api/collections/x/records", "/api"} {
+		rec := httptest.NewRecorder()
+		ServeApex(rec, apiReq("http://tinycld.org"+path), "tinycld.org")
+
+		if rec.Code != http.StatusNotFound {
+			t.Errorf("%s: status = %d, want 404 (the apex hosts no API)", path, rec.Code)
+		}
+		if ct := rec.Header().Get("Content-Type"); !strings.HasPrefix(ct, "application/json") {
+			t.Errorf("%s: Content-Type = %q, want application/json", path, ct)
+		}
+		if body := rec.Body.String(); strings.Contains(body, "<!doctype") {
+			t.Errorf("%s: answered with the HTML page", path)
+		}
+	}
+}
+
+// A client probing an unknown address must tell three cases apart: a real
+// server, an apex, and a host that is down or wrong. A bare 404 collapses the
+// last two, so the apex carries a marker the client can key on.
+func TestServeApex_APIErrorCarriesApexMarker(t *testing.T) {
+	rec := httptest.NewRecorder()
+	ServeApex(rec, apiReq("http://tinycld.org/api/org-info"), "tinycld.org")
+
+	var body struct {
+		Code    int    `json:"code"`
+		Message string `json:"message"`
+		Data    struct {
+			Kind string `json:"kind"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("body is not valid JSON: %v", err)
+	}
+	if body.Data.Kind != ApexMarker {
+		t.Fatalf("data.kind = %q, want %q", body.Data.Kind, ApexMarker)
+	}
+	// Still a well-formed PocketBase error, so existing client handling parses it.
+	if body.Code != http.StatusNotFound || body.Message == "" {
+		t.Fatalf("not a PocketBase-shaped error: %+v", body)
+	}
+}
+
+// An /api/* path is an API call whatever the caller claims to accept — a
+// browser typing the URL must not get the page there either.
+func TestServeApex_APIPathIgnoresAcceptHeader(t *testing.T) {
+	rec := httptest.NewRecorder()
+	ServeApex(rec, htmlReq("http://tinycld.org/api/org-info"), "tinycld.org")
+
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404 even for Accept: text/html", rec.Code)
+	}
+	if ct := rec.Header().Get("Content-Type"); !strings.HasPrefix(ct, "application/json") {
+		t.Fatalf("Content-Type = %q, want application/json", ct)
+	}
+}
+
+// The page itself must be unaffected — non-API paths still serve the finder.
+func TestServeApex_NonAPIPathsStillServeThePage(t *testing.T) {
+	for _, path := range []string{"/", "/anything", "/apifoo"} {
+		rec := httptest.NewRecorder()
+		ServeApex(rec, htmlReq("http://tinycld.org"+path), "tinycld.org")
+		if rec.Code != http.StatusOK {
+			t.Errorf("%s: status = %d, want 200", path, rec.Code)
+		}
+		if !strings.Contains(rec.Body.String(), "<form") {
+			t.Errorf("%s: should serve the org-finder page", path)
+		}
+	}
+}

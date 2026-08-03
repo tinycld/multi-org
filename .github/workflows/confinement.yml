@@ -102,3 +102,78 @@ jobs:
           sudo env "PATH=$PATH" \
             "GOMODCACHE=$(go env GOMODCACHE)" "GOFLAGS=-mod=mod" \
             go test ./internal/orgmanager/ ./internal/builder/ -run TestConfinement -v -count=1
+
+  # Browser-level acceptance against REAL provisioned orgs: two orgs, two tenant
+  # processes, two databases, fronted by the real front router — then Playwright
+  # driving the app shell's switcher across those two subdomains.
+  #
+  # Separate job rather than a step in `confinement`: it needs the Playwright
+  # browser and the app shell's web bundle, neither of which the Go suite wants,
+  # and a failure here should read as "the app is broken across orgs" rather than
+  # as a confinement regression.
+  browser-e2e:
+    name: Browser E2E (two orgs)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          path: ws/multi-org
+
+      - name: Check out tinycld for .node-version
+        env:
+          GH_TOKEN: ${{ secrets.SIBLING_CHECKOUT_TOKEN || github.token }}
+        run: |
+          git clone --depth 1 \
+            "https://x-access-token:${GH_TOKEN}@github.com/tinycld/tinycld.git" .node-version-src
+      - uses: actions/setup-node@v5
+        with:
+          node-version-file: .node-version-src/.node-version
+
+      # The tenant artifact is built from the sibling checkouts by the local npm
+      # registry the test stands up, so the workspace must be assembled exactly
+      # as the confinement job does.
+      - name: Assemble workspace (app + core + features)
+        working-directory: ws
+        env:
+          TINYCLD_REPO_BASE: ${{ secrets.SIBLING_CHECKOUT_TOKEN && format('https://x-access-token:{0}@github.com/tinycld', secrets.SIBLING_CHECKOUT_TOKEN) || 'https://github.com/tinycld' }}
+        run: |
+          npx @tinycld/bootstrap@latest --assemble-only \
+            --with calc --with calendar --with contacts \
+            --with drive --with mail --with text
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: ws/.go-version
+          cache-dependency-path: ws/multi-org/go.sum
+
+      - name: Install (workspace root)
+        working-directory: ws
+        run: corepack enable && pnpm install --no-frozen-lockfile
+
+      # Playwright browser + the static web bundle. The tenant artifact serves
+      # its OWN copy of the bundle (it is built into the artifact), so this
+      # installs the browser; the bundle build is what the artifact's own build
+      # step consumes.
+      - name: Configure test env
+        uses: ./ws/tinycld/.github/actions/configure-test-env
+
+      # A warm pnpm store makes the artifact build minutes rather than tens of
+      # minutes — the builder resolves the org's package set through it.
+      - name: Browser E2E (two provisioned orgs)
+        working-directory: ws/multi-org
+        env:
+          RUN_HOSTED_BROWSER_E2E: '1'
+          TINYCLD_WS_ROOT: ${{ github.workspace }}/ws
+        run: |
+          export BUILDER_E2E_PNPM_STORE="$(pnpm store path)"
+          go test ./internal/controlplane/ -run TestHostedBrowserE2E -v -count=1 -timeout 60m
+
+      - name: Upload Playwright artifacts
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: multi-org-playwright-artifacts
+          path: |
+            ws/tinycld/test-results/
+            ws/tinycld/playwright-report/
+          retention-days: 14

@@ -130,16 +130,22 @@ jobs:
           node-version-file: .node-version-src/.node-version
 
       # The tenant artifact is built from the sibling checkouts by the local npm
-      # registry the test stands up, so the workspace must be assembled exactly
-      # as the confinement job does.
-      - name: Assemble workspace (app + core + features)
+      # registry the test stands up, so the workspace must be assembled before
+      # the build runs.
+      #
+      # Assembled with NO features, unlike the confinement job. The scaffold
+      # copied into every build includes tinycld.packages.ts, which enumerates
+      # whatever members are present — so assembling six features while building
+      # a base-only lockfile makes postinstall fail with "no workspace member
+      # named @tinycld/calc". The assembled set and the built set have to agree,
+      # and the switcher UI under test is core, so base-only is both correct and
+      # the cheaper half of that agreement.
+      - name: Assemble workspace (app + core)
         working-directory: ws
         env:
           TINYCLD_REPO_BASE: ${{ secrets.SIBLING_CHECKOUT_TOKEN && format('https://x-access-token:{0}@github.com/tinycld', secrets.SIBLING_CHECKOUT_TOKEN) || 'https://github.com/tinycld' }}
         run: |
-          npx @tinycld/bootstrap@latest --assemble-only \
-            --with calc --with calendar --with contacts \
-            --with drive --with mail --with text
+          npx @tinycld/bootstrap@latest --assemble-only
 
       - uses: actions/setup-go@v6
         with:

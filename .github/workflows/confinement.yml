@@ -146,6 +146,28 @@ jobs:
           go-version-file: ws/.go-version
           cache-dependency-path: ws/multi-org/go.sum
 
+      # The builder copies a fixed set of workspace-root "scaffold extras" into
+      # every build (pkgbuild.scaffoldExtras: .npmrc, tinycld.packages.ts,
+      # scripts, tests, package-versions.json). bootstrap writes the middle
+      # three; .npmrc and package-versions.json live in the separate
+      # tinycld/workspace repo, so an assembled ws/ lacks them.
+      #
+      # package-versions.json is the one that fails loudly — ReadOverrides needs
+      # it as a recipe-hash input, so the artifact build dies at resolve time.
+      # A missing .npmrc is skipped silently, which is worse: the build would
+      # quietly resolve against the wrong registry config. Copy both.
+      #
+      # The confinement job never builds an artifact, which is why only this job
+      # needs them.
+      - name: Fetch workspace-root scaffold extras
+        env:
+          GH_TOKEN: ${{ secrets.SIBLING_CHECKOUT_TOKEN || github.token }}
+        run: |
+          git clone --depth 1 \
+            "https://x-access-token:${GH_TOKEN}@github.com/tinycld/workspace.git" ws-scaffold
+          cp ws-scaffold/package-versions.json ws/package-versions.json
+          cp ws-scaffold/.npmrc ws/.npmrc
+
       - name: Install (workspace root)
         working-directory: ws
         run: corepack enable && pnpm install --no-frozen-lockfile

@@ -323,9 +323,39 @@ idle sweep, and the readiness protocol are untouched.
 - **Build latency UX.** Novel sets pay minutes; surfaced through the same
   job-progress UI World A has, but the org keeps serving its old build —
   confirm the UI communicates "building, not down".
-- **Native OTA per org.** One store app must serve per-org JS bundles;
-  runtime-version matching already constrains this in World A — the hosted
-  update endpoint needs the same policy per org.
+- ~~**Native OTA per org.**~~ **DONE 2026-08-02.** The builder now indexes each
+  artifact's staged native bundles into `recipe.json` (`Bundles`,
+  `RuntimeVersion`), derived PARENT-side by hashing the committed bytes — the
+  confined job never authors them, same rule as members/integrities. Runtime
+  version comes from the base member's `app.json` `expo.version` ONLY: the
+  shell's `package.json` (0.4.0) and the recipe's base entry (`@tinycld/core`,
+  0.0.4) are both different numbers, and stamping either would 204 every device
+  forever, so a miss fails the build rather than falling back.
+  `RegisterTenantAppUpdateEndpoints` serves the same routes as the host with the
+  same manifest/bad-bundle/traversal logic (one shared body, two
+  `appUpdateSources` seams), reading the artifact instead of a `pkg_build` row
+  and `pb_public/native/` instead of a build archive. Bundle ids are
+  content-addressed (`recipe-<hash12>-<platform>`, from the builder's existing
+  deterministic build id), so two orgs on the same package set advertise the
+  SAME bundle and a device moving between them is correctly told "up to date".
+  Client-side, the native store is keyed by server (`servers/<serverKey>/`, with
+  an `active.json` the pre-bridge loader reads), so each org keeps its own
+  bundle instead of the two thrashing over one slot. `run-hosted-install.sh` no
+  longer sets `PW_SKIP_OTA`.
+  **Verified end-to-end 2026-08-02** against a live org (`run-hosted-install.sh`,
+  all eight phases green): the builder wrote `bundles` + `runtimeVersion` into
+  `recipe.json` (both empty before this work), the tenant served a `200` manifest
+  where it previously 404'd, the `.hbc` downloaded with a SHA-256 matching the
+  manifest exactly, and up-to-date / runtime-mismatch / traversal returned
+  `204` / `204` / `404`. Install→upgrade→downgrade produced three distinct
+  content-addressed ids, and the downgrade was a **cache hit** — no fourth
+  artifact, the org returning to the byte-identical bundle it served before the
+  upgrade (D4's sharing guarantee, observable as 28.6s vs the upgrade's 2.2m).
+  One trap worth recording: `runtimeVersion` must come from `app.json`'s
+  `expo.version` ONLY. The shell's `package.json` (a deliberately different
+  number) and the recipe's base member (`@tinycld/core`) are both wrong, and
+  either would stamp bundles no device can match — a silent, permanent "updates
+  never arrive". A miss now fails the build instead of falling back.
 - **Builder capacity.** One host initially (concurrency-capped); the queue
   is the seam if it ever needs to be a fleet.
 - **Multiple templates** (plans/tiers): D7 trivially extends to named
@@ -555,9 +585,11 @@ idle sweep, and the readiness protocol are untouched.
    (host-only; onboarding above replaces it), the buggy-fixture entrypoint
    rollbacks (hosted revert is covered at protocol level by
    TestHostedDeployE2E), build-history revert (`pkg_build` archives are
-   single-tenant machinery), OTA assertions (§6 "Native OTA per org" stays
-   open; `PW_SKIP_OTA`), and the git-remote core phases (the hosted base
-   rides the npm lockfile). Getting it green surfaced and fixed real product
+   single-tenant machinery), and the git-remote core phases (the hosted base
+   rides the npm lockfile). (The OTA assertions were unselected here too until
+   §6's "Native OTA per org" landed on 2026-08-02; the runner now leaves
+   `PW_SKIP_OTA` unset and asserts a new content-addressed bundle id per
+   package change.) Getting it green surfaced and fixed real product
    gaps, each with a regression guard where testable:
    - **Tenants served no SPA at all** — `registerStaticServe` was host-only
      and the router only proxies. `RegisterTenant` now mounts the org's

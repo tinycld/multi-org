@@ -1,10 +1,46 @@
 # multitenant
 
-A multi-tenant router for [PocketBase](https://pocketbase.io). A fronting HTTPS
-server dispatches by subdomain to either a **control-plane** PocketBase app (the
-org/deployment registry + provisioning API, in-process) or a lazily
-spawned **tenant process**. Each tenant is a per-org build artifact (a stock
-PocketBase linking exactly the org's package set) running in its own OS
+> ### ⚠️ Advanced, and still in testing
+>
+> This is **not** the way to run TinyCld. A normal deployment is one app shell
+> serving one organization — see the app shell's own install docs, which is what
+> almost everyone wants and what is exercised in production.
+>
+> This module hosts **many** organizations on one machine, and it does so by
+> running each one as its own confined OS process. That buys real isolation, and
+> it costs a per-org build pipeline, a uid/namespace/cgroup story, wildcard TLS,
+> and an operator who is comfortable with all three.
+>
+> Its layers compose and are covered end to end by tests that spawn real tenant
+> processes, but it has not accumulated the production mileage the single-tenant
+> path has. Treat it as a capable system still proving itself, read
+> [Operator prerequisites & known gaps](#operator-prerequisites--known-gaps)
+> before deploying it, and expect to be the person who debugs it.
+
+## What it is for
+
+One TinyCld install serves one organization. If you want several — a hosting
+provider running many customers, or one team keeping separate workspaces that
+must not see each other's data — you would otherwise run several complete
+deployments, each with its own machine, TLS, and upgrade cycle.
+
+This router collapses that into one host. Each org gets its own subdomain
+(`acme.example.com`), its own database, and its own process, while sharing one
+machine, one certificate, and one thing to operate. Orgs stay isolated by the
+kernel rather than by application-level checks, and each runs exactly the set of
+packages it installed — so one org adding Mail does not change what another org
+is running.
+
+The design goal is that an org is a **process boundary**, not a `WHERE org_id =`
+clause. There is no shared tenant table to leak across, because there is no
+shared database.
+
+## How it works
+
+A fronting HTTPS server dispatches by subdomain to either a **control-plane**
+PocketBase app (the org/deployment registry + provisioning API, in-process) or a
+lazily spawned **tenant process**. Each tenant is a per-org build artifact (a
+stock PocketBase linking exactly the org's package set) running in its own OS
 process — confined to its own uid, mount and PID namespaces, and cgroup on
 Linux — whose `pb_hooks`/`pb_public`/`pb_migrations` are symlinks into a
 committed, content-addressed build under `<root>/builds/<recipe-hash>/`. The

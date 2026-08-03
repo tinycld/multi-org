@@ -254,14 +254,32 @@ func (b *Builder) buildOne(ctx context.Context, refs []PackageRef, sink pkgbuild
 	if err := writeMemberManifests(spec.ArtifactDir, res.Manifests); err != nil {
 		return Result{}, err
 	}
+	// Index the native OTA bundles the job staged, so the org's tenant can
+	// serve them from /api/app/update (DESIGN §6 "Native OTA per org"). The
+	// facts are derived HERE, parent-side, by reading and hashing the staged
+	// bytes — never taken from the confined job's report — for the same reason
+	// members and integrities are: a job runs package-author code, and the
+	// bundle hash is the client's whole integrity guarantee. runtimeVersion
+	// comes from the base member dir the parent itself fetched.
+	runtimeVersion := runtimeVersionFromBase(res.Dirs[pkgbuild.BaseMemberSlug])
+	bundles, err := scanNativeBundles(spec.ArtifactDir, spec.BuildID, runtimeVersion)
+	if err != nil {
+		return Result{}, fmt.Errorf("index native bundles for %s: %w", res.RecipeHash, err)
+	}
+	if len(bundles) > 0 {
+		sink.Logf("native OTA bundles indexed: %d (runtime version %s)", len(bundles), runtimeVersion)
+	}
+
 	tc, _ := b.toolchain()
 	if err := writeRecipeFile(spec.ArtifactDir, Recipe{
-		RecipeHash: res.RecipeHash,
-		BuildID:    spec.BuildID,
-		BuiltAt:    b.now().UTC(),
-		Toolchain:  tc,
-		Members:    res.Members,
-		Overrides:  res.Overrides,
+		RecipeHash:     res.RecipeHash,
+		BuildID:        spec.BuildID,
+		BuiltAt:        b.now().UTC(),
+		Toolchain:      tc,
+		Members:        res.Members,
+		Overrides:      res.Overrides,
+		RuntimeVersion: runtimeVersion,
+		Bundles:        bundles,
 	}); err != nil {
 		return Result{}, err
 	}

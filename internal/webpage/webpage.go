@@ -89,16 +89,42 @@ func NotFound(w http.ResponseWriter, r *http.Request, baseDomain string) {
 	write(w, r, http.StatusNotFound, "no such organization", data)
 }
 
+// IsAPIPath reports whether a request targets an API rather than a page. The
+// apex hosts no API — every org's API lives on the org's own subdomain — so
+// these must not be answered with the org-finder page.
+func IsAPIPath(path string) bool {
+	return path == "/api" || strings.HasPrefix(path, "/api/")
+}
+
+// ApexMarker is the machine-readable "this host is an apex, not a server"
+// signal, returned in the `data` field of an apex API response. A client that
+// probes an unknown address needs to tell three cases apart — a real server, an
+// apex, and a host that is simply down or wrong — and a bare 404 collapses the
+// last two. Clients should treat its PRESENCE as the signal and ignore the rest
+// of the body.
+const ApexMarker = "multi_org_apex"
+
 // ServeApex serves the org-finder page at the base domain. It exists so the
 // apex is a recovery point rather than a redirect loop: a user who knows only
 // "it's on tinycld.org" can land here, see the orgs this browser has signed
 // into (the parent-domain switcher cookie), or type their org's name.
+//
+// API paths get a 404 carrying ApexMarker instead of the page. The apex used to
+// answer the finder HTML with 200 for EVERY path, /api/* included, which made it
+// indistinguishable from a healthy server: a client probing /api/health got a
+// 200 back, admitted the apex as its server, and then sent every subsequent API
+// call into HTML. Both halves of that were wrong — the status and the body.
 //
 // The page's script derives every org URL from location.hostname — never from
 // the cookie, which is client-writable and must not supply navigation targets
 // (see internal/orgcookie). Slugs are validated as single DNS labels for the
 // same reason.
 func ServeApex(w http.ResponseWriter, r *http.Request, baseDomain string) {
+	if IsAPIPath(r.URL.Path) {
+		writeAPIError(w, http.StatusNotFound, "this host serves organizations, not an API", ApexMarker)
+		return
+	}
+
 	var body strings.Builder
 	if err := apexBody.Execute(&body, apexData{CookieName: orgcookie.Name, BaseDomain: baseDomain}); err != nil {
 		http.Error(w, "internal error", http.StatusInternalServerError)
@@ -129,6 +155,25 @@ func write(w http.ResponseWriter, r *http.Request, status int, message string, d
 		"code":    status,
 		"message": message,
 		"data":    struct{}{},
+	})
+}
+
+// writeAPIError answers an API path in PocketBase's error shape ({code,
+// message, data}), with a machine-readable marker in `data`.
+//
+// Deliberately does NOT negotiate on Accept, unlike write(): an /api/* path is
+// an API call whatever the caller claims to accept, and handing a browser the
+// org-finder page there is what let the apex pass for a server. The marker goes
+// in `data` because that field is already part of the shape every client parses,
+// so this stays a well-formed PocketBase error rather than a bespoke body.
+func writeAPIError(w http.ResponseWriter, status int, message, marker string) {
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Cache-Control", "no-store")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"code":    status,
+		"message": message,
+		"data":    map[string]any{"kind": marker},
 	})
 }
 

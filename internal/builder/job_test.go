@@ -27,7 +27,22 @@ func fakePipeline(t *testing.T) pkgbuild.Pipeline {
 		return "", nil
 	}
 	return pkgbuild.Pipeline{
-		Run:        fakeRun,
+		Run: fakeRun,
+		// The CLI cross-compile step goes through RunEnv; write the -o target
+		// (which sits behind -trimpath/-ldflags, not at args[1] like the
+		// server build) so cli-dist/ gets populated when the build has a cli/.
+		RunEnv: func(_ string, _ []string, name string, args ...string) (string, error) {
+			if name == "go" && len(args) > 0 && args[0] == "build" {
+				for i, a := range args {
+					if a == "-o" && i+1 < len(args) {
+						if err := os.WriteFile(args[i+1], []byte("#!fake-cli"), 0o755); err != nil {
+							return "", err
+						}
+					}
+				}
+			}
+			return "", nil
+		},
 		PnpmStream: fakeStream,
 		ExpoStream: fakeStream,
 		Stage: func(appDir string) (string, error) {
@@ -111,6 +126,61 @@ func TestInProcessRunner_AssemblesBuildsAndStages(t *testing.T) {
 	}
 	if info.Mode()&0o111 == 0 {
 		t.Fatal("staged binary is not executable")
+	}
+
+	// No cli/ module in this assembly → the (best-effort) cross-compile
+	// skipped, and staging tolerates the absence rather than failing.
+	if _, err := os.Stat(filepath.Join(spec.ArtifactDir, pkgbuild.CLIDistDirName)); !os.IsNotExist(err) {
+		t.Fatalf("artifact should have no cli-dist without a cli module: %v", err)
+	}
+}
+
+// TestInProcessRunner_StagesCliDist covers the assembly WITH a cli/ module:
+// the pipeline cross-compiles into <appDir>/cli-dist and stageArtifact must
+// carry it into the artifact (the build workspace is deleted after commit).
+func TestInProcessRunner_StagesCliDist(t *testing.T) {
+	root := t.TempDir()
+	baseDir := filepath.Join(root, "prefetched", "tinycld")
+	if err := os.MkdirAll(filepath.Join(baseDir, "core"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	corePkg := `{"name": "@tinycld/core", "version": "0.0.9"}` + "\n"
+	if err := os.WriteFile(filepath.Join(baseDir, "core", "package.json"), []byte(corePkg), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// The member ships a cli/ module → the pipeline's cross-compile runs.
+	if err := os.MkdirAll(filepath.Join(baseDir, "cli"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(baseDir, "cli", "go.mod"), []byte("module tinycld.org/cli\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	spec := JobSpec{
+		BuildID:      "recipe-cli",
+		BuildDir:     filepath.Join(root, "job", "build"),
+		ArtifactDir:  filepath.Join(root, "job", "artifact"),
+		ScaffoldRoot: writeScaffoldRoot(t),
+		PnpmStoreDir: filepath.Join(root, "pnpm-store"),
+		BinaryName:   "tinycld",
+		Manifest: pkgbuild.RebuildManifest{
+			BuildID: "recipe-cli",
+			Members: []pkgbuild.MemberSpec{{Slug: "tinycld", Version: "0.0.9", Spec: "tinycld@0.4.0"}},
+		},
+		MemberDirs:  map[string]string{"tinycld": baseDir},
+		Integrities: map[string]string{"tinycld": "sha256:beef"},
+	}
+
+	runner := InProcessRunner{Pipeline: func(JobSpec) pkgbuild.Pipeline { return fakePipeline(t) }}
+	if err := runner.Run(context.Background(), spec, nil); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, target := range pkgbuild.CLITargets {
+		staged := filepath.Join(spec.ArtifactDir, pkgbuild.CLIDistDirName, target.FileName())
+		if _, err := os.Stat(staged); err != nil {
+			t.Errorf("artifact missing %s: %v", target.FileName(), err)
+		}
 	}
 }
 

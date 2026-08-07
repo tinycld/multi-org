@@ -139,6 +139,16 @@ func stageArtifact(spec JobSpec, out pkgbuild.BuildOutput) error {
 	if err := copyTreeDeref(out.StageDir, filepath.Join(spec.ArtifactDir, "pb_public")); err != nil {
 		return fmt.Errorf("stage artifact: copy web release: %w", err)
 	}
+	// CLI binaries are best-effort upstream (the pipeline continues without
+	// them), so absence here is normal — the tenant then serves an empty
+	// downloads list. The build workspace is deleted after commit, so without
+	// this copy the binaries would be lost.
+	cliDist := filepath.Join(appDir, pkgbuild.CLIDistDirName)
+	if _, err := os.Stat(cliDist); err == nil {
+		if err := copyTreeDeref(cliDist, filepath.Join(spec.ArtifactDir, pkgbuild.CLIDistDirName)); err != nil {
+			return fmt.Errorf("stage artifact: copy cli-dist: %w", err)
+		}
+	}
 	return nil
 }
 

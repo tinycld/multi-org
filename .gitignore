@@ -1,1 +1,6 @@
 serve-multi
+
+# Per-developer Go workspace: the replace directives point at whichever local
+# checkout of the app shell this machine has, so it can never be shared.
+go.work
+go.work.sum
